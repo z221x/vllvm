@@ -1,22 +1,27 @@
-cmake_minimum_required(VERSION 3.14)
-project(vollvm_pass)
-find_package(LLVM REQUIRED CONFIG
-    PATHS "../../install"
-    NO_DEFAULT_PATH
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
+    "Generate compile_commands.json for clangd" FORCE)
+
+add_llvm_component_library(LLVMVLLVM
+  Utils.cpp
+  FlattenFuncPass.cpp
+  EncryptoStrPass.cpp
+  IndirectCallPass.cpp
+  IndirectBranchPass.cpp
+  PassInfo.cpp
+  CryptoUtils.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/VLLVM
+
+  LINK_COMPONENTS
+  Analysis
+  Core
+  Passes
+  Support
+  TransformUtils
 )
-list(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
-include(AddLLVM)
-include_directories("./include") # 包含 ./include 文件夹中的头文件
-separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
-add_definitions(${LLVM_DEFINITIONS_LIST})
-include_directories(${LLVM_INCLUDE_DIRS})
-add_llvm_library(
-    vollvm MODULE
-    Utils.cpp
-    FlattenFuncPass.cpp
-    EncryptoStrPass.cpp
-    IndirectCallPass.cpp
-    IndirectBranchPass.cpp
-    PassInfo.cpp
-    CryptoUtils.cpp
+
+target_include_directories(LLVMVLLVM
+  PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )

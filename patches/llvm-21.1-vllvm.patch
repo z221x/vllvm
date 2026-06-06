@@ -1,0 +1,117 @@
+diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
+index 169d177..2e2a271 100644
+--- a/llvm/lib/Transforms/CMakeLists.txt
++++ b/llvm/lib/Transforms/CMakeLists.txt
+@@ -10,3 +10,4 @@ add_subdirectory(ObjCARC)
+ add_subdirectory(Coroutines)
+ add_subdirectory(CFGuard)
+ add_subdirectory(HipStdPar)
++add_subdirectory(VLLVM)
+diff --git a/clang/include/clang/Basic/CodeGenOptions.def b/clang/include/clang/Basic/CodeGenOptions.def
+index 90f91c1..25eb0a3 100644
+--- a/clang/include/clang/Basic/CodeGenOptions.def
++++ b/clang/include/clang/Basic/CodeGenOptions.def
+@@ -77,5 +77,10 @@ CODEGENOPT(EnableNoundefAttrs, 1, 0, Benign) ///< Enable emitting `noundef` attr
+ CODEGENOPT(DebugPassManager, 1, 0, Benign) ///< Prints debug information for the new
+                                            ///< pass manager.
++CODEGENOPT(VLLVMAll, 1, 0, Benign) ///< Enable every VLLVM obfuscation pass.
++CODEGENOPT(VLLVMEncryptoStr, 1, 0, Benign) ///< Enable VLLVM string encryption.
++CODEGENOPT(VLLVMFlattenFunc, 1, 0, Benign) ///< Enable VLLVM control-flow flattening.
++CODEGENOPT(VLLVMIndirectCall, 1, 0, Benign) ///< Enable VLLVM indirect calls.
++CODEGENOPT(VLLVMIndirectBranch, 1, 0, Benign) ///< Enable VLLVM indirect branches.
+ CODEGENOPT(DisableRedZone    , 1, 0, Benign) ///< Set when -mno-red-zone is enabled.
+ CODEGENOPT(EmitCallSiteInfo, 1, 0, Benign) ///< Emit call site info only in the case of
+                                            ///< '-g' + 'O>0' level.
+diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
+index f926295..846c9ac 100644
+--- a/clang/include/clang/Driver/Options.td
++++ b/clang/include/clang/Driver/Options.td
+@@ -1114,5 +1114,25 @@ def client__name : JoinedOrSeparate<["-"], "client_name">;
+ def combine : Flag<["-", "--"], "combine">, Flags<[NoXarchOption, Unsupported]>;
+ def compatibility__version : JoinedOrSeparate<["-"], "compatibility_version">;
++def enstr : Flag<["-"], "enstr">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable VLLVM string encryption obfuscation">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMEncryptoStr">>;
++def fla : Flag<["-"], "fla">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable VLLVM control-flow flattening obfuscation">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMFlattenFunc">>;
++def icall : Flag<["-"], "icall">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable VLLVM indirect call obfuscation">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMIndirectCall">>;
++def ibr : Flag<["-"], "ibr">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable VLLVM indirect branch obfuscation">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMIndirectBranch">>;
++def ollvm : Flag<["-"], "ollvm">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable all VLLVM obfuscation passes">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMAll">>;
+ def config : Joined<["--"], "config=">, Flags<[NoXarchOption]>,
+   Visibility<[ClangOption, CLOption, DXCOption, FlangOption]>, MetaVarName<"<file>">,
+   HelpText<"Specify configuration file">;
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index ef6eb4a..2f3d71a 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -7608,6 +7608,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+     A->claim();
+   }
+ 
++  // Forward VLLVM obfuscation options to -cc1.
++  for (const Arg *A :
++       Args.filtered(options::OPT_ollvm, options::OPT_enstr, options::OPT_fla,
++                     options::OPT_icall, options::OPT_ibr)) {
++    A->render(Args, CmdArgs);
++    A->claim();
++  }
++
+   // Forward --vfsoverlay to -cc1.
+   for (const Arg *A : Args.filtered(options::OPT_vfsoverlay)) {
+     CmdArgs.push_back("--vfsoverlay");
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index 6519572..f25da9b 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -57,6 +57,7 @@
+ #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
+ #include "llvm/Transforms/ObjCARC.h"
+ #include "llvm/Transforms/Scalar/EarlyCSE.h"
++#include "llvm/Transforms/VLLVM/VLLVM.h"
+ #include "llvm/Transforms/Scalar/GVN.h"
+ #include "llvm/Transforms/Scalar/JumpThreading.h"
+ #include "llvm/Transforms/Utils/Debugify.h"
+@@ -969,5 +970,19 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+   for (const auto &PassCallback : CodeGenOpts.PassBuilderCallbacks)
+     PassCallback(PB);
++  if (CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr ||
++      CodeGenOpts.VLLVMFlattenFunc || CodeGenOpts.VLLVMIndirectCall ||
++      CodeGenOpts.VLLVMIndirectBranch) {
++    llvm::vllvm::VLLVMOptions Options;
++    Options.EncryptoStr = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr;
++    Options.FlattenFunc = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMFlattenFunc;
++    Options.IndirectCall = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectCall;
++    Options.IndirectBranch =
++        CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectBranch;
++    PB.registerPipelineStartEPCallback(
++        [Options](ModulePassManager &MPM, OptimizationLevel) {
++          llvm::vllvm::addVLLVMPasses(MPM, Options);
++        });
++  }
+ #define HANDLE_EXTENSION(Ext)                                                  \
+   get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);
+ #include "llvm/Support/Extension.def"
+diff --git a/clang/lib/CodeGen/CMakeLists.txt b/clang/lib/CodeGen/CMakeLists.txt
+index f4e5697..87c186d 100644
+--- a/clang/lib/CodeGen/CMakeLists.txt
++++ b/clang/lib/CodeGen/CMakeLists.txt
+@@ -28,6 +28,7 @@ set(LLVM_LINK_COMPONENTS
+   Target
+   TargetParser
+   TransformUtils
++  VLLVM
+   )
+ 
+ # Workaround for MSVC ARM64 performance regression:
