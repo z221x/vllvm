@@ -71,6 +71,7 @@ configure_and_build() {
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
     -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_PREFIX" \
     "-DLLVM_ENABLE_PROJECTS=clang;clang-tools-extra;lld" \
+    -DCLANG_DEFAULT_LINKER=lld \
     -DLLVM_TARGETS_TO_BUILD=host \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -80,7 +81,7 @@ configure_and_build() {
     -DLLVM_ENABLE_LIBXML2=OFF \
     -DLLVM_ENABLE_TERMINFO=OFF
 
-  cmake --build "$LLVM_BUILD" --target clang clangd --parallel "$JOBS"
+  cmake --build "$LLVM_BUILD" --target clang clangd lld --parallel "$JOBS"
 }
 
 require_command cmake

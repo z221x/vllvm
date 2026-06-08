@@ -63,7 +63,7 @@ function Copy-VllvmSources {
     cmake -E copy_if_different $_.FullName (Join-Path $DstInclude $_.Name)
   }
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VLLVM.h") `
-    (Join-Path $PublicInclude "VLLVM.h")
+  (Join-Path $PublicInclude "VLLVM.h")
 }
 
 function Apply-VllvmPatch {
@@ -72,7 +72,8 @@ function Apply-VllvmPatch {
     $ErrorActionPreference = "Continue"
     & git -C $LLVMSource apply --reverse --check $PatchFile *> $null
     $ReverseCheckExitCode = $LASTEXITCODE
-  } finally {
+  }
+  finally {
     $ErrorActionPreference = $OldErrorActionPreference
   }
 
@@ -86,7 +87,8 @@ function Apply-VllvmPatch {
     $ErrorActionPreference = "Continue"
     & git -C $LLVMSource apply --check $PatchFile *> $null
     $ApplyCheckExitCode = $LASTEXITCODE
-  } finally {
+  }
+  finally {
     $ErrorActionPreference = $OldErrorActionPreference
   }
 
@@ -112,6 +114,7 @@ function Configure-AndBuild {
     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
     "-DCMAKE_INSTALL_PREFIX=$LLVMInstallPrefix",
     "-DLLVM_ENABLE_PROJECTS=clang;clang-tools-extra;lld",
+    "-DCLANG_DEFAULT_LINKER=lld",
     "-DLLVM_TARGETS_TO_BUILD=host",
     "-DLLVM_INCLUDE_TESTS=OFF",
     "-DLLVM_INCLUDE_EXAMPLES=OFF",
@@ -123,7 +126,7 @@ function Configure-AndBuild {
   )
 
   cmake @Args
-  cmake --build $LLVMBuild --target clang clangd --parallel $Jobs
+  cmake --build $LLVMBuild --target clang clangd lld --parallel $Jobs
 }
 
 Require-Command cmake
