@@ -83,6 +83,17 @@ run_case() {
     ;;
   icall)
     grep -q "func_table" "$ll"
+    grep -q "func_index_table.* global " "$ll"
+    if grep -q "func_index_table.* constant " "$ll"; then
+      echo "icall encrypted index table must be writable data" >&2
+      exit 1
+    fi
+    if grep -q "@func_table.*getelementptr" "$ll"; then
+      echo "icall function table must store plain function addresses" >&2
+      exit 1
+    fi
+    grep -q "load volatile i32" "$ll"
+    grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$ll"
     ;;
   ibr)
     grep -q "indirectbr" "$ll"
