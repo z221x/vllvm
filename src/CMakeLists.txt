@@ -7,6 +7,7 @@ add_llvm_component_library(LLVMVLLVM
   EncryptoStrPass.cpp
   IndirectCallPass.cpp
   IndirectBranchPass.cpp
+  LocalVarStructPass.cpp
   PassInfo.cpp
   CryptoUtils.cpp
 

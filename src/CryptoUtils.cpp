@@ -1,7 +1,7 @@
 #include "CryptoUtils.h"
 namespace llvm {
 uint64_t CryptoUtils::getRandom64BaiscIndex(uint32_t index) {
-  uint64_t tmpA, tmpB = 0;
+  uint64_t tmpA = 0, tmpB = 0;
   uint32_t seed = sbox[index & 0xff] | sbox[(index >> 8) & 0xff] << 8 |
                   sbox[(index >> 16) & 0xff] << 16 |
                   sbox[(index >> 24) & 0xff] << 24;

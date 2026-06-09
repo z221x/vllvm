@@ -7,10 +7,9 @@
 PreservedAnalyses IndirectBranchPass::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] IndirectBranchPass:" << F.getName() << "\n";
-  bool isChanged = false;
   cryptoUtils = new CryptoUtils(F.getParent());
   getAllBBs(F);
-  isChanged = makeIndirectBranch(F, makeGloableBBTable(F));
+  bool isChanged = makeIndirectBranch(F, makeGloableBBTable(F));
   return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 void IndirectBranchPass::getAllBBs(Function &F) {
@@ -41,11 +40,14 @@ void IndirectBranchPass::getAllBBs(Function &F) {
   long seed = cryptoUtils->getRandom32();
   std::default_random_engine e(seed);
   std::shuffle(BBTargets.begin(), BBTargets.end(), e);
-  for (int i = 0; i < BBTargets.size(); i++) {
-    BBNums[BBTargets[i]] = i;
+  for (size_t i = 0; i < BBTargets.size(); ++i) {
+    BBNums[BBTargets[i]] = static_cast<int>(i);
   }
 }
 GlobalVariable *IndirectBranchPass::makeGloableBBTable(Function &F) {
+  if (BBTargets.empty())
+    return nullptr;
+
   std::vector<Constant *> BBArray;
   Module *M = F.getParent();
   LLVMContext &Ctx = F.getContext();
@@ -65,7 +67,11 @@ GlobalVariable *IndirectBranchPass::makeGloableBBTable(Function &F) {
 }
 bool IndirectBranchPass::makeIndirectBranch(Function &F,
                                             GlobalVariable *BBTableGV) {
+  if (BrInstSites.empty() || BBTableGV == nullptr)
+    return false;
+
   LLVMContext &Ctx = F.getContext();
+  auto *BBTableTy = cast<ArrayType>(BBTableGV->getValueType());
   for (BranchInst *BI : BrInstSites) {
     if (BI->isConditional()) {
       unsigned N = BI->getNumSuccessors();
@@ -85,7 +91,9 @@ bool IndirectBranchPass::makeIndirectBranch(Function &F,
           ConstantInt::get(IRB.getInt32Ty(), BBNums[BI->getSuccessor(1)]);
       Value *Idx = IRB.CreateSelect(Cond, TIdx, FIdx);
       // 计算目标地址
-      Value *BBPtr = IRB.CreateGEP(Type::getInt64Ty(Ctx), BBTableGV, Idx);
+      Value *BBPtr = IRB.CreateInBoundsGEP(
+          BBTableTy, BBTableGV,
+          {ConstantInt::get(Type::getInt32Ty(Ctx), 0), Idx});
       Value *BBAddr = IRB.CreateLoad(IRB.getPtrTy(), BBPtr);
       addKey = IRB.CreateNeg(addKey);
       BBAddr = IRB.CreateGEP(IRB.getInt8Ty(), BBAddr, addKey);
@@ -103,9 +111,10 @@ bool IndirectBranchPass::makeIndirectBranch(Function &F,
       IRBuilder<> IRB(BI);
       IRB.SetInsertPoint(BI);
       // 计算目标地址
-      Value *BBPtr =
-          IRB.CreateGEP(Type::getInt64Ty(Ctx), BBTableGV,
-                        ConstantInt::get(Type::getInt64Ty(Ctx), BBNums[Succ]));
+      Value *BBPtr = IRB.CreateInBoundsGEP(
+          BBTableTy, BBTableGV,
+          {ConstantInt::get(Type::getInt32Ty(Ctx), 0),
+           ConstantInt::get(Type::getInt32Ty(Ctx), BBNums[Succ])});
       Value *BBAddr = IRB.CreateLoad(IRB.getPtrTy(), BBPtr);
       Constant *addKey =
           ConstantInt::get(Type::getInt32Ty(Ctx),

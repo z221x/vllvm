@@ -1,17 +1,9 @@
-diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
-index 169d177..2e2a271 100644
---- a/llvm/lib/Transforms/CMakeLists.txt
-+++ b/llvm/lib/Transforms/CMakeLists.txt
-@@ -10,3 +10,4 @@ add_subdirectory(ObjCARC)
- add_subdirectory(Coroutines)
- add_subdirectory(CFGuard)
- add_subdirectory(HipStdPar)
-+add_subdirectory(VLLVM)
 diff --git a/clang/include/clang/Basic/CodeGenOptions.def b/clang/include/clang/Basic/CodeGenOptions.def
-index 90f91c1..25eb0a3 100644
+index 41031026c..834d15d2c 100644
 --- a/clang/include/clang/Basic/CodeGenOptions.def
 +++ b/clang/include/clang/Basic/CodeGenOptions.def
-@@ -77,5 +77,10 @@ CODEGENOPT(EnableNoundefAttrs, 1, 0, Benign) ///< Enable emitting `noundef` attr
+@@ -69,6 +69,12 @@ CODEGENOPT(ExperimentalStrictFloatingPoint, 1, 0, Benign) ///< Enables the new,
+ CODEGENOPT(EnableNoundefAttrs, 1, 0, Benign) ///< Enable emitting `noundef` attributes on IR call arguments and return values
  CODEGENOPT(DebugPassManager, 1, 0, Benign) ///< Prints debug information for the new
                                             ///< pass manager.
 +CODEGENOPT(VLLVMAll, 1, 0, Benign) ///< Enable every VLLVM obfuscation pass.
@@ -19,14 +11,16 @@ index 90f91c1..25eb0a3 100644
 +CODEGENOPT(VLLVMFlattenFunc, 1, 0, Benign) ///< Enable VLLVM control-flow flattening.
 +CODEGENOPT(VLLVMIndirectCall, 1, 0, Benign) ///< Enable VLLVM indirect calls.
 +CODEGENOPT(VLLVMIndirectBranch, 1, 0, Benign) ///< Enable VLLVM indirect branches.
++CODEGENOPT(VLLVMLocalVarStruct, 1, 0, Benign) ///< Enable VLLVM local variable struct packing.
  CODEGENOPT(DisableRedZone    , 1, 0, Benign) ///< Set when -mno-red-zone is enabled.
  CODEGENOPT(EmitCallSiteInfo, 1, 0, Benign) ///< Emit call site info only in the case of
                                             ///< '-g' + 'O>0' level.
 diff --git a/clang/include/clang/Driver/Options.td b/clang/include/clang/Driver/Options.td
-index f926295..846c9ac 100644
+index 958d0d05a..d15309ab6 100644
 --- a/clang/include/clang/Driver/Options.td
 +++ b/clang/include/clang/Driver/Options.td
-@@ -1114,5 +1114,25 @@ def client__name : JoinedOrSeparate<["-"], "client_name">;
+@@ -1112,6 +1112,30 @@ def cl_ext_EQ : CommaJoined<["-"], "cl-ext=">, Group<opencl_Group>,
+ def client__name : JoinedOrSeparate<["-"], "client_name">;
  def combine : Flag<["-", "--"], "combine">, Flags<[NoXarchOption, Unsupported]>;
  def compatibility__version : JoinedOrSeparate<["-"], "compatibility_version">;
 +def enstr : Flag<["-"], "enstr">,
@@ -45,6 +39,10 @@ index f926295..846c9ac 100644
 +  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
 +  HelpText<"Enable VLLVM indirect branch obfuscation">,
 +  MarshallingInfoFlag<CodeGenOpts<"VLLVMIndirectBranch">>;
++def lvars : Flag<["-"], "lvars">,
++  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
++  HelpText<"Enable VLLVM local variable struct obfuscation">,
++  MarshallingInfoFlag<CodeGenOpts<"VLLVMLocalVarStruct">>;
 +def ollvm : Flag<["-"], "ollvm">,
 +  Flags<[NoXarchOption]>, Visibility<[ClangOption, CC1Option]>,
 +  HelpText<"Enable all VLLVM obfuscation passes">,
@@ -52,30 +50,11 @@ index f926295..846c9ac 100644
  def config : Joined<["--"], "config=">, Flags<[NoXarchOption]>,
    Visibility<[ClangOption, CLOption, DXCOption, FlangOption]>, MetaVarName<"<file>">,
    HelpText<"Specify configuration file">;
-diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
-index ef6eb4a..2f3d71a 100644
---- a/clang/lib/Driver/ToolChains/Clang.cpp
-+++ b/clang/lib/Driver/ToolChains/Clang.cpp
-@@ -7608,6 +7608,14 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
-     A->claim();
-   }
- 
-+  // Forward VLLVM obfuscation options to -cc1.
-+  for (const Arg *A :
-+       Args.filtered(options::OPT_ollvm, options::OPT_enstr, options::OPT_fla,
-+                     options::OPT_icall, options::OPT_ibr)) {
-+    A->render(Args, CmdArgs);
-+    A->claim();
-+  }
-+
-   // Forward --vfsoverlay to -cc1.
-   for (const Arg *A : Args.filtered(options::OPT_vfsoverlay)) {
-     CmdArgs.push_back("--vfsoverlay");
 diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
-index 6519572..f25da9b 100644
+index 2f6d4c414..ba71ae473 100644
 --- a/clang/lib/CodeGen/BackendUtil.cpp
 +++ b/clang/lib/CodeGen/BackendUtil.cpp
-@@ -57,6 +57,7 @@
+@@ -83,6 +83,7 @@
  #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
  #include "llvm/Transforms/ObjCARC.h"
  #include "llvm/Transforms/Scalar/EarlyCSE.h"
@@ -83,18 +62,21 @@ index 6519572..f25da9b 100644
  #include "llvm/Transforms/Scalar/GVN.h"
  #include "llvm/Transforms/Scalar/JumpThreading.h"
  #include "llvm/Transforms/Utils/Debugify.h"
-@@ -969,5 +970,19 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+@@ -990,6 +991,22 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+   }
    for (const auto &PassCallback : CodeGenOpts.PassBuilderCallbacks)
      PassCallback(PB);
 +  if (CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr ||
 +      CodeGenOpts.VLLVMFlattenFunc || CodeGenOpts.VLLVMIndirectCall ||
-+      CodeGenOpts.VLLVMIndirectBranch) {
++      CodeGenOpts.VLLVMIndirectBranch || CodeGenOpts.VLLVMLocalVarStruct) {
 +    llvm::vllvm::VLLVMOptions Options;
 +    Options.EncryptoStr = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr;
 +    Options.FlattenFunc = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMFlattenFunc;
 +    Options.IndirectCall = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectCall;
 +    Options.IndirectBranch =
 +        CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectBranch;
++    Options.LocalVarStruct =
++        CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMLocalVarStruct;
 +    PB.registerPipelineStartEPCallback(
 +        [Options](ModulePassManager &MPM, OptimizationLevel) {
 +          llvm::vllvm::addVLLVMPasses(MPM, Options);
@@ -104,10 +86,10 @@ index 6519572..f25da9b 100644
    get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);
  #include "llvm/Support/Extension.def"
 diff --git a/clang/lib/CodeGen/CMakeLists.txt b/clang/lib/CodeGen/CMakeLists.txt
-index f4e5697..87c186d 100644
+index a05b31f97..48e193a65 100644
 --- a/clang/lib/CodeGen/CMakeLists.txt
 +++ b/clang/lib/CodeGen/CMakeLists.txt
-@@ -28,6 +28,7 @@ set(LLVM_LINK_COMPONENTS
+@@ -31,6 +31,7 @@ set(LLVM_LINK_COMPONENTS
    Target
    TargetParser
    TransformUtils
@@ -115,3 +97,1497 @@ index f4e5697..87c186d 100644
    )
  
  # Workaround for MSVC ARM64 performance regression:
+diff --git a/clang/lib/Driver/ToolChains/Clang.cpp b/clang/lib/Driver/ToolChains/Clang.cpp
+index 626133223..53de7e85a 100644
+--- a/clang/lib/Driver/ToolChains/Clang.cpp
++++ b/clang/lib/Driver/ToolChains/Clang.cpp
+@@ -7607,6 +7607,15 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
+     A->claim();
+   }
+ 
++  // Forward VLLVM obfuscation options to -cc1.
++  for (const Arg *A :
++       Args.filtered(options::OPT_ollvm, options::OPT_enstr, options::OPT_fla,
++                     options::OPT_icall, options::OPT_ibr,
++                     options::OPT_lvars)) {
++    A->render(Args, CmdArgs);
++    A->claim();
++  }
++
+   // Forward --vfsoverlay to -cc1.
+   for (const Arg *A : Args.filtered(options::OPT_vfsoverlay)) {
+     CmdArgs.push_back("--vfsoverlay");
+diff --git a/llvm/include/llvm/Transforms/VLLVM/VLLVM.h b/llvm/include/llvm/Transforms/VLLVM/VLLVM.h
+new file mode 100644
+index 000000000..401925b0b
+--- /dev/null
++++ b/llvm/include/llvm/Transforms/VLLVM/VLLVM.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "llvm/IR/PassManager.h"
++
++namespace llvm::vllvm {
++struct VLLVMOptions {
++  bool EncryptoStr = false;
++  bool FlattenFunc = false;
++  bool IndirectCall = false;
++  bool IndirectBranch = false;
++  bool LocalVarStruct = false;
++
++  bool any() const {
++    return EncryptoStr || FlattenFunc || IndirectCall || IndirectBranch ||
++           LocalVarStruct;
++  }
++};
++
++void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options);
++} // namespace llvm::vllvm
+diff --git a/llvm/lib/Transforms/CMakeLists.txt b/llvm/lib/Transforms/CMakeLists.txt
+index 7046f2f4b..11fea9346 100644
+--- a/llvm/lib/Transforms/CMakeLists.txt
++++ b/llvm/lib/Transforms/CMakeLists.txt
+@@ -9,3 +9,4 @@ add_subdirectory(ObjCARC)
+ add_subdirectory(Coroutines)
+ add_subdirectory(CFGuard)
+ add_subdirectory(HipStdPar)
++add_subdirectory(VLLVM)
+diff --git a/llvm/lib/Transforms/VLLVM/CMakeLists.txt b/llvm/lib/Transforms/VLLVM/CMakeLists.txt
+new file mode 100644
+index 000000000..a39aa1b73
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/CMakeLists.txt
+@@ -0,0 +1,28 @@
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
++    "Generate compile_commands.json for clangd" FORCE)
++
++add_llvm_component_library(LLVMVLLVM
++  Utils.cpp
++  FlattenFuncPass.cpp
++  EncryptoStrPass.cpp
++  IndirectCallPass.cpp
++  IndirectBranchPass.cpp
++  LocalVarStructPass.cpp
++  PassInfo.cpp
++  CryptoUtils.cpp
++
++  ADDITIONAL_HEADER_DIRS
++  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/VLLVM
++
++  LINK_COMPONENTS
++  Analysis
++  Core
++  Passes
++  Support
++  TransformUtils
++)
++
++target_include_directories(LLVMVLLVM
++  PRIVATE
++  "${CMAKE_CURRENT_SOURCE_DIR}/include"
++)
+diff --git a/llvm/lib/Transforms/VLLVM/CryptoUtils.cpp b/llvm/lib/Transforms/VLLVM/CryptoUtils.cpp
+new file mode 100644
+index 000000000..0f0161264
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/CryptoUtils.cpp
+@@ -0,0 +1,26 @@
++#include "CryptoUtils.h"
++namespace llvm {
++uint64_t CryptoUtils::getRandom64BaiscIndex(uint32_t index) {
++  uint64_t tmpA = 0, tmpB = 0;
++  uint32_t seed = sbox[index & 0xff] | sbox[(index >> 8) & 0xff] << 8 |
++                  sbox[(index >> 16) & 0xff] << 16 |
++                  sbox[(index >> 24) & 0xff] << 24;
++  seed = seed ^ (randomKey[0] | randomKey[1] << 8 | randomKey[2] << 16 |
++                 randomKey[3] << 24);
++  srand(seed);
++  tmpA ^= rand();
++  tmpB ^= (randomKey[4] | randomKey[5] << 8 | randomKey[6] << 16 |
++           randomKey[7] << 24);
++  tmpB ^= tmpA;
++  tmpA = tmpA << 32;
++  tmpA ^= rand();
++  tmpB ^= (randomKey[8] | randomKey[9] << 8 | randomKey[10] << 16 |
++           randomKey[11] << 24);
++  tmpB ^= tmpA;
++  tmpA = tmpA << 32;
++  tmpA ^= rand();
++  tmpB ^= (randomKey[12] | randomKey[13] << 8 | randomKey[14] << 16 |
++           randomKey[15] << 24);
++  return (tmpA ^ tmpB);
++}
++} // namespace llvm
+diff --git a/llvm/lib/Transforms/VLLVM/EncryptoStrPass.cpp b/llvm/lib/Transforms/VLLVM/EncryptoStrPass.cpp
+new file mode 100644
+index 000000000..cf9a7f465
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/EncryptoStrPass.cpp
+@@ -0,0 +1,266 @@
++#include "EncryptoStrPass.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/Support/RandomNumberGenerator.h"
++
++#include <array>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <vector>
++
++using namespace llvm;
++
++namespace {
++constexpr size_t KeySize = 16;
++}
++
++class EncryptoStrPass::EncryptoStr {
++public:
++  uint64_t strID; // 用于标识以及密钥生成
++  GlobalVariable *strVar;
++  std::array<uint8_t, KeySize> encKey{};
++  std::vector<User *> callUser;
++  Function *decFunc;
++  Module &M;
++  bool isDouble;
++
++  EncryptoStr(uint64_t id, GlobalVariable *strvar, bool isdouble, Module &m)
++      : strID(id), strVar(strvar), decFunc(nullptr), M(m), isDouble(isdouble) {
++    // 生成key
++    getRandomKey();
++    makeDecryptoFunc();
++  }
++
++  void encryptoStr() {
++    auto *cda = dyn_cast<ConstantDataArray>(strVar->getInitializer());
++    if (!cda)
++      return;
++
++    std::string encValue = encrypto(cda->getAsString());
++    // 修改构造器
++    Constant *newInit = ConstantDataArray::getString(
++        M.getContext(), StringRef(encValue.data(), encValue.size()), false);
++    strVar->setInitializer(newInit);
++    // 设置可写
++    strVar->setConstant(false);
++  }
++
++  std::string encrypto(StringRef strRef) const {
++    std::string result(strRef.begin(), strRef.end());
++    for (size_t i = 0; i < result.size(); ++i) {
++      result[i] = static_cast<char>(
++          static_cast<uint8_t>(result[i]) ^ encKey[i % encKey.size()]);
++    }
++    return result;
++  }
++
++  void makeDecryptoFunc() {
++    if (isDouble) {
++      decFunc = M.getFunction("_decrypto" + std::to_string(strID));
++      return;
++    }
++
++    LLVMContext &Ctx = M.getContext();
++    IRBuilder<> IRB(Ctx);
++    FunctionType *decryptoFuncType =
++        FunctionType::get(IRB.getPtrTy(), {IRB.getPtrTy()}, false);
++    decFunc = Function::Create(decryptoFuncType, Function::PrivateLinkage,
++                               "_decrypto" + std::to_string(strID), &M);
++
++    // 创建函数体
++    BasicBlock *entryBB = BasicBlock::Create(Ctx, "entry", decFunc);
++    BasicBlock *loopBB = BasicBlock::Create(Ctx, "loop", decFunc);
++    BasicBlock *loopbrBB = BasicBlock::Create(Ctx, "loopbr", decFunc);
++    BasicBlock *exitBB = BasicBlock::Create(Ctx, "exit", decFunc);
++
++    // 获取参数
++    auto argIter = decFunc->arg_begin();
++    Value *strArg = argIter++;
++    strArg->setName("strArg");
++
++    IRB.SetInsertPoint(entryBB);
++    auto *arrayTy = cast<ArrayType>(strVar->getValueType());
++    uint64_t strSize = arrayTy->getNumElements();
++    // 创建result
++    FunctionType *mallocType =
++        FunctionType::get(IRB.getPtrTy(), {IRB.getInt64Ty()}, false);
++    FunctionCallee mallocFunc = M.getOrInsertFunction("malloc", mallocType);
++    Value *result = IRB.CreateCall(mallocFunc, {IRB.getInt64(strSize)});
++
++    // 创建变量key
++    ArrayType *keyArrayType = ArrayType::get(IRB.getInt8Ty(), KeySize);
++    Value *keyVar = IRB.CreateAlloca(keyArrayType, nullptr, "key");
++    for (size_t i = 0; i < encKey.size(); ++i) {
++      // 数组索引、元素索引
++      Value *index[] = {IRB.getInt32(0), IRB.getInt32(static_cast<uint32_t>(i))};
++      Value *keyElemPtr = IRB.CreateGEP(keyArrayType, keyVar, index);
++      Value *keyValue = IRB.getInt8(encKey[i]);
++      // 存储元素值
++      IRB.CreateStore(keyValue, keyElemPtr);
++    }
++
++    // 创建变量i=0
++    Value *iVar = IRB.CreateAlloca(IRB.getInt64Ty(), nullptr, "i");
++    IRB.CreateStore(IRB.getInt64(0), iVar);
++    IRB.CreateBr(loopBB);
++
++    // 解密循环
++    /*
++    for(int i=0;i<strlen;i++)
++    {
++      result[i]=str[i]^key[i];
++    }
++    */
++    IRB.SetInsertPoint(loopBB);
++    Value *iLoad = IRB.CreateLoad(IRB.getInt64Ty(), iVar, "iLoad");
++    Value *cond = IRB.CreateICmpULT(iLoad, IRB.getInt64(strSize), "cond");
++    IRB.CreateCondBr(cond, loopbrBB, exitBB);
++
++    IRB.SetInsertPoint(loopbrBB);
++    Value *strPtr = IRB.CreateGEP(IRB.getInt8Ty(), strArg, iLoad, "strPtr");
++    Value *strLoad = IRB.CreateLoad(IRB.getInt8Ty(), strPtr, "strLoad");
++    Value *keyOffset =
++        IRB.CreateURem(iLoad, IRB.getInt64(encKey.size()), "keyOffset");
++    Value *keyIndex[] = {IRB.getInt32(0), keyOffset};
++    Value *keyPtr =
++        IRB.CreateInBoundsGEP(keyArrayType, keyVar, keyIndex, "keyPtr");
++    Value *keyLoad = IRB.CreateLoad(IRB.getInt8Ty(), keyPtr, "keyLoad");
++    Value *xorValue = IRB.CreateXor(strLoad, keyLoad, "xorValue");
++    Value *outPtr = IRB.CreateGEP(IRB.getInt8Ty(), result, iLoad, "outPtr");
++    IRB.CreateStore(xorValue, outPtr);
++    Value *iNext = IRB.CreateAdd(iLoad, IRB.getInt64(1), "iNext");
++    IRB.CreateStore(iNext, iVar);
++    IRB.CreateBr(loopBB);
++
++    IRB.SetInsertPoint(exitBB);
++    IRB.CreateRet(result);
++  }
++
++  void getRandomKey() {
++    // 根据strID生成唯一的RandomNumberGenerator
++    std::unique_ptr<RandomNumberGenerator> RNG =
++        M.createRNG(std::to_string(strID));
++    uint64_t part1 = (*RNG)(); // 前8字节
++    uint64_t part2 = (*RNG)(); // 后8字节
++    memcpy(encKey.data(), &part1, 8);
++    memcpy(encKey.data() + 8, &part2, 8);
++  }
++
++  bool insertDecryptoCall() {
++    if (!decFunc)
++      return false;
++
++    if (isDouble) {
++      for (User *user : callUser) {
++        auto *instr = dyn_cast<Instruction>(user);
++        if (!instr)
++          return false;
++
++        IRBuilder<> IRB(instr);
++        // char ** tmp = dec(*ptr)
++        Value *tmpVar = IRB.CreateAlloca(IRB.getPtrTy(), nullptr);
++        Value *arg = IRB.CreateLoad(IRB.getPtrTy(), strVar);
++        IRB.CreateStore(IRB.CreateCall(decFunc, {arg}), tmpVar);
++        instr->replaceUsesOfWith(strVar, tmpVar);
++      }
++      return true;
++    }
++
++    for (User *user : callUser) {
++      auto *instr = dyn_cast<Instruction>(user);
++      if (!instr)
++        return false;
++
++      IRBuilder<> IRB(instr);
++      Value *strPtr = IRB.CreateBitCast(strVar, IRB.getPtrTy());
++      instr->replaceUsesOfWith(strVar, IRB.CreateCall(decFunc, {strPtr}));
++    }
++    return true;
++  }
++};
++
++PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
++  errs() << "[vllvm] EncryptoStrPass:" << M.getName() << "\n";
++  bool isChanged = false;
++  std::vector<EncryptoStr *> encryptoStrPool = makeEncryptoStrPool(M);
++  for (EncryptoStr *encryptoStr : encryptoStrPool) {
++    if (!encryptoStr->insertDecryptoCall()) {
++      isChanged = false;
++      break;
++    }
++    isChanged = true;
++  }
++  for (EncryptoStr *encryptoStr : encryptoStrPool)
++    delete encryptoStr;
++  return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
++
++std::vector<EncryptoStrPass::EncryptoStr *>
++EncryptoStrPass::makeEncryptoStrPool(Module &M) {
++  std::vector<EncryptoStr *> encStringPool;
++  uint64_t ID = 0;
++  for (GlobalVariable &globalVar : M.globals()) {
++    ++ID;
++    // 全局变量有构造器
++    if (!globalVar.hasInitializer() || !globalVar.getValueType()->isArrayTy())
++      continue;
++
++    auto *cda = dyn_cast<ConstantDataArray>(globalVar.getInitializer());
++    // 字符串
++    if (!cda || !cda->isString())
++      continue;
++
++    auto *encryptoStr = new EncryptoStr(ID, &globalVar, false, M);
++    std::vector<EncryptoStr *> pendingDoubleStrings;
++    bool supported = true;
++
++    // 第一层调用
++    for (User *userFirst : globalVar.users()) {
++      if (isa<Instruction>(userFirst)) {
++        encryptoStr->callUser.push_back(userFirst);
++        continue;
++      }
++
++      // 如果使用者是全局变量，则寻找使用者的调用
++      auto *global = dyn_cast<GlobalVariable>(userFirst);
++      if (!global) {
++        supported = false;
++        break;
++      }
++
++      auto *encryptoStrDouble = new EncryptoStr(ID, global, true, M);
++      for (User *userSecond : global->users()) {
++        if (isa<Instruction>(userSecond)) {
++          encryptoStrDouble->callUser.push_back(userSecond);
++          continue;
++        }
++
++        // 如果有第三层引用就不在加密此字符串
++        supported = false;
++        break;
++      }
++
++      if (!supported) {
++        delete encryptoStrDouble;
++        break;
++      }
++      pendingDoubleStrings.push_back(encryptoStrDouble);
++    }
++
++    if (!supported) {
++      for (EncryptoStr *pending : pendingDoubleStrings)
++        delete pending;
++      delete encryptoStr;
++      continue;
++    }
++
++    // 加密字符串
++    encryptoStr->encryptoStr();
++    encStringPool.insert(encStringPool.end(), pendingDoubleStrings.begin(),
++                         pendingDoubleStrings.end());
++    encStringPool.push_back(encryptoStr);
++  }
++  return encStringPool;
++}
+diff --git a/llvm/lib/Transforms/VLLVM/FlattenFuncPass.cpp b/llvm/lib/Transforms/VLLVM/FlattenFuncPass.cpp
+new file mode 100644
+index 000000000..40cc03dd4
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/FlattenFuncPass.cpp
+@@ -0,0 +1,176 @@
++#include "FlattenFuncPass.h"
++#include "CryptoUtils.h"
++#include "Utils.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/Transforms/Utils/LowerSwitch.h"
++PreservedAnalyses FlattenFuncPass::run(Function &F,
++                                       FunctionAnalysisManager &FAM) {
++  errs() << "[vllvm] FlattenFuncPass:" << F.getName() << "\n";
++  bool isChanged = false;
++  isChanged = doFlatten(F, FAM);
++  return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
++bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
++  std::vector<BasicBlock *> flattenBBs;
++  LowerSwitchPass lowerSwitchPass;
++  PreservedAnalyses Changed = lowerSwitchPass.run(F, FAM);
++  LLVMContext &Ctx = F.getContext();
++  BasicBlock *switchLoopEntry;
++  BasicBlock *switchLoopEnd;
++  LoadInst *load;
++  SwitchInst *switchI;
++  Module *M = F.getParent();
++  // 初始化cryptoUtils
++  CryptoUtils *cryptoUtils = new CryptoUtils(M);
++  // 获取所有基本块
++  for (Function::iterator bb = F.begin(); bb != F.end(); bb++) {
++
++    flattenBBs.push_back(&(*bb));
++  }
++  if (flattenBBs.size() <= 1) {
++    return false;
++  }
++  // 异常处理修正
++  for (Function::iterator bb = F.begin(); bb != F.end(); bb++) {
++    if (isa<InvokeInst>(bb->getTerminator())) {
++      InvokeInst *inst = reinterpret_cast<InvokeInst *>(bb->getTerminator());
++      auto removeBB = std::find(flattenBBs.begin(), flattenBBs.end(),
++                                inst->getUnwindDest());
++      if (removeBB != flattenBBs.end()) {
++        flattenBBs.erase(removeBB);
++      }
++    }
++  }
++  flattenBBs.erase(flattenBBs.begin()); // 删除入口基本块
++  // 入口基本块处理
++  BasicBlock *entryBB = &*(F.begin());
++  // 如果末尾指令是br
++  BranchInst *br = NULL;
++  if (isa<BranchInst>(entryBB->getTerminator())) {
++    br = cast<BranchInst>(entryBB->getTerminator());
++  }
++  // 条件跳转与多分支跳转处理
++  if (entryBB->getTerminator()->getNumSuccessors() > 1 &&
++      (br != NULL && br->isConditional())) {
++    BasicBlock::iterator i = entryBB->end();
++    --i;
++
++    if (entryBB->size() > 1) {
++      --i;
++    }
++
++    // 将条件跳转的语句切割出来，成为一个新的基本块
++    BasicBlock *tmpBB = entryBB->splitBasicBlock(i, "first");
++    flattenBBs.insert(flattenBBs.begin(), tmpBB);
++  }
++  IRBuilder<> IRB(entryBB);
++  entryBB->getTerminator()->eraseFromParent(); // 删除原有的 terminator
++  // 创建控制变量与初始化支配key
++  AllocaInst *switchVar =
++      IRB.CreateAlloca(Type::getInt32Ty(Ctx), 0, "switchVar");
++  IRB.CreateStore(ConstantInt::get(Type::getInt32Ty(Ctx),
++                                   cryptoUtils->getRandom32BaiscIndex(0)),
++                  switchVar);
++  Constant *caseKeyValue = ConstantInt::get(Type::getInt32Ty(Ctx),
++                                            cryptoUtils->getRandom32(), false);
++  AllocaInst *caseKeyPtr =
++      IRB.CreateAlloca(Type::getInt32Ty(Ctx), 0, "caseKeyPtr");
++  IRB.CreateStore(caseKeyValue, caseKeyPtr);
++  // switch框架
++  switchLoopEntry = BasicBlock::Create(Ctx, "switchLoopEntry", &F, entryBB);
++  switchLoopEnd = BasicBlock::Create(Ctx, "switchLoopEnd", &F, entryBB);
++  load = new LoadInst(Type::getInt32Ty(Ctx), switchVar, "loadSwitchVar",
++                      switchLoopEntry);
++  // entryBB->switchLoopEntry
++  entryBB->moveBefore(switchLoopEntry);
++  BranchInst::Create(switchLoopEntry, entryBB);
++  BranchInst::Create(switchLoopEntry, switchLoopEnd);
++  BasicBlock *swDefault =
++      BasicBlock::Create(Ctx, "switchDefault", &F, switchLoopEnd);
++  BranchInst::Create(switchLoopEnd, swDefault);
++  switchI = SwitchInst::Create(load, swDefault, 0, switchLoopEntry);
++  // 给每个块分配case值
++  for (BasicBlock *bb : flattenBBs) {
++    ConstantInt *numCase = NULL;
++    bb->moveBefore(switchLoopEnd);
++    numCase = ConstantInt::get(Type::getInt32Ty(Ctx),
++                               cryptoUtils->getRandom32BaiscIndex(
++                                   switchI->getNumCases())); // 随机一个case值
++    switchI->addCase(numCase, bb);
++  }
++  // 修正每个原有基本块的后继
++  for (BasicBlock *bb : flattenBBs) {
++    // Ret块
++    if (bb->getTerminator()->getNumSuccessors() == 0) {
++      continue;
++    }
++    //
++    if (isa<InvokeInst>(bb->getTerminator())) {
++      continue;
++    }
++    if (bb->getTerminator()->getNumSuccessors() > 1 &&
++        (isa<IndirectBrInst>(bb->getTerminator()))) {
++      // errs() << "skip multi-branch flattening\n";
++      continue;
++    }
++    ConstantInt *numCase = NULL;
++    IRBuilder<> IRB(bb);
++    IRB.SetInsertPoint(bb->getTerminator());
++    if (bb->getTerminator()->getNumSuccessors() == 1) {
++      BasicBlock *succBB = bb->getTerminator()->getSuccessor(0);
++      numCase = switchI->findCaseDest(succBB);
++
++      if (numCase == NULL) {
++        numCase = ConstantInt::get(
++            Type::getInt32Ty(Ctx),
++            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
++      }
++      Constant *X = ConstantExpr::getSub(caseKeyValue, numCase);
++      Value *caseKeyTmp =
++          IRB.CreateLoad(Type::getInt32Ty(Ctx), caseKeyPtr, "caseKeyTmp");
++      Value *newNumCase = IRB.CreateSub(caseKeyTmp, X, "");
++      IRB.CreateStore(newNumCase, load->getPointerOperand());
++      IRB.CreateBr(switchLoopEntry);
++      bb->getTerminator()->eraseFromParent();
++      continue;
++    }
++    if (bb->getTerminator()->getNumSuccessors() == 2) {
++      ConstantInt *numCaseTrue =
++          switchI->findCaseDest(bb->getTerminator()->getSuccessor(0));
++      ConstantInt *numCaseFalse =
++          switchI->findCaseDest(bb->getTerminator()->getSuccessor(1));
++
++      if (numCaseTrue == NULL) {
++        numCaseTrue = ConstantInt::get(
++            Type::getInt32Ty(Ctx),
++            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
++      }
++      if (numCaseFalse == NULL) {
++        numCaseFalse = ConstantInt::get(
++            Type::getInt32Ty(Ctx),
++            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
++      }
++      Constant *X, *Y;
++      X = ConstantExpr::getSub(caseKeyValue, numCaseTrue);
++      Y = ConstantExpr::getSub(caseKeyValue, numCaseFalse);
++      Value *caseKeyTmp =
++          IRB.CreateLoad(Type::getInt32Ty(Ctx), caseKeyPtr, "caseKeyTmp");
++      Value *newNumCaseTrue = IRB.CreateSub(caseKeyTmp, X, "newNumCaseTrue");
++      Value *newNumCaseFalse = IRB.CreateSub(caseKeyTmp, Y, "newNumCaseFalse");
++      // 创建分支
++      BranchInst *br = cast<BranchInst>(bb->getTerminator());
++      Value *sel = IRB.CreateSelect(br->getCondition(), newNumCaseTrue,
++                                    newNumCaseFalse, "");
++
++      IRB.CreateStore(sel, load->getPointerOperand());
++      IRB.CreateBr(switchLoopEntry);
++      bb->getTerminator()->eraseFromParent();
++      continue;
++    }
++  }
++  //  收尾工作
++  fixStack(&F);
++  lowerSwitchPass.run(F, FAM);
++  return true;
++}
+diff --git a/llvm/lib/Transforms/VLLVM/IndirectBranchPass.cpp b/llvm/lib/Transforms/VLLVM/IndirectBranchPass.cpp
+new file mode 100644
+index 000000000..58636b3dc
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/IndirectBranchPass.cpp
+@@ -0,0 +1,133 @@
++
++#include "IndirectBranchPass.h"
++#include "llvm/IR/Constant.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DerivedTypes.h"
++#include "llvm/IR/IRBuilder.h"
++PreservedAnalyses IndirectBranchPass::run(Function &F,
++                                          FunctionAnalysisManager &FAM) {
++  errs() << "[vllvm] IndirectBranchPass:" << F.getName() << "\n";
++  cryptoUtils = new CryptoUtils(F.getParent());
++  getAllBBs(F);
++  bool isChanged = makeIndirectBranch(F, makeGloableBBTable(F));
++  return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
++void IndirectBranchPass::getAllBBs(Function &F) {
++  BBTargets.clear();
++  BBNums.clear();
++  BrInstSites.clear();
++  for (BasicBlock &BB : F) {
++    if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
++      BrInstSites.push_back(BI);
++      if (BI->isConditional()) {
++        unsigned N = BI->getNumSuccessors();
++        for (unsigned I = 0; I < N; I++) {
++          BasicBlock *Succ = BI->getSuccessor(I);
++          if (BBNums.count(Succ) == 0) {
++            BBTargets.push_back(Succ);
++            BBNums[Succ] = 0;
++          }
++        }
++      } else {
++        BasicBlock *Succ = BI->getSuccessor(0);
++        if (BBNums.count(Succ) == 0) {
++          BBTargets.push_back(Succ);
++          BBNums[Succ] = 0;
++        }
++      }
++    }
++  }
++  long seed = cryptoUtils->getRandom32();
++  std::default_random_engine e(seed);
++  std::shuffle(BBTargets.begin(), BBTargets.end(), e);
++  for (size_t i = 0; i < BBTargets.size(); ++i) {
++    BBNums[BBTargets[i]] = static_cast<int>(i);
++  }
++}
++GlobalVariable *IndirectBranchPass::makeGloableBBTable(Function &F) {
++  if (BBTargets.empty())
++    return nullptr;
++
++  std::vector<Constant *> BBArray;
++  Module *M = F.getParent();
++  LLVMContext &Ctx = F.getContext();
++  for (BasicBlock *BB : BBTargets) {
++    Constant *enBBAddr = ConstantExpr::getBitCast(BlockAddress::get(BB),
++                                                  PointerType::getUnqual(Ctx));
++    enBBAddr = ConstantExpr::getGetElementPtr(
++        Type::getInt8Ty(Ctx), enBBAddr,
++        ConstantInt::get(Type::getInt32Ty(Ctx),
++                         cryptoUtils->getRandom32BaiscIndex(BBNums[BB])));
++    BBArray.push_back(enBBAddr);
++  }
++  ArrayType *ATy =
++      ArrayType::get(PointerType::getUnqual(F.getContext()), BBArray.size());
++  return new GlobalVariable(*M, ATy, false, GlobalValue::PrivateLinkage,
++                            ConstantArray::get(ATy, BBArray));
++}
++bool IndirectBranchPass::makeIndirectBranch(Function &F,
++                                            GlobalVariable *BBTableGV) {
++  if (BrInstSites.empty() || BBTableGV == nullptr)
++    return false;
++
++  LLVMContext &Ctx = F.getContext();
++  auto *BBTableTy = cast<ArrayType>(BBTableGV->getValueType());
++  for (BranchInst *BI : BrInstSites) {
++    if (BI->isConditional()) {
++      unsigned N = BI->getNumSuccessors();
++      IRBuilder<> IRB(BI);
++      IRB.SetInsertPoint(BI);
++      Value *Cond = BI->getCondition();
++      Constant *TaddKey = ConstantInt::get(
++          Type::getInt32Ty(Ctx),
++          cryptoUtils->getRandom32BaiscIndex(BBNums[BI->getSuccessor(0)]));
++      Constant *FaddKey = ConstantInt::get(
++          Type::getInt32Ty(Ctx),
++          cryptoUtils->getRandom32BaiscIndex(BBNums[BI->getSuccessor(1)]));
++      Value *addKey = IRB.CreateSelect(Cond, TaddKey, FaddKey);
++      Value *TIdx =
++          ConstantInt::get(IRB.getInt32Ty(), BBNums[BI->getSuccessor(0)]);
++      Value *FIdx =
++          ConstantInt::get(IRB.getInt32Ty(), BBNums[BI->getSuccessor(1)]);
++      Value *Idx = IRB.CreateSelect(Cond, TIdx, FIdx);
++      // 计算目标地址
++      Value *BBPtr = IRB.CreateInBoundsGEP(
++          BBTableTy, BBTableGV,
++          {ConstantInt::get(Type::getInt32Ty(Ctx), 0), Idx});
++      Value *BBAddr = IRB.CreateLoad(IRB.getPtrTy(), BBPtr);
++      addKey = IRB.CreateNeg(addKey);
++      BBAddr = IRB.CreateGEP(IRB.getInt8Ty(), BBAddr, addKey);
++      // 创建间接跳转指令
++      IndirectBrInst *indBr =
++          IRB.CreateIndirectBr(BBAddr, N /*num of destinations*/);
++      for (unsigned I = 0; I < N; I++) {
++        BasicBlock *Succ = BI->getSuccessor(I);
++        indBr->addDestination(Succ);
++      }
++      // 删除原有的直接跳转指令
++      BI->eraseFromParent();
++    } else {
++      BasicBlock *Succ = BI->getSuccessor(0);
++      IRBuilder<> IRB(BI);
++      IRB.SetInsertPoint(BI);
++      // 计算目标地址
++      Value *BBPtr = IRB.CreateInBoundsGEP(
++          BBTableTy, BBTableGV,
++          {ConstantInt::get(Type::getInt32Ty(Ctx), 0),
++           ConstantInt::get(Type::getInt32Ty(Ctx), BBNums[Succ])});
++      Value *BBAddr = IRB.CreateLoad(IRB.getPtrTy(), BBPtr);
++      Constant *addKey =
++          ConstantInt::get(Type::getInt32Ty(Ctx),
++                           cryptoUtils->getRandom32BaiscIndex(BBNums[Succ]));
++      BBAddr =
++          IRB.CreateGEP(IRB.getInt8Ty(), BBAddr, ConstantExpr::getNeg(addKey));
++      // 创建间接跳转指令
++      IndirectBrInst *indBr =
++          IRB.CreateIndirectBr(BBAddr, 1 /*num of destinations*/);
++      indBr->addDestination(Succ);
++      // 删除原有的直接跳转指令
++      BI->eraseFromParent();
++    }
++  }
++  return true;
++}
+diff --git a/llvm/lib/Transforms/VLLVM/IndirectCallPass.cpp b/llvm/lib/Transforms/VLLVM/IndirectCallPass.cpp
+new file mode 100644
+index 000000000..db63f1b51
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/IndirectCallPass.cpp
+@@ -0,0 +1,101 @@
++#include "IndirectCallPass.h"
++#include "llvm/IR/IRBuilder.h"
++PreservedAnalyses IndirectCallPass::run(Function &F,
++                                        FunctionAnalysisManager &FAM) {
++  errs() << "[vllvm] IndirectCallPass:" << F.getName() << "\n";
++  cryptoUtils = new CryptoUtils(F.getParent());
++  getAllCallees(F);
++  bool isChanged = makeIndirectCall(F, makeGloableFuncTable(F));
++  return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
++
++void IndirectCallPass::getAllCallees(Function &F) {
++  Callees.clear();
++  CalleeNums.clear();
++  CallSites.clear();
++  for (auto &BB : F) {
++    for (auto &I : BB) {
++      if (auto *callInst = dyn_cast<CallInst>(&I)) {
++        Function *callee = callInst->getCalledFunction();
++        if (callee == nullptr) {
++          continue;
++        }
++        // 内联函数不做处理
++        if (callee->isIntrinsic()) {
++          continue;
++        }
++        if (callee->isDeclaration()) {
++          continue;
++        }
++        if (callInst->isMustTailCall()) {
++          continue;
++        }
++        CallSites.push_back(callInst);
++        if (std::find(Callees.begin(), Callees.end(), callee) ==
++            Callees.end()) {
++          Callees.push_back(callee);
++        }
++        if (CalleeNums.count(callee) == 0) {
++          CalleeNums[callee] = 0;
++        }
++      }
++    }
++  }
++  long seed = cryptoUtils->getRandom32();
++  std::default_random_engine e(seed);
++  std::shuffle(Callees.begin(), Callees.end(), e);
++  for (size_t i = 0; i < Callees.size(); ++i) {
++    CalleeNums[Callees[i]] = static_cast<int>(i);
++  }
++}
++GlobalVariable *IndirectCallPass::makeGloableFuncTable(Function &F) {
++  if (Callees.empty())
++    return nullptr;
++
++  Module *M = F.getParent();
++  LLVMContext &Ctx = M->getContext();
++  // 创建全局数组存储函数加密后地址
++  Type *voidPtrTy = PointerType::getUnqual(Ctx);
++  ArrayType *funcTableTy = ArrayType::get(voidPtrTy, Callees.size());
++  std::vector<Constant *> funcPtrs;
++  for (auto callee : Callees) {
++    Constant *funcAddr = ConstantExpr::getBitCast(callee, voidPtrTy);
++    Constant *addKey = ConstantInt::get(
++        Type::getInt32Ty(Ctx),
++        cryptoUtils->getRandom32BaiscIndex(CalleeNums[callee]));
++    // 对地址进行add操作进行加密
++    funcAddr =
++        ConstantExpr::getGetElementPtr(Type::getInt8Ty(Ctx), funcAddr, addKey);
++    funcPtrs.push_back(funcAddr);
++  }
++  Constant *funcTableInit = ConstantArray::get(funcTableTy, funcPtrs);
++  GlobalVariable *funcTableGV =
++      new GlobalVariable(*M, funcTableTy, true, GlobalValue::PrivateLinkage,
++                         funcTableInit, "func_table" + F.getName());
++  return funcTableGV;
++}
++bool IndirectCallPass::makeIndirectCall(Function &F,
++                                        GlobalVariable *funcTableGV) {
++  if (CallSites.empty() || funcTableGV == nullptr)
++    return false;
++
++  LLVMContext &Ctx = F.getContext();
++  auto *funcTableTy = cast<ArrayType>(funcTableGV->getValueType());
++  for (auto callInst : CallSites) {
++    auto callee = callInst->getCalledFunction();
++    IRBuilder IRB(callInst);
++    IRB.SetInsertPoint(callInst);
++    Value *funcPtr = IRB.CreateInBoundsGEP(
++        funcTableTy, funcTableGV,
++        {ConstantInt::get(Type::getInt32Ty(Ctx), 0),
++         ConstantInt::get(Type::getInt32Ty(Ctx), CalleeNums[callee])});
++    Value *funcAddr = IRB.CreateLoad(IRB.getPtrTy(), funcPtr);
++    Constant *addKey = ConstantInt::get(
++        Type::getInt32Ty(Ctx),
++        cryptoUtils->getRandom32BaiscIndex(CalleeNums[callee]));
++    funcAddr =
++        IRB.CreateGEP(IRB.getInt8Ty(), funcAddr, ConstantExpr::getNeg(addKey));
++    callInst->setCalledOperand(funcAddr);
++  }
++  return true;
++}
+diff --git a/llvm/lib/Transforms/VLLVM/LocalVarStructPass.cpp b/llvm/lib/Transforms/VLLVM/LocalVarStructPass.cpp
+new file mode 100644
+index 000000000..0bdb0c282
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/LocalVarStructPass.cpp
+@@ -0,0 +1,211 @@
++#include "LocalVarStructPass.h"
++
++#include "llvm/ADT/SmallVector.h"
++#include "llvm/ADT/Twine.h"
++#include "llvm/IR/Constants.h"
++#include "llvm/IR/DataLayout.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/Module.h"
++#include "llvm/Support/Alignment.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <optional>
++
++using namespace llvm;
++
++namespace {
++struct LocalSlot {
++  AllocaInst *Alloca = nullptr;
++  Type *FieldTy = nullptr;
++  unsigned FieldIndex = 0;
++  bool IsArrayAllocation = false;
++};
++
++bool hasUnsupportedExit(Function &F) {
++  for (BasicBlock &BB : F) {
++    auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
++    if (!RI)
++      continue;
++
++    Instruction *Prev = RI->getPrevNonDebugInstruction();
++    auto *CB = dyn_cast_or_null<CallBase>(Prev);
++    if (CB && CB->isMustTailCall())
++      return true;
++  }
++  return false;
++}
++
++bool hasEH(Function &F) {
++  for (BasicBlock &BB : F) {
++    for (Instruction &I : BB) {
++      if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
++          isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
++          isa<CatchSwitchInst>(&I) || isa<CleanupReturnInst>(&I))
++        return true;
++    }
++  }
++  return false;
++}
++
++bool isSupportedAlloca(AllocaInst &AI, const DataLayout &DL) {
++  if (!AI.isStaticAlloca() || AI.isUsedWithInAlloca() || AI.isSwiftError())
++    return false;
++  if (AI.getAddressSpace() != 0)
++    return false;
++
++  Type *AllocatedTy = AI.getAllocatedType();
++  if (!AllocatedTy->isSized())
++    return false;
++
++  auto *ArraySize = dyn_cast<ConstantInt>(AI.getArraySize());
++  if (!ArraySize || ArraySize->isZero() ||
++      ArraySize->getValue().getActiveBits() > 63)
++    return false;
++
++  std::optional<TypeSize> AllocSize = AI.getAllocationSize(DL);
++  if (!AllocSize || AllocSize->isScalable() || AllocSize->isZero())
++    return false;
++
++  return true;
++}
++
++Type *getFieldType(AllocaInst &AI) {
++  auto *ArraySize = cast<ConstantInt>(AI.getArraySize());
++  Type *AllocatedTy = AI.getAllocatedType();
++  if (ArraySize->isOne())
++    return AllocatedTy;
++  return ArrayType::get(AllocatedTy, ArraySize->getZExtValue());
++}
++
++Constant *getIntPtrConstant(Type *IntPtrTy, uint64_t Value) {
++  return ConstantInt::get(IntPtrTy, Value);
++}
++} // namespace
++
++PreservedAnalyses LocalVarStructPass::run(Function &F,
++                                          FunctionAnalysisManager &FAM) {
++  errs() << "[vllvm] LocalVarStructPass:" << F.getName() << "\n";
++  bool IsChanged = moveAllocasToStruct(F);
++  return IsChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
++}
++
++bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
++  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
++      hasUnsupportedExit(F) || hasEH(F))
++    return false;
++
++  Module *M = F.getParent();
++  const DataLayout &DL = M->getDataLayout();
++  LLVMContext &Ctx = F.getContext();
++
++  SmallVector<AllocaInst *, 16> Allocas;
++  for (Instruction &I : F.getEntryBlock()) {
++    auto *AI = dyn_cast<AllocaInst>(&I);
++    if (!AI)
++      continue;
++    if (isSupportedAlloca(*AI, DL))
++      Allocas.push_back(AI);
++  }
++  if (Allocas.empty())
++    return false;
++
++  SmallVector<Type *, 32> FieldTypes;
++  SmallVector<LocalSlot, 16> Slots;
++  uint64_t CurrentOffset = 0;
++  Align MaxAlign(1);
++
++  for (AllocaInst *AI : Allocas) {
++    Type *FieldTy = getFieldType(*AI);
++    TypeSize FieldSize = DL.getTypeAllocSize(FieldTy);
++    if (FieldSize.isScalable())
++      return false;
++
++    Align FieldAlign =
++        std::max(AI->getAlign(), DL.getABITypeAlign(FieldTy));
++    MaxAlign = std::max(MaxAlign, FieldAlign);
++
++    uint64_t AlignedOffset = alignTo(CurrentOffset, FieldAlign);
++    if (AlignedOffset != CurrentOffset) {
++      FieldTypes.push_back(
++          ArrayType::get(Type::getInt8Ty(Ctx), AlignedOffset - CurrentOffset));
++      CurrentOffset = AlignedOffset;
++    }
++
++    LocalSlot Slot;
++    Slot.Alloca = AI;
++    Slot.FieldTy = FieldTy;
++    Slot.FieldIndex = FieldTypes.size();
++    Slot.IsArrayAllocation = AI->isArrayAllocation();
++    Slots.push_back(Slot);
++
++    FieldTypes.push_back(FieldTy);
++    CurrentOffset += FieldSize.getFixedValue();
++  }
++
++  if (FieldTypes.empty())
++    return false;
++
++  StructType *StructTy =
++      StructType::create(Ctx, FieldTypes,
++                         (Twine("vllvm.localvars.") + F.getName()).str());
++
++  Instruction *InsertBefore = &*F.getEntryBlock().getFirstInsertionPt();
++  IRBuilder<> IRB(InsertBefore);
++
++  Type *IntPtrTy = DL.getIntPtrType(Ctx);
++  Constant *StructSize = ConstantExpr::getSizeOf(StructTy);
++  StructSize = ConstantExpr::getTruncOrBitCast(StructSize, IntPtrTy);
++
++  uint64_t ExtraAlignBytes = MaxAlign.value() - 1;
++  Constant *AllocSize =
++      ConstantExpr::getAdd(StructSize, getIntPtrConstant(IntPtrTy, ExtraAlignBytes));
++
++  CallInst *RawStructPtr =
++      IRB.CreateMalloc(IntPtrTy, StructTy, AllocSize, nullptr, nullptr,
++                       "vllvm.locals.raw");
++  Value *StructPtr = RawStructPtr;
++  if (MaxAlign.value() > 1) {
++    unsigned PtrBits = cast<IntegerType>(IntPtrTy)->getBitWidth();
++    Value *RawInt = IRB.CreatePtrToInt(RawStructPtr, IntPtrTy, "vllvm.locals.int");
++    Value *Biased = IRB.CreateAdd(
++        RawInt, getIntPtrConstant(IntPtrTy, ExtraAlignBytes),
++        "vllvm.locals.bias");
++    Constant *Mask = ConstantInt::get(
++        IntPtrTy, APInt(PtrBits, ~(MaxAlign.value() - 1)));
++    Value *AlignedInt = IRB.CreateAnd(Biased, Mask, "vllvm.locals.aligned_int");
++    StructPtr =
++        IRB.CreateIntToPtr(AlignedInt, IRB.getPtrTy(), "vllvm.locals");
++  }
++
++  for (const LocalSlot &Slot : Slots) {
++    std::string SlotName = Slot.Alloca->hasName()
++                               ? (Slot.Alloca->getName() + ".slot").str()
++                               : "vllvm.local.slot";
++    Value *SlotPtr =
++        IRB.CreateStructGEP(StructTy, StructPtr, Slot.FieldIndex, SlotName);
++    if (Slot.IsArrayAllocation) {
++      SlotPtr = IRB.CreateInBoundsGEP(
++          Slot.FieldTy, SlotPtr,
++          {getIntPtrConstant(IntPtrTy, 0), getIntPtrConstant(IntPtrTy, 0)},
++          SlotName + ".elem");
++    }
++    Slot.Alloca->replaceAllUsesWith(SlotPtr);
++  }
++
++  for (LocalSlot &Slot : Slots)
++    Slot.Alloca->eraseFromParent();
++
++  SmallVector<ReturnInst *, 8> Returns;
++  for (BasicBlock &BB : F)
++    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
++      Returns.push_back(RI);
++
++  for (ReturnInst *RI : Returns) {
++    IRBuilder<> FreeIRB(RI);
++    FreeIRB.CreateFree(RawStructPtr);
++  }
++
++  return true;
++}
+diff --git a/llvm/lib/Transforms/VLLVM/PassInfo.cpp b/llvm/lib/Transforms/VLLVM/PassInfo.cpp
+new file mode 100644
+index 000000000..1c5fe9d1c
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/PassInfo.cpp
+@@ -0,0 +1,39 @@
++#include "PassInfo.h"
++#include "VLLVM.h"
++
++#include <utility>
++
++using namespace llvm;
++
++namespace llvm::vllvm {
++void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
++  if (!Options.any())
++    return;
++
++  if (Options.EncryptoStr)
++    MPM.addPass(EncryptoStrPass());
++
++  FunctionPassManager FPM;
++  bool HasFunctionPass = false;
++
++  if (Options.FlattenFunc) {
++    FPM.addPass(FlattenFuncPass());
++    HasFunctionPass = true;
++  }
++  if (Options.IndirectCall) {
++    FPM.addPass(IndirectCallPass());
++    HasFunctionPass = true;
++  }
++  if (Options.IndirectBranch) {
++    FPM.addPass(IndirectBranchPass());
++    HasFunctionPass = true;
++  }
++  if (Options.LocalVarStruct) {
++    FPM.addPass(LocalVarStructPass());
++    HasFunctionPass = true;
++  }
++
++  if (HasFunctionPass)
++    MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
++}
++} // namespace llvm::vllvm
+diff --git a/llvm/lib/Transforms/VLLVM/Utils.cpp b/llvm/lib/Transforms/VLLVM/Utils.cpp
+new file mode 100644
+index 000000000..cd26b0b43
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/Utils.cpp
+@@ -0,0 +1,176 @@
++#include "Utils.h"
++
++#include "llvm/IR/DiagnosticInfo.h"
++#include "llvm/IR/EHPersonalities.h"
++#include "llvm/IR/IRBuilder.h"
++#include "llvm/IR/InstIterator.h"
++#include "llvm/IR/IntrinsicInst.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/NoFolder.h"
++// Shamefully borrowed from ../Scalar/RegToMem.cpp :(
++bool valueEscapes(Instruction *Inst) {
++  BasicBlock *BB = Inst->getParent();
++  for (Value::use_iterator UI = Inst->use_begin(), E = Inst->use_end(); UI != E;
++       ++UI) {
++    Instruction *I = cast<Instruction>(*UI);
++    if (I->getParent() != BB || isa<PHINode>(I)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void fixStack(Function *f) {
++  // Try to remove phi node and demote reg to stack
++  std::vector<PHINode *> tmpPhi;
++  std::vector<Instruction *> tmpReg;
++  BasicBlock *bbEntry = &*f->begin();
++
++  do {
++    tmpPhi.clear();
++    tmpReg.clear();
++
++    for (Function::iterator i = f->begin(); i != f->end(); ++i) {
++      for (BasicBlock::iterator j = i->begin(); j != i->end(); ++j) {
++        if (isa<PHINode>(j)) {
++          PHINode *phi = cast<PHINode>(j);
++          tmpPhi.push_back(phi);
++          continue;
++        }
++        if (!(isa<AllocaInst>(j) && j->getParent() == bbEntry) &&
++            (valueEscapes(&*j) || j->isUsedOutsideOfBlock(&*i))) {
++          tmpReg.push_back(&*j);
++          continue;
++        }
++      }
++    }
++    for (unsigned int i = 0; i != tmpReg.size(); ++i) {
++      DemoteRegToStack(*tmpReg.at(i));
++    }
++
++    for (unsigned int i = 0; i != tmpPhi.size(); ++i) {
++      DemotePHIToStack(tmpPhi.at(i));
++    }
++
++  } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
++}
++
++CallBase *fixEH(CallBase *CB) {
++  const auto BB = CB->getParent();
++  if (!BB) {
++    return CB;
++  }
++  const auto Fn = BB->getParent();
++  if (!Fn || !Fn->hasPersonalityFn() ||
++      !isScopedEHPersonality(classifyEHPersonality(Fn->getPersonalityFn()))) {
++    return CB;
++  }
++  const auto BlockColors = colorEHFunclets(*Fn);
++  const auto BBColor = BlockColors.find(BB);
++  if (BBColor == BlockColors.end()) {
++    return CB;
++  }
++  const auto &ColorVec = BBColor->getSecond();
++  assert(ColorVec.size() == 1 && "non-unique color for block!");
++
++  const auto EHBlock = ColorVec.front();
++  if (!EHBlock || !EHBlock->isEHPad()) {
++    return CB;
++  }
++  const auto EHPad = EHBlock->getFirstNonPHI();
++
++  const OperandBundleDef OB("funclet", EHPad);
++  auto *NewCall =
++      CallBase::addOperandBundle(CB, LLVMContext::OB_funclet, OB, CB);
++  NewCall->copyMetadata(*CB);
++  CB->replaceAllUsesWith(NewCall);
++  CB->eraseFromParent();
++  return NewCall;
++}
++
++void LowerConstantExpr(Function &F) {
++  SmallPtrSet<Instruction *, 8> WorkList;
++
++  for (inst_iterator It = inst_begin(F), E = inst_end(F); It != E; ++It) {
++    Instruction *I = &*It;
++
++    if (isa<LandingPadInst>(I) || isa<CatchPadInst>(I) ||
++        isa<CatchSwitchInst>(I) || isa<CatchReturnInst>(I))
++      continue;
++    if (auto *II = dyn_cast<IntrinsicInst>(I)) {
++      if (II->getIntrinsicID() == Intrinsic::eh_typeid_for) {
++        continue;
++      }
++    }
++
++    for (unsigned int i = 0; i < I->getNumOperands(); ++i) {
++      if (isa<ConstantExpr>(I->getOperand(i)))
++        WorkList.insert(I);
++    }
++  }
++
++  while (!WorkList.empty()) {
++    auto It = WorkList.begin();
++    Instruction *I = *It;
++    WorkList.erase(*It);
++
++    if (PHINode *PHI = dyn_cast<PHINode>(I)) {
++      for (unsigned int i = 0; i < PHI->getNumIncomingValues(); ++i) {
++        Instruction *TI = PHI->getIncomingBlock(i)->getTerminator();
++        if (ConstantExpr *CE =
++                dyn_cast<ConstantExpr>(PHI->getIncomingValue(i))) {
++          Instruction *NewInst = CE->getAsInstruction();
++          NewInst->insertBefore(TI);
++          PHI->setIncomingValue(i, NewInst);
++          WorkList.insert(NewInst);
++        }
++      }
++    } else {
++      for (unsigned int i = 0; i < I->getNumOperands(); ++i) {
++        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(I->getOperand(i))) {
++          Instruction *NewInst = CE->getAsInstruction();
++          NewInst->insertBefore(I);
++          I->replaceUsesOfWith(CE, NewInst);
++          WorkList.insert(NewInst);
++        }
++      }
++    }
++  }
++}
++
++bool expandConstantExpr(Function &F) {
++  bool Changed = false;
++  LLVMContext &Ctx = F.getContext();
++  IRBuilder<NoFolder> IRB(Ctx);
++
++  for (auto &BB : F) {
++    for (auto &I : BB) {
++      if (I.isEHPad() || isa<AllocaInst>(&I) || isa<IntrinsicInst>(&I) ||
++          isa<SwitchInst>(&I) || I.isAtomic()) {
++        continue;
++      }
++      auto CI = dyn_cast<CallInst>(&I);
++      auto GEP = dyn_cast<GetElementPtrInst>(&I);
++      auto IsPhi = isa<PHINode>(&I);
++      auto InsertPt =
++          IsPhi ? F.getEntryBlock().getFirstInsertionPt() : I.getIterator();
++      for (unsigned i = 0; i < I.getNumOperands(); ++i) {
++        if (CI && CI->isBundleOperand(i)) {
++          continue;
++        }
++        if (GEP && (i < 2 || GEP->getSourceElementType()->isStructTy())) {
++          continue;
++        }
++        auto Opr = I.getOperand(i);
++        if (auto CEP = dyn_cast<ConstantExpr>(Opr)) {
++          IRB.SetInsertPoint(InsertPt);
++          auto CEPInst = CEP->getAsInstruction();
++          IRB.Insert(CEPInst);
++          I.setOperand(i, CEPInst);
++          Changed = true;
++        }
++      }
++    }
++  }
++  return Changed;
++}
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/CryptoUtils.h b/llvm/lib/Transforms/VLLVM/include/CryptoUtils.h
+new file mode 100644
+index 000000000..09d0c018b
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/CryptoUtils.h
+@@ -0,0 +1,48 @@
++#pragma once
++#include "llvm/IR/Module.h"
++#include "llvm/Pass.h"
++#include "llvm/Support/RandomNumberGenerator.h"
++namespace llvm {
++class CryptoUtils {
++public:
++  Module *M;
++  std::unique_ptr<RandomNumberGenerator> RNG;
++  uint8_t *randomKey = new uint8_t[16];
++  CryptoUtils(Module *m) {
++    M = m;
++    RNG = M->createRNG(M->getName());
++    getRandomBytes(randomKey, 16);
++  }
++  uint32_t getRandom32BaiscIndex(uint32_t index) {
++    return (uint32_t)getRandom64BaiscIndex(index);
++  };
++  uint64_t getRandom64BaiscIndex(uint32_t index);
++  uint32_t getRandom32() { return (uint32_t)getRandom64(); };
++  uint64_t getRandom64() { return (*RNG)(); };
++
++private:
++  uint8_t sbox[256] = {
++      0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B,
++      0xFE, 0xD7, 0xAB, 0x76, 0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0,
++      0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0, 0xB7, 0xFD, 0x93, 0x26,
++      0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
++      0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2,
++      0xEB, 0x27, 0xB2, 0x75, 0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0,
++      0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84, 0x53, 0xD1, 0x00, 0xED,
++      0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
++      0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F,
++      0x50, 0x3C, 0x9F, 0xA8, 0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5,
++      0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2, 0xCD, 0x0C, 0x13, 0xEC,
++      0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
++      0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14,
++      0xDE, 0x5E, 0x0B, 0xDB, 0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C,
++      0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79, 0xE7, 0xC8, 0x37, 0x6D,
++      0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
++      0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F,
++      0x4B, 0xBD, 0x8B, 0x8A, 0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E,
++      0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E, 0xE1, 0xF8, 0x98, 0x11,
++      0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
++      0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F,
++      0xB0, 0x54, 0xBB, 0x16};
++};
++} // namespace llvm
+diff --git a/llvm/lib/Transforms/VLLVM/include/EncryptoStrPass.h b/llvm/lib/Transforms/VLLVM/include/EncryptoStrPass.h
+new file mode 100644
+index 000000000..4828d47fc
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/EncryptoStrPass.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include "llvm/IR/Function.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/Module.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++using namespace llvm;
++class EncryptoStrPass : public PassInfoMixin<EncryptoStrPass> {
++public:
++  class EncryptoStr;
++  std::vector<EncryptoStr *> makeEncryptoStrPool(Module &M);
++  PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM);
++  static bool isRequired() { return true; }
++};
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/FlattenFuncPass.h b/llvm/lib/Transforms/VLLVM/include/FlattenFuncPass.h
+new file mode 100644
+index 000000000..576e7753d
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/FlattenFuncPass.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include "llvm/IR/Function.h"
++#include "llvm/IR/PassManager.h"
++#include "llvm/Pass.h"
++using namespace llvm;
++class FlattenFuncPass : public PassInfoMixin<FlattenFuncPass> {
++public:
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
++  bool doFlatten(Function &F, FunctionAnalysisManager &FAM);
++  static bool isRequired() { return true; }
++};
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/IndirectBranchPass.h b/llvm/lib/Transforms/VLLVM/include/IndirectBranchPass.h
+new file mode 100644
+index 000000000..19d5aeeff
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/IndirectBranchPass.h
+@@ -0,0 +1,22 @@
++#pragma once
++#include "CryptoUtils.h"
++#include "map"
++#include "llvm/IR/BasicBlock.h"
++#include "llvm/IR/GlobalVariable.h"
++#include "llvm/IR/Instructions.h"
++#include "llvm/IR/PassManager.h"
++using namespace llvm;
++class IndirectBranchPass : public PassInfoMixin<IndirectBranchPass> {
++public:
++  std::vector<BasicBlock *> BBTargets;
++  std::map<BasicBlock *, int> BBNums;
++  std::vector<BranchInst *> BrInstSites;
++  CryptoUtils *cryptoUtils;
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
++  static bool isRequired() { return true; }
++
++private:
++  GlobalVariable *makeGloableBBTable(Function &F);
++  bool makeIndirectBranch(Function &F, GlobalVariable *BBTableGV);
++  void getAllBBs(Function &F);
++};
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/IndirectCallPass.h b/llvm/lib/Transforms/VLLVM/include/IndirectCallPass.h
+new file mode 100644
+index 000000000..00fa46d7d
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/IndirectCallPass.h
+@@ -0,0 +1,21 @@
++#pragma once
++#include "CryptoUtils.h"
++#include "map"
++#include "llvm/IR/Function.h"
++#include "llvm/IR/PassManager.h"
++
++using namespace llvm;
++class IndirectCallPass : public PassInfoMixin<IndirectCallPass> {
++public:
++  std::vector<Function *> Callees;
++  std::map<Function *, int> CalleeNums;
++  std::vector<CallInst *> CallSites;
++  CryptoUtils *cryptoUtils;
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
++  static bool isRequired() { return true; }
++
++private:
++  GlobalVariable *makeGloableFuncTable(Function &F);
++  bool makeIndirectCall(Function &F, GlobalVariable *funcTableGV);
++  void getAllCallees(Function &F);
++};
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/LocalVarStructPass.h b/llvm/lib/Transforms/VLLVM/include/LocalVarStructPass.h
+new file mode 100644
+index 000000000..764a086db
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/LocalVarStructPass.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include "llvm/IR/Function.h"
++#include "llvm/IR/PassManager.h"
++
++using namespace llvm;
++class LocalVarStructPass : public PassInfoMixin<LocalVarStructPass> {
++public:
++  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
++  static bool isRequired() { return true; }
++
++private:
++  bool moveAllocasToStruct(Function &F);
++};
+diff --git a/llvm/lib/Transforms/VLLVM/include/PassInfo.h b/llvm/lib/Transforms/VLLVM/include/PassInfo.h
+new file mode 100644
+index 000000000..60ceb919f
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/PassInfo.h
+@@ -0,0 +1,6 @@
++#pragma once
++#include "EncryptoStrPass.h"
++#include "FlattenFuncPass.h"
++#include "IndirectBranchPass.h"
++#include "IndirectCallPass.h"
++#include "LocalVarStructPass.h"
+diff --git a/llvm/lib/Transforms/VLLVM/include/Utils.h b/llvm/lib/Transforms/VLLVM/include/Utils.h
+new file mode 100644
+index 000000000..f50e790dc
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/Utils.h
+@@ -0,0 +1,14 @@
++#ifndef __UTILS_OBF__
++#define __UTILS_OBF__
++
++#include "llvm/IR/Function.h"
++#include "llvm/Transforms/Utils/Local.h" // For DemoteRegToStack and DemotePHIToStack
++
++using namespace llvm;
++
++bool valueEscapes(Instruction *Inst);
++void fixStack(Function *f);
++CallBase *fixEH(CallBase *CB);
++void LowerConstantExpr(Function &F);
++bool expandConstantExpr(Function &F);
++#endif
+\ No newline at end of file
+diff --git a/llvm/lib/Transforms/VLLVM/include/VLLVM.h b/llvm/lib/Transforms/VLLVM/include/VLLVM.h
+new file mode 100644
+index 000000000..401925b0b
+--- /dev/null
++++ b/llvm/lib/Transforms/VLLVM/include/VLLVM.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "llvm/IR/PassManager.h"
++
++namespace llvm::vllvm {
++struct VLLVMOptions {
++  bool EncryptoStr = false;
++  bool FlattenFunc = false;
++  bool IndirectCall = false;
++  bool IndirectBranch = false;
++  bool LocalVarStruct = false;
++
++  bool any() const {
++    return EncryptoStr || FlattenFunc || IndirectCall || IndirectBranch ||
++           LocalVarStruct;
++  }
++};
++
++void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options);
++} // namespace llvm::vllvm

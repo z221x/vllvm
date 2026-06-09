@@ -28,6 +28,10 @@ void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
     FPM.addPass(IndirectBranchPass());
     HasFunctionPass = true;
   }
+  if (Options.LocalVarStruct) {
+    FPM.addPass(LocalVarStructPass());
+    HasFunctionPass = true;
+  }
 
   if (HasFunctionPass)
     MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));

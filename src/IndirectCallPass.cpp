@@ -3,10 +3,9 @@
 PreservedAnalyses IndirectCallPass::run(Function &F,
                                         FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] IndirectCallPass:" << F.getName() << "\n";
-  bool isChanged = false;
   cryptoUtils = new CryptoUtils(F.getParent());
   getAllCallees(F);
-  isChanged = makeIndirectCall(F, makeGloableFuncTable(F));
+  bool isChanged = makeIndirectCall(F, makeGloableFuncTable(F));
   return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
@@ -16,17 +15,19 @@ void IndirectCallPass::getAllCallees(Function &F) {
   CallSites.clear();
   for (auto &BB : F) {
     for (auto &I : BB) {
-      if (dyn_cast<CallInst>(&I)) {
-        auto *callInst = dyn_cast<CallInst>(&I);
+      if (auto *callInst = dyn_cast<CallInst>(&I)) {
         Function *callee = callInst->getCalledFunction();
+        if (callee == nullptr) {
+          continue;
+        }
         // 内联函数不做处理
         if (callee->isIntrinsic()) {
           continue;
         }
-        if (callee == nullptr) {
+        if (callee->isDeclaration()) {
           continue;
         }
-        if (callee->isDeclaration()) {
+        if (callInst->isMustTailCall()) {
           continue;
         }
         CallSites.push_back(callInst);
@@ -43,11 +44,14 @@ void IndirectCallPass::getAllCallees(Function &F) {
   long seed = cryptoUtils->getRandom32();
   std::default_random_engine e(seed);
   std::shuffle(Callees.begin(), Callees.end(), e);
-  for (int i = 0; i < Callees.size(); i++) {
-    CalleeNums[Callees[i]] = i;
+  for (size_t i = 0; i < Callees.size(); ++i) {
+    CalleeNums[Callees[i]] = static_cast<int>(i);
   }
 }
 GlobalVariable *IndirectCallPass::makeGloableFuncTable(Function &F) {
+  if (Callees.empty())
+    return nullptr;
+
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
   // 创建全局数组存储函数加密后地址
@@ -60,7 +64,8 @@ GlobalVariable *IndirectCallPass::makeGloableFuncTable(Function &F) {
         Type::getInt32Ty(Ctx),
         cryptoUtils->getRandom32BaiscIndex(CalleeNums[callee]));
     // 对地址进行add操作进行加密
-    funcAddr = ConstantExpr::getGetElementPtr(voidPtrTy, funcAddr, addKey);
+    funcAddr =
+        ConstantExpr::getGetElementPtr(Type::getInt8Ty(Ctx), funcAddr, addKey);
     funcPtrs.push_back(funcAddr);
   }
   Constant *funcTableInit = ConstantArray::get(funcTableTy, funcPtrs);
@@ -71,21 +76,25 @@ GlobalVariable *IndirectCallPass::makeGloableFuncTable(Function &F) {
 }
 bool IndirectCallPass::makeIndirectCall(Function &F,
                                         GlobalVariable *funcTableGV) {
-  Module *M = F.getParent();
-  LLVMContext &Ctx = M->getContext();
+  if (CallSites.empty() || funcTableGV == nullptr)
+    return false;
+
+  LLVMContext &Ctx = F.getContext();
+  auto *funcTableTy = cast<ArrayType>(funcTableGV->getValueType());
   for (auto callInst : CallSites) {
     auto callee = callInst->getCalledFunction();
     IRBuilder IRB(callInst);
     IRB.SetInsertPoint(callInst);
-    Value *funcPtr = IRB.CreateGEP(
-        Type::getInt64Ty(Ctx), funcTableGV,
-        ConstantInt::get(Type::getInt64Ty(Ctx), CalleeNums[callee]));
+    Value *funcPtr = IRB.CreateInBoundsGEP(
+        funcTableTy, funcTableGV,
+        {ConstantInt::get(Type::getInt32Ty(Ctx), 0),
+         ConstantInt::get(Type::getInt32Ty(Ctx), CalleeNums[callee])});
     Value *funcAddr = IRB.CreateLoad(IRB.getPtrTy(), funcPtr);
     Constant *addKey = ConstantInt::get(
         Type::getInt32Ty(Ctx),
         cryptoUtils->getRandom32BaiscIndex(CalleeNums[callee]));
     funcAddr =
-        IRB.CreateGEP(IRB.getInt64Ty(), funcAddr, ConstantExpr::getNeg(addKey));
+        IRB.CreateGEP(IRB.getInt8Ty(), funcAddr, ConstantExpr::getNeg(addKey));
     callInst->setCalledOperand(funcAddr);
   }
   return true;

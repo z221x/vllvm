@@ -21,14 +21,6 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   LoadInst *load;
   SwitchInst *switchI;
   Module *M = F.getParent();
-  ConstantInt *Zero = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
-  GlobalVariable *globalSwitchVar =
-      new GlobalVariable(*M,
-                         Type::getInt32Ty(Ctx), // 类型
-                         false,                 // isConstant
-                         GlobalValue::ExternalLinkage,
-                         Zero, // initializer -> 变为定义
-                         "");
   // 初始化cryptoUtils
   CryptoUtils *cryptoUtils = new CryptoUtils(M);
   // 获取所有基本块
@@ -75,9 +67,11 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   IRBuilder<> IRB(entryBB);
   entryBB->getTerminator()->eraseFromParent(); // 删除原有的 terminator
   // 创建控制变量与初始化支配key
+  AllocaInst *switchVar =
+      IRB.CreateAlloca(Type::getInt32Ty(Ctx), 0, "switchVar");
   IRB.CreateStore(ConstantInt::get(Type::getInt32Ty(Ctx),
                                    cryptoUtils->getRandom32BaiscIndex(0)),
-                  globalSwitchVar);
+                  switchVar);
   Constant *caseKeyValue = ConstantInt::get(Type::getInt32Ty(Ctx),
                                             cryptoUtils->getRandom32(), false);
   AllocaInst *caseKeyPtr =
@@ -86,8 +80,8 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   // switch框架
   switchLoopEntry = BasicBlock::Create(Ctx, "switchLoopEntry", &F, entryBB);
   switchLoopEnd = BasicBlock::Create(Ctx, "switchLoopEnd", &F, entryBB);
-  load = new LoadInst(Type::getInt32Ty(Ctx), globalSwitchVar,
-                      "loadGlobalSwitchVar", switchLoopEntry);
+  load = new LoadInst(Type::getInt32Ty(Ctx), switchVar, "loadSwitchVar",
+                      switchLoopEntry);
   // entryBB->switchLoopEntry
   entryBB->moveBefore(switchLoopEntry);
   BranchInst::Create(switchLoopEntry, entryBB);
