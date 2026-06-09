@@ -1,9 +1,18 @@
 #include "FlattenFuncPass.h"
 #include "CryptoUtils.h"
 #include "Utils.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/Transforms/Utils/LowerSwitch.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <random>
+#include <vector>
+
 PreservedAnalyses FlattenFuncPass::run(Function &F,
                                        FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] FlattenFuncPass:" << F.getName() << "\n";
@@ -14,12 +23,12 @@ PreservedAnalyses FlattenFuncPass::run(Function &F,
 bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   std::vector<BasicBlock *> flattenBBs;
   LowerSwitchPass lowerSwitchPass;
-  PreservedAnalyses Changed = lowerSwitchPass.run(F, FAM);
+  lowerSwitchPass.run(F, FAM);
   LLVMContext &Ctx = F.getContext();
+  Type *Int32Ty = Type::getInt32Ty(Ctx);
   BasicBlock *switchLoopEntry;
+  BasicBlock *switchDispatchEntry;
   BasicBlock *switchLoopEnd;
-  LoadInst *load;
-  SwitchInst *switchI;
   Module *M = F.getParent();
   // 初始化cryptoUtils
   CryptoUtils *cryptoUtils = new CryptoUtils(M);
@@ -43,6 +52,9 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
     }
   }
   flattenBBs.erase(flattenBBs.begin()); // 删除入口基本块
+  if (flattenBBs.empty()) {
+    return false;
+  }
   // 入口基本块处理
   BasicBlock *entryBB = &*(F.begin());
   // 如果末尾指令是br
@@ -64,24 +76,53 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
     BasicBlock *tmpBB = entryBB->splitBasicBlock(i, "first");
     flattenBBs.insert(flattenBBs.begin(), tmpBB);
   }
+
+  BasicBlock *initialStateBB = flattenBBs.front();
+  std::default_random_engine shuffleEngine(cryptoUtils->getRandom32());
+  std::shuffle(flattenBBs.begin(), flattenBBs.end(), shuffleEngine);
+
+  auto getStateIndexForBB = [&](BasicBlock *targetBB) -> unsigned {
+    for (unsigned i = 0; i < flattenBBs.size(); ++i) {
+      if (flattenBBs[i] == targetBB) {
+        return i;
+      }
+    }
+    return flattenBBs.size() - 1;
+  };
+
   IRBuilder<> IRB(entryBB);
   entryBB->getTerminator()->eraseFromParent(); // 删除原有的 terminator
-  // 创建控制变量与初始化支配key
-  AllocaInst *switchVar =
-      IRB.CreateAlloca(Type::getInt32Ty(Ctx), 0, "switchVar");
-  IRB.CreateStore(ConstantInt::get(Type::getInt32Ty(Ctx),
-                                   cryptoUtils->getRandom32BaiscIndex(0)),
+  // 创建状态变量。状态值只保存常量表下标，真实比较常量放在表里。
+  AllocaInst *switchVar = IRB.CreateAlloca(Int32Ty, 0, "switchVar");
+  IRB.CreateStore(ConstantInt::get(Int32Ty, getStateIndexForBB(initialStateBB)),
                   switchVar);
-  Constant *caseKeyValue = ConstantInt::get(Type::getInt32Ty(Ctx),
-                                            cryptoUtils->getRandom32(), false);
-  AllocaInst *caseKeyPtr =
-      IRB.CreateAlloca(Type::getInt32Ty(Ctx), 0, "caseKeyPtr");
-  IRB.CreateStore(caseKeyValue, caseKeyPtr);
+
+  std::vector<uint32_t> caseValues;
+  std::vector<Constant *> caseConstants;
+  caseValues.reserve(flattenBBs.size());
+  caseConstants.reserve(flattenBBs.size());
+  for (unsigned i = 0; i < flattenBBs.size(); ++i) {
+    uint32_t caseValue = cryptoUtils->getRandom32BaiscIndex(i);
+    while (std::find(caseValues.begin(), caseValues.end(), caseValue) !=
+           caseValues.end()) {
+      caseValue = cryptoUtils->getRandom32();
+    }
+    caseValues.push_back(caseValue);
+    caseConstants.push_back(ConstantInt::get(Int32Ty, caseValue));
+  }
+
+  ArrayType *caseTableTy = ArrayType::get(Int32Ty, caseConstants.size());
+  GlobalVariable *caseTable = new GlobalVariable(
+      *M, caseTableTy, true, GlobalValue::PrivateLinkage,
+      ConstantArray::get(caseTableTy, caseConstants),
+      (Twine("vllvm.fla.const.table.") + F.getName()).str());
+  caseTable->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
+
   // switch框架
   switchLoopEntry = BasicBlock::Create(Ctx, "switchLoopEntry", &F, entryBB);
+  switchDispatchEntry =
+      BasicBlock::Create(Ctx, "switchDispatchEntry", &F, entryBB);
   switchLoopEnd = BasicBlock::Create(Ctx, "switchLoopEnd", &F, entryBB);
-  load = new LoadInst(Type::getInt32Ty(Ctx), switchVar, "loadSwitchVar",
-                      switchLoopEntry);
   // entryBB->switchLoopEntry
   entryBB->moveBefore(switchLoopEntry);
   BranchInst::Create(switchLoopEntry, entryBB);
@@ -89,15 +130,50 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   BasicBlock *swDefault =
       BasicBlock::Create(Ctx, "switchDefault", &F, switchLoopEnd);
   BranchInst::Create(switchLoopEnd, swDefault);
-  switchI = SwitchInst::Create(load, swDefault, 0, switchLoopEntry);
-  // 给每个块分配case值
+
+  std::vector<BasicBlock *> dispatchBBs;
+  dispatchBBs.reserve(flattenBBs.size());
+  for (unsigned i = 0; i < flattenBBs.size(); ++i) {
+    BasicBlock *dispatchBB =
+        BasicBlock::Create(Ctx, "caseDispatch", &F, swDefault);
+    dispatchBBs.push_back(dispatchBB);
+  }
+
+  IRB.SetInsertPoint(switchLoopEntry);
+  Value *stateIndex = IRB.CreateLoad(Int32Ty, switchVar, "loadSwitchIndex");
+  Value *isValidIndex = IRB.CreateICmpULT(
+      stateIndex, ConstantInt::get(Int32Ty, flattenBBs.size()),
+      "switchIndexInRange");
+  IRB.CreateCondBr(isValidIndex, switchDispatchEntry, swDefault);
+
+  IRB.SetInsertPoint(switchDispatchEntry);
+  Value *caseValuePtr = IRB.CreateInBoundsGEP(
+      caseTableTy, caseTable, {ConstantInt::get(Int32Ty, 0), stateIndex},
+      "caseValuePtr");
+  LoadInst *caseValue =
+      IRB.CreateLoad(Int32Ty, caseValuePtr, "loadCaseValue");
+  caseValue->setVolatile(true);
+  IRB.CreateBr(dispatchBBs.front());
+
+  for (unsigned i = 0; i < dispatchBBs.size(); ++i) {
+    IRB.SetInsertPoint(dispatchBBs[i]);
+    Value *caseConstPtr = IRB.CreateInBoundsGEP(
+        caseTableTy, caseTable,
+        {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, i)},
+        "caseConstPtr");
+    LoadInst *caseConst =
+        IRB.CreateLoad(Int32Ty, caseConstPtr, "loadCaseConst");
+    caseConst->setVolatile(true);
+    Value *caseMatch =
+        IRB.CreateICmpEQ(caseValue, caseConst, "caseConstMatch");
+    BasicBlock *nextBB =
+        i + 1 < dispatchBBs.size() ? dispatchBBs[i + 1] : swDefault;
+    IRB.CreateCondBr(caseMatch, flattenBBs[i], nextBB);
+  }
+
+  // 给每个块分配一个常量表下标作为状态值
   for (BasicBlock *bb : flattenBBs) {
-    ConstantInt *numCase = NULL;
     bb->moveBefore(switchLoopEnd);
-    numCase = ConstantInt::get(Type::getInt32Ty(Ctx),
-                               cryptoUtils->getRandom32BaiscIndex(
-                                   switchI->getNumCases())); // 随机一个case值
-    switchI->addCase(numCase, bb);
   }
   // 修正每个原有基本块的后继
   for (BasicBlock *bb : flattenBBs) {
@@ -114,56 +190,41 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
       // errs() << "skip multi-branch flattening\n";
       continue;
     }
-    ConstantInt *numCase = NULL;
     IRBuilder<> IRB(bb);
     IRB.SetInsertPoint(bb->getTerminator());
     if (bb->getTerminator()->getNumSuccessors() == 1) {
       BasicBlock *succBB = bb->getTerminator()->getSuccessor(0);
-      numCase = switchI->findCaseDest(succBB);
-
-      if (numCase == NULL) {
-        numCase = ConstantInt::get(
-            Type::getInt32Ty(Ctx),
-            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
-      }
-      Constant *X = ConstantExpr::getSub(caseKeyValue, numCase);
-      Value *caseKeyTmp =
-          IRB.CreateLoad(Type::getInt32Ty(Ctx), caseKeyPtr, "caseKeyTmp");
-      Value *newNumCase = IRB.CreateSub(caseKeyTmp, X, "");
-      IRB.CreateStore(newNumCase, load->getPointerOperand());
+      Value *oldStateIndex =
+          IRB.CreateLoad(Int32Ty, switchVar, "oldStateIndex");
+      Value *stateDelta = IRB.CreateSub(
+          ConstantInt::get(Int32Ty, getStateIndexForBB(succBB)),
+          oldStateIndex, "stateDelta");
+      Value *newStateIndex = IRB.CreateAdd(
+          oldStateIndex, stateDelta, "newStateIndex");
+      IRB.CreateStore(newStateIndex, switchVar);
       IRB.CreateBr(switchLoopEntry);
       bb->getTerminator()->eraseFromParent();
       continue;
     }
     if (bb->getTerminator()->getNumSuccessors() == 2) {
-      ConstantInt *numCaseTrue =
-          switchI->findCaseDest(bb->getTerminator()->getSuccessor(0));
-      ConstantInt *numCaseFalse =
-          switchI->findCaseDest(bb->getTerminator()->getSuccessor(1));
-
-      if (numCaseTrue == NULL) {
-        numCaseTrue = ConstantInt::get(
-            Type::getInt32Ty(Ctx),
-            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
-      }
-      if (numCaseFalse == NULL) {
-        numCaseFalse = ConstantInt::get(
-            Type::getInt32Ty(Ctx),
-            cryptoUtils->getRandom32BaiscIndex(switchI->getNumCases() - 1));
-      }
-      Constant *X, *Y;
-      X = ConstantExpr::getSub(caseKeyValue, numCaseTrue);
-      Y = ConstantExpr::getSub(caseKeyValue, numCaseFalse);
-      Value *caseKeyTmp =
-          IRB.CreateLoad(Type::getInt32Ty(Ctx), caseKeyPtr, "caseKeyTmp");
-      Value *newNumCaseTrue = IRB.CreateSub(caseKeyTmp, X, "newNumCaseTrue");
-      Value *newNumCaseFalse = IRB.CreateSub(caseKeyTmp, Y, "newNumCaseFalse");
+      unsigned trueIndex =
+          getStateIndexForBB(bb->getTerminator()->getSuccessor(0));
+      unsigned falseIndex =
+          getStateIndexForBB(bb->getTerminator()->getSuccessor(1));
       // 创建分支
       BranchInst *br = cast<BranchInst>(bb->getTerminator());
-      Value *sel = IRB.CreateSelect(br->getCondition(), newNumCaseTrue,
-                                    newNumCaseFalse, "");
-
-      IRB.CreateStore(sel, load->getPointerOperand());
+      Value *targetStateIndex =
+          IRB.CreateSelect(br->getCondition(),
+                           ConstantInt::get(Int32Ty, trueIndex),
+                           ConstantInt::get(Int32Ty, falseIndex),
+                           "targetStateIndex");
+      Value *oldStateIndex =
+          IRB.CreateLoad(Int32Ty, switchVar, "oldStateIndex");
+      Value *stateDelta =
+          IRB.CreateSub(targetStateIndex, oldStateIndex, "stateDelta");
+      Value *newStateIndex =
+          IRB.CreateAdd(oldStateIndex, stateDelta, "newStateIndex");
+      IRB.CreateStore(newStateIndex, switchVar);
       IRB.CreateBr(switchLoopEntry);
       bb->getTerminator()->eraseFromParent();
       continue;

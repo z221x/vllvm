@@ -8,19 +8,20 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Alignment.h"
+#include "llvm/Support/RandomNumberGenerator.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 using namespace llvm;
 
 namespace {
+// 记录原始栈槽与替代它的堆结构体字段之间的对应关系。
 struct LocalSlot {
   AllocaInst *Alloca = nullptr;
-  Type *FieldTy = nullptr;
   unsigned FieldIndex = 0;
-  bool IsArrayAllocation = false;
 };
 
 bool hasUnsupportedExit(Function &F) {
@@ -50,6 +51,8 @@ bool hasEH(Function &F) {
 }
 
 bool isSupportedAlloca(AllocaInst &AI, const DataLayout &DL) {
+  // 只处理固定大小、默认地址空间的 alloca。动态栈槽或 ABI 特殊栈槽可能
+  // 带有额外 lowering 约束，不能直接替换成普通堆字段。
   if (!AI.isStaticAlloca() || AI.isUsedWithInAlloca() || AI.isSwiftError())
     return false;
   if (AI.getAddressSpace() != 0)
@@ -72,6 +75,8 @@ bool isSupportedAlloca(AllocaInst &AI, const DataLayout &DL) {
 }
 
 Type *getFieldType(AllocaInst &AI) {
+  // LLVM 中 "alloca T, N" 的结果仍是 T*；放进结构体时需要表达完整
+  // 存储对象，所以多元素 alloca 会变成 [N x T] 字段。
   auto *ArraySize = cast<ConstantInt>(AI.getArraySize());
   Type *AllocatedTy = AI.getAllocatedType();
   if (ArraySize->isOne())
@@ -81,6 +86,28 @@ Type *getFieldType(AllocaInst &AI) {
 
 Constant *getIntPtrConstant(Type *IntPtrTy, uint64_t Value) {
   return ConstantInt::get(IntPtrTy, Value);
+}
+
+uint64_t makeNonZeroKey(RandomNumberGenerator &RNG, unsigned SlotNo) {
+  uint64_t Key = RNG();
+  if (Key != 0)
+    return Key;
+
+  Key = RNG();
+  if (Key != 0)
+    return Key;
+
+  return 0xA5A5A5A5A5A5A5A5ULL ^ (SlotNo + 1);
+}
+
+Instruction *getInsertionPointForUse(Use &U) {
+  User *TheUser = U.getUser();
+  if (auto *PN = dyn_cast<PHINode>(TheUser)) {
+    BasicBlock *IncomingBB = PN->getIncomingBlock(U.getOperandNo());
+    return IncomingBB->getTerminator();
+  }
+
+  return dyn_cast<Instruction>(TheUser);
 }
 } // namespace
 
@@ -92,6 +119,8 @@ PreservedAnalyses LocalVarStructPass::run(Function &F,
 }
 
 bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
+  // 这些场景插入 malloc/free 容易破坏 ABI 敏感控制流或异常处理语义，
+  // 因此先保守跳过。
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
       hasUnsupportedExit(F) || hasEH(F))
     return false;
@@ -111,19 +140,25 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
   if (Allocas.empty())
     return false;
 
+  for (AllocaInst *AI : Allocas)
+    for (Use &U : AI->uses())
+      if (!getInsertionPointForUse(U))
+        return false;
+
   SmallVector<Type *, 32> FieldTypes;
   SmallVector<LocalSlot, 16> Slots;
   uint64_t CurrentOffset = 0;
   Align MaxAlign(1);
 
+  // 手工构造结构体布局；必要时插入 i8 padding 字段，保证每个旧 alloca
+  // 至少保留原来的对齐要求。
   for (AllocaInst *AI : Allocas) {
     Type *FieldTy = getFieldType(*AI);
     TypeSize FieldSize = DL.getTypeAllocSize(FieldTy);
     if (FieldSize.isScalable())
       return false;
 
-    Align FieldAlign =
-        std::max(AI->getAlign(), DL.getABITypeAlign(FieldTy));
+    Align FieldAlign = std::max(AI->getAlign(), DL.getABITypeAlign(FieldTy));
     MaxAlign = std::max(MaxAlign, FieldAlign);
 
     uint64_t AlignedOffset = alignTo(CurrentOffset, FieldAlign);
@@ -135,9 +170,7 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
 
     LocalSlot Slot;
     Slot.Alloca = AI;
-    Slot.FieldTy = FieldTy;
     Slot.FieldIndex = FieldTypes.size();
-    Slot.IsArrayAllocation = AI->isArrayAllocation();
     Slots.push_back(Slot);
 
     FieldTypes.push_back(FieldTy);
@@ -147,51 +180,93 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
   if (FieldTypes.empty())
     return false;
 
-  StructType *StructTy =
-      StructType::create(Ctx, FieldTypes,
-                         (Twine("vllvm.localvars.") + F.getName()).str());
-
-  Instruction *InsertBefore = &*F.getEntryBlock().getFirstInsertionPt();
-  IRBuilder<> IRB(InsertBefore);
+  StructType *StructTy = StructType::create(
+      Ctx, FieldTypes, (Twine("vllvm.localvars.") + F.getName()).str());
+  const StructLayout *Layout = DL.getStructLayout(StructTy);
 
   Type *IntPtrTy = DL.getIntPtrType(Ctx);
+  unsigned PtrBits = cast<IntegerType>(IntPtrTy)->getBitWidth();
+  ArrayType *ConstTableTy = ArrayType::get(IntPtrTy, Slots.size());
+  SmallVector<Constant *, 16> ConstEntries;
+  SmallVector<APInt, 16> OffsetKeys;
+  std::unique_ptr<RandomNumberGenerator> RNG =
+      M->createRNG((Twine("vllvm.localvars.") + F.getName()).str());
+
+  // 每个函数一张可写数据表，表里只保存加密后的字段偏移。key 是按 slot
+  // 随机生成的局部常量，不进入全局数据。
+  for (size_t SlotNo = 0; SlotNo < Slots.size(); ++SlotNo) {
+    const LocalSlot &Slot = Slots[SlotNo];
+    APInt OffsetKey(PtrBits, makeNonZeroKey(*RNG, SlotNo));
+    APInt EncryptedOffset(PtrBits, Layout->getElementOffset(Slot.FieldIndex));
+    EncryptedOffset ^= OffsetKey;
+
+    OffsetKeys.push_back(OffsetKey);
+    ConstEntries.push_back(ConstantInt::get(IntPtrTy, EncryptedOffset));
+  }
+
+  GlobalVariable *ConstTable =
+      new GlobalVariable(*M, ConstTableTy, false, GlobalValue::PrivateLinkage,
+                         ConstantArray::get(ConstTableTy, ConstEntries),
+                         (Twine("vllvm.localvars.table.") + F.getName()).str());
+  ConstTable->setAlignment(DL.getABITypeAlign(ConstTableTy));
+
+  Instruction *InsertBefore = &*F.getEntryBlock().getFirstInsertionPt();
+  IRBuilder<> First_IRB(InsertBefore);
+
   Constant *StructSize = ConstantExpr::getSizeOf(StructTy);
   StructSize = ConstantExpr::getTruncOrBitCast(StructSize, IntPtrTy);
 
+  // malloc 通常只保证平台默认对齐。这里额外申请 MaxAlign - 1 字节并
+  // 手动向上对齐；释放时仍使用原始 malloc 指针。
   uint64_t ExtraAlignBytes = MaxAlign.value() - 1;
-  Constant *AllocSize =
-      ConstantExpr::getAdd(StructSize, getIntPtrConstant(IntPtrTy, ExtraAlignBytes));
+  Constant *AllocSize = ConstantExpr::getAdd(
+      StructSize, getIntPtrConstant(IntPtrTy, ExtraAlignBytes));
 
-  CallInst *RawStructPtr =
-      IRB.CreateMalloc(IntPtrTy, StructTy, AllocSize, nullptr, nullptr,
-                       "vllvm.locals.raw");
+  CallInst *RawStructPtr = First_IRB.CreateMalloc(
+      IntPtrTy, StructTy, AllocSize, nullptr, nullptr, "vllvm.locals.raw");
   Value *StructPtr = RawStructPtr;
   if (MaxAlign.value() > 1) {
-    unsigned PtrBits = cast<IntegerType>(IntPtrTy)->getBitWidth();
-    Value *RawInt = IRB.CreatePtrToInt(RawStructPtr, IntPtrTy, "vllvm.locals.int");
-    Value *Biased = IRB.CreateAdd(
+    Value *RawInt =
+        First_IRB.CreatePtrToInt(RawStructPtr, IntPtrTy, "vllvm.locals.int");
+    Value *Biased = First_IRB.CreateAdd(
         RawInt, getIntPtrConstant(IntPtrTy, ExtraAlignBytes),
         "vllvm.locals.bias");
-    Constant *Mask = ConstantInt::get(
-        IntPtrTy, APInt(PtrBits, ~(MaxAlign.value() - 1)));
-    Value *AlignedInt = IRB.CreateAnd(Biased, Mask, "vllvm.locals.aligned_int");
-    StructPtr =
-        IRB.CreateIntToPtr(AlignedInt, IRB.getPtrTy(), "vllvm.locals");
+    Constant *Mask =
+        ConstantInt::get(IntPtrTy, APInt(PtrBits, ~(MaxAlign.value() - 1)));
+    Value *AlignedInt =
+        First_IRB.CreateAnd(Biased, Mask, "vllvm.locals.aligned_int");
+    StructPtr = First_IRB.CreateIntToPtr(AlignedInt, First_IRB.getPtrTy(),
+                                         "vllvm.locals");
   }
 
-  for (const LocalSlot &Slot : Slots) {
+  // 把旧栈槽的所有引用改写成“结构体基址 + 表中解密出的偏移”。
+  for (size_t SlotNo = 0; SlotNo < Slots.size(); ++SlotNo) {
+    const LocalSlot &Slot = Slots[SlotNo];
     std::string SlotName = Slot.Alloca->hasName()
                                ? (Slot.Alloca->getName() + ".slot").str()
                                : "vllvm.local.slot";
-    Value *SlotPtr =
-        IRB.CreateStructGEP(StructTy, StructPtr, Slot.FieldIndex, SlotName);
-    if (Slot.IsArrayAllocation) {
-      SlotPtr = IRB.CreateInBoundsGEP(
-          Slot.FieldTy, SlotPtr,
-          {getIntPtrConstant(IntPtrTy, 0), getIntPtrConstant(IntPtrTy, 0)},
-          SlotName + ".elem");
+
+    SmallVector<Use *, 16> Uses;
+    for (Use &U : Slot.Alloca->uses())
+      Uses.push_back(&U);
+
+    for (Use *U : Uses) {
+      Instruction *InsertPt = getInsertionPointForUse(*U);
+      IRBuilder<> UseIRB(InsertPt);
+      Value *ConstEntryPtr = UseIRB.CreateGEP(
+          ConstTableTy, ConstTable,
+          {getIntPtrConstant(IntPtrTy, 0), getIntPtrConstant(IntPtrTy, SlotNo)},
+          "vllvm.local.const.entry");
+      LoadInst *EncryptedOffset =
+          UseIRB.CreateLoad(IntPtrTy, ConstEntryPtr, "vllvm.local.enc_offset");
+      EncryptedOffset->setVolatile(true);
+      Constant *OffsetKey = ConstantInt::get(IntPtrTy, OffsetKeys[SlotNo]);
+      Value *Offset =
+          UseIRB.CreateXor(EncryptedOffset, OffsetKey, "vllvm.local.offset");
+      Value *SlotPtr =
+          UseIRB.CreateGEP(First_IRB.getInt8Ty(), StructPtr, Offset, SlotName);
+      U->set(SlotPtr);
     }
-    Slot.Alloca->replaceAllUsesWith(SlotPtr);
   }
 
   for (LocalSlot &Slot : Slots)
@@ -202,6 +277,8 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
     if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
       Returns.push_back(RI);
 
+  // 在每条普通 return 路径前释放原始 malloc 指针；对齐后的指针可能已经
+  // 发生偏移，不能直接传给 free。
   for (ReturnInst *RI : Returns) {
     IRBuilder<> FreeIRB(RI);
     FreeIRB.CreateFree(RawStructPtr);

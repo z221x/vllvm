@@ -4,3 +4,5 @@ build
 llvm-project-*
 out
 .clangd
+
+.DS_Store

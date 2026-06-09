@@ -1,3 +1,4 @@
+#include <stdio.h>
 typedef struct Pair {
   int x;
   long long y;
@@ -130,5 +131,6 @@ int main(void) {
   combined ^= (unsigned)early_return(-3) * 3u;
   combined += (unsigned)early_return(5) * 5u;
   combined ^= byte_shuffle(0x12345678u);
-  return (int)(combined & 127u);
+  printf("%d",combined & 127);
+  return (int)(combined & 127);
 }

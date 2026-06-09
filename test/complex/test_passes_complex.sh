@@ -23,9 +23,20 @@ if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   fi
 fi
 
+NO_DEBUG_ARGS=(-g0)
+
+strip_binary() {
+  local bin=$1
+  if command -v strip >/dev/null 2>&1; then
+    strip "$bin" >/dev/null 2>&1 || strip -x "$bin" >/dev/null 2>&1 || true
+  fi
+}
+
 mkdir -p "$OUT_DIR"
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -O0 "$SRC" -o "$OUT_DIR/base"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
+  -o "$OUT_DIR/base"
+strip_binary "$OUT_DIR/base"
 set +e
 "$OUT_DIR/base"
 BASE_STATUS=$?
@@ -38,9 +49,12 @@ run_case() {
   local ll="$OUT_DIR/$name.ll"
   local exe="$OUT_DIR/$name"
 
-  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -O0 -S -emit-llvm "${flags[@]}" "$SRC" \
-    -o "$ll"
-  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -O0 "${flags[@]}" "$SRC" -o "$exe"
+  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
+    -emit-llvm "${flags[@]}" "$SRC" -o "$ll"
+
+  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "${flags[@]}" \
+    "$SRC" -o "$exe"
+  strip_binary "$exe"
 
   set +e
   "$exe"
@@ -78,6 +92,36 @@ run_case() {
     grep -q "func_table" "$ll"
     grep -q "indirectbr" "$ll"
     grep -q "vllvm.localvars" "$ll"
+    grep -q "vllvm.localvars.table.* global " "$ll"
+    grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i[0-9]+\\]" "$ll"
+    if grep -q "vllvm.localvars.table.* constant " "$ll"; then
+      echo "ollvm local variable table must be writable data" >&2
+      exit 1
+    fi
+    if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" "$ll"; then
+      echo "ollvm local variable table must keep keys out of global data" >&2
+      exit 1
+    fi
+    grep -q "load volatile" "$ll"
+    local volatile_loads
+    volatile_loads=$(grep -Ec "load volatile i[0-9]+" "$ll")
+    if [ "$volatile_loads" -lt 1 ]; then
+      echo "ollvm local variable table must load encrypted offsets" >&2
+      exit 1
+    fi
+    grep -Eq "xor i[0-9]+ %[0-9]+, [-0-9]+" "$ll"
+    local unique_offset_keys_in_code
+    unique_offset_keys_in_code=$(
+      grep -oE "xor i[0-9]+ %[0-9]+, [-0-9]+" "$ll" |
+        sed -E "s/.*xor i[0-9]+ %[0-9]+, ([-0-9]+).*/\\1/" |
+        sort -u |
+        wc -l |
+        tr -d " "
+    )
+    if [ "$unique_offset_keys_in_code" -lt 2 ]; then
+      echo "ollvm local variable table must use per-slot local offset keys" >&2
+      exit 1
+    fi
     ;;
   esac
 }
