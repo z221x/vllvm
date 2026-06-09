@@ -39,7 +39,7 @@ mkdir -p "$OUT_DIR"
   -o "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.localvars" "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.localvars.table.* global " "$OUT_DIR/test_lvars.ll"
-grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i[0-9]+\\]" \
+grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i32\\]" \
   "$OUT_DIR/test_lvars.ll"
 if grep -q "vllvm.localvars.table.* constant " "$OUT_DIR/test_lvars.ll"; then
   echo "local variable table must be writable data, not constant data" >&2
@@ -51,16 +51,16 @@ if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)"
   exit 1
 fi
 grep -q "load volatile" "$OUT_DIR/test_lvars.ll"
-VOLATILE_LOADS=$(grep -Ec "load volatile i[0-9]+" "$OUT_DIR/test_lvars.ll")
+VOLATILE_LOADS=$(grep -Ec "load volatile i32" "$OUT_DIR/test_lvars.ll")
 if [ "$VOLATILE_LOADS" -lt 1 ]; then
   echo "expected volatile loads for encrypted offsets" >&2
   exit 1
 fi
-grep -Eq "xor i[0-9]+ %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"
+grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"
 UNIQUE_OFFSET_KEYS_IN_CODE=$(
-  grep -oE "xor i[0-9]+ %[0-9]+, [-0-9]+" \
+  grep -oE "xor i32 %[0-9]+, [-0-9]+" \
     "$OUT_DIR/test_lvars.ll" |
-    sed -E "s/.*xor i[0-9]+ %[0-9]+, ([-0-9]+).*/\\1/" |
+    sed -E "s/.*xor i32 %[0-9]+, ([-0-9]+).*/\\1/" |
     sort -u |
     wc -l |
     tr -d " "

@@ -11,6 +11,11 @@
 - `-lvars`: 将函数局部变量搬入入口处 malloc 的结构体
 - `-ollvm`: 一次启用以上全部 Pass
 
+当 `-fla`、`-icall`、`-lvars` 同时启用时，会自动使用组合 Pass：
+平坦化 case 值、间接调用加密下标、局部变量结构体偏移共用同一张
+四字节 `i32` 的 `vllvm.combined.const.table.*`。间接调用的函数地址仍保留在独立
+`func_table*` 指针表中。
+
 示例：
 
 ```bash

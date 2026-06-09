@@ -103,10 +103,14 @@ run_case() {
     grep -q "func_table" "$ll"
     grep -q "indirectbr" "$ll"
     grep -q "vllvm.localvars" "$ll"
-    grep -q "vllvm.localvars.table.* global " "$ll"
-    grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i[0-9]+\\]" "$ll"
-    if grep -q "vllvm.localvars.table.* constant " "$ll"; then
-      echo "ollvm local variable table must be writable data" >&2
+    grep -q "vllvm.combined.const.table.* global " "$ll"
+    grep -Eq "vllvm\\.combined\\.const\\.table.*global \\[[0-9]+ x i32\\]" "$ll"
+    if grep -q "vllvm.combined.const.table.* constant " "$ll"; then
+      echo "ollvm combined table must be writable data" >&2
+      exit 1
+    fi
+    if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" "$ll"; then
+      echo "ollvm must use one combined integer constant table" >&2
       exit 1
     fi
     if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" "$ll"; then
@@ -115,16 +119,16 @@ run_case() {
     fi
     grep -q "load volatile" "$ll"
     local volatile_loads
-    volatile_loads=$(grep -Ec "load volatile i[0-9]+" "$ll")
+    volatile_loads=$(grep -Ec "load volatile i32" "$ll")
     if [ "$volatile_loads" -lt 1 ]; then
       echo "ollvm local variable table must load encrypted offsets" >&2
       exit 1
     fi
-    grep -Eq "xor i[0-9]+ %[0-9]+, [-0-9]+" "$ll"
+    grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$ll"
     local unique_offset_keys_in_code
     unique_offset_keys_in_code=$(
-      grep -oE "xor i[0-9]+ %[0-9]+, [-0-9]+" "$ll" |
-        sed -E "s/.*xor i[0-9]+ %[0-9]+, ([-0-9]+).*/\\1/" |
+      grep -oE "xor i32 %[0-9]+, [-0-9]+" "$ll" |
+        sed -E "s/.*xor i32 %[0-9]+, ([-0-9]+).*/\\1/" |
         sort -u |
         wc -l |
         tr -d " "

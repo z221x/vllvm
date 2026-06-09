@@ -15,12 +15,17 @@ void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
 
   FunctionPassManager FPM;
   bool HasFunctionPass = false;
+  bool UseCombinedConstTable =
+      Options.FlattenFunc && Options.IndirectCall && Options.LocalVarStruct;
 
-  if (Options.FlattenFunc) {
+  if (UseCombinedConstTable) {
+    FPM.addPass(CombinedObfuscationPass());
+    HasFunctionPass = true;
+  } else if (Options.FlattenFunc) {
     FPM.addPass(FlattenFuncPass());
     HasFunctionPass = true;
   }
-  if (Options.IndirectCall) {
+  if (!UseCombinedConstTable && Options.IndirectCall) {
     FPM.addPass(IndirectCallPass());
     HasFunctionPass = true;
   }
@@ -28,7 +33,7 @@ void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
     FPM.addPass(IndirectBranchPass());
     HasFunctionPass = true;
   }
-  if (Options.LocalVarStruct) {
+  if (!UseCombinedConstTable && Options.LocalVarStruct) {
     FPM.addPass(LocalVarStructPass());
     HasFunctionPass = true;
   }

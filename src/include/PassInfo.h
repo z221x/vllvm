@@ -1,4 +1,5 @@
 #pragma once
+#include "CombinedObfuscationPass.h"
 #include "EncryptoStrPass.h"
 #include "FlattenFuncPass.h"
 #include "IndirectBranchPass.h"

@@ -88,16 +88,16 @@ Constant *getIntPtrConstant(Type *IntPtrTy, uint64_t Value) {
   return ConstantInt::get(IntPtrTy, Value);
 }
 
-uint64_t makeNonZeroKey(RandomNumberGenerator &RNG, unsigned SlotNo) {
-  uint64_t Key = RNG();
+uint32_t makeNonZeroKey(RandomNumberGenerator &RNG, unsigned SlotNo) {
+  uint32_t Key = static_cast<uint32_t>(RNG());
   if (Key != 0)
     return Key;
 
-  Key = RNG();
+  Key = static_cast<uint32_t>(RNG());
   if (Key != 0)
     return Key;
 
-  return 0xA5A5A5A5A5A5A5A5ULL ^ (SlotNo + 1);
+  return 0xA5A5A5A5U ^ static_cast<uint32_t>(SlotNo + 1);
 }
 
 Instruction *getInsertionPointForUse(Use &U) {
@@ -186,9 +186,10 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
 
   Type *IntPtrTy = DL.getIntPtrType(Ctx);
   unsigned PtrBits = cast<IntegerType>(IntPtrTy)->getBitWidth();
-  ArrayType *ConstTableTy = ArrayType::get(IntPtrTy, Slots.size());
+  Type *ConstTy = Type::getInt32Ty(Ctx);
+  ArrayType *ConstTableTy = ArrayType::get(ConstTy, Slots.size());
   SmallVector<Constant *, 16> ConstEntries;
-  SmallVector<APInt, 16> OffsetKeys;
+  SmallVector<uint32_t, 16> OffsetKeys;
   std::unique_ptr<RandomNumberGenerator> RNG =
       M->createRNG((Twine("vllvm.localvars.") + F.getName()).str());
 
@@ -196,12 +197,15 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
   // 随机生成的局部常量，不进入全局数据。
   for (size_t SlotNo = 0; SlotNo < Slots.size(); ++SlotNo) {
     const LocalSlot &Slot = Slots[SlotNo];
-    APInt OffsetKey(PtrBits, makeNonZeroKey(*RNG, SlotNo));
-    APInt EncryptedOffset(PtrBits, Layout->getElementOffset(Slot.FieldIndex));
-    EncryptedOffset ^= OffsetKey;
+    uint64_t Offset = Layout->getElementOffset(Slot.FieldIndex);
+    if (Offset > UINT32_MAX)
+      return false;
+
+    uint32_t OffsetKey = makeNonZeroKey(*RNG, SlotNo);
+    uint32_t EncryptedOffset = static_cast<uint32_t>(Offset) ^ OffsetKey;
 
     OffsetKeys.push_back(OffsetKey);
-    ConstEntries.push_back(ConstantInt::get(IntPtrTy, EncryptedOffset));
+    ConstEntries.push_back(ConstantInt::get(ConstTy, EncryptedOffset));
   }
 
   GlobalVariable *ConstTable =
@@ -255,14 +259,17 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
       IRBuilder<> UseIRB(InsertPt);
       Value *ConstEntryPtr = UseIRB.CreateGEP(
           ConstTableTy, ConstTable,
-          {getIntPtrConstant(IntPtrTy, 0), getIntPtrConstant(IntPtrTy, SlotNo)},
+          {ConstantInt::get(Type::getInt32Ty(Ctx), 0),
+           ConstantInt::get(Type::getInt32Ty(Ctx), SlotNo)},
           "vllvm.local.const.entry");
       LoadInst *EncryptedOffset =
-          UseIRB.CreateLoad(IntPtrTy, ConstEntryPtr, "vllvm.local.enc_offset");
+          UseIRB.CreateLoad(ConstTy, ConstEntryPtr, "vllvm.local.enc_offset");
       EncryptedOffset->setVolatile(true);
-      Constant *OffsetKey = ConstantInt::get(IntPtrTy, OffsetKeys[SlotNo]);
+      Constant *OffsetKey = ConstantInt::get(ConstTy, OffsetKeys[SlotNo]);
+      Value *Offset32 =
+          UseIRB.CreateXor(EncryptedOffset, OffsetKey, "vllvm.local.offset32");
       Value *Offset =
-          UseIRB.CreateXor(EncryptedOffset, OffsetKey, "vllvm.local.offset");
+          UseIRB.CreateZExtOrBitCast(Offset32, IntPtrTy, "vllvm.local.offset");
       Value *SlotPtr =
           UseIRB.CreateGEP(First_IRB.getInt8Ty(), StructPtr, Offset, SlotName);
       U->set(SlotPtr);

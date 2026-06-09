@@ -3,6 +3,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
 
 add_llvm_component_library(LLVMVLLVM
   Utils.cpp
+  CombinedObfuscationPass.cpp
   FlattenFuncPass.cpp
   EncryptoStrPass.cpp
   IndirectCallPass.cpp
