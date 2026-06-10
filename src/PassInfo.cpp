@@ -19,7 +19,7 @@ void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
       Options.FlattenFunc && Options.IndirectCall && Options.LocalVarStruct;
 
   if (UseCombinedConstTable) {
-    FPM.addPass(CombinedObfuscationPass());
+    FPM.addPass(FunctionObfuscationPass());
     HasFunctionPass = true;
   } else if (Options.FlattenFunc) {
     FPM.addPass(FlattenFuncPass());

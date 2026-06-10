@@ -1,4 +1,4 @@
-#include "CombinedObfuscationPass.h"
+#include "FunctionObfuscationPass.h"
 
 #include "CryptoUtils.h"
 #include "Utils.h"
@@ -678,14 +678,14 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
 }
 } // namespace
 
-PreservedAnalyses CombinedObfuscationPass::run(Function &F,
+PreservedAnalyses FunctionObfuscationPass::run(Function &F,
                                                FunctionAnalysisManager &FAM) {
-  errs() << "[vllvm] CombinedObfuscationPass:" << F.getName() << "\n";
+  errs() << "[vllvm] FunctionObfuscationPass:" << F.getName() << "\n";
   bool Changed = runCombined(F, FAM);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-bool CombinedObfuscationPass::runCombined(Function &F,
+bool FunctionObfuscationPass::runCombined(Function &F,
                                           FunctionAnalysisManager &FAM) {
   if (F.empty() || F.isDeclaration())
     return false;

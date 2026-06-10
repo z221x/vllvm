@@ -3,8 +3,8 @@
 #include "llvm/IR/PassManager.h"
 
 using namespace llvm;
-class CombinedObfuscationPass
-    : public PassInfoMixin<CombinedObfuscationPass> {
+class FunctionObfuscationPass
+    : public PassInfoMixin<FunctionObfuscationPass> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }
