@@ -35,14 +35,19 @@ strip_binary() {
 mkdir -p "$OUT_DIR"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -lvars "$SRC" \
+  -DVLLVM_TEST_COMBO=1 "$SRC" \
   -o "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.localvars" "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.localvars.table.* global " "$OUT_DIR/test_lvars.ll"
-grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i32\\]" \
+grep -q "vllvm.combined.const.table" "$OUT_DIR/test_lvars.ll"
+grep -q "vllvm.combined.const.table.* global " "$OUT_DIR/test_lvars.ll"
+grep -Eq "vllvm\\.combined\\.const\\.table.*global \\[[0-9]+ x i32\\]" \
   "$OUT_DIR/test_lvars.ll"
-if grep -q "vllvm.localvars.table.* constant " "$OUT_DIR/test_lvars.ll"; then
-  echo "local variable table must be writable data, not constant data" >&2
+if grep -q "vllvm.combined.const.table.* constant " "$OUT_DIR/test_lvars.ll"; then
+  echo "combined table must be writable data, not constant data" >&2
+  exit 1
+fi
+if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" \
+  "$OUT_DIR/test_lvars.ll"; then
+  echo "combined mode must not emit separate integer tables" >&2
   exit 1
 fi
 if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" \
@@ -78,7 +83,8 @@ fi
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -lvars -fla -icall "$SRC" \
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
+  -DVLLVM_TEST_COMBO=1 "$SRC" \
   -o "$OUT_DIR/test_lvars"
 strip_binary "$OUT_DIR/test_lvars_base"
 strip_binary "$OUT_DIR/test_lvars"

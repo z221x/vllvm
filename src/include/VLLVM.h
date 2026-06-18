@@ -16,5 +16,5 @@ struct VLLVMOptions {
   }
 };
 
-void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options);
+void addVLLVMPasses(ModulePassManager &MPM);
 } // namespace llvm::vllvm

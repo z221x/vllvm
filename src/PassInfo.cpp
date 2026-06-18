@@ -19,26 +19,20 @@ public:
 class VLLVMEncryptoStrDispatchPass
     : public PassInfoMixin<VLLVMEncryptoStrDispatchPass> {
 public:
-  explicit VLLVMEncryptoStrDispatchPass(VLLVMOptions Options)
-      : Options(Options) {}
-
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
-    if (!moduleRequestsStringEncryption(M, Options))
+    if (!moduleRequestsStringEncryption(M))
       return PreservedAnalyses::all();
     return EncryptoStrPass().run(M, MAM);
   }
-
-private:
-  VLLVMOptions Options;
 };
 
 class VLLVMFunctionDispatchPass
     : public PassInfoMixin<VLLVMFunctionDispatchPass> {
 public:
-  explicit VLLVMFunctionDispatchPass(VLLVMOptions Options) : Options(Options) {}
+  static bool isRequired() { return true; }
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-    VLLVMOptions FunctionOptions = getFunctionVLLVMOptions(F, Options);
+    VLLVMOptions FunctionOptions = getFunctionVLLVMOptions(F);
     FunctionOptions.EncryptoStr = false;
     if (!FunctionOptions.any())
       return PreservedAnalyses::all();
@@ -65,17 +59,14 @@ public:
 
     return PA;
   }
-
-private:
-  VLLVMOptions Options;
 };
 } // namespace
 
-void addVLLVMPasses(ModulePassManager &MPM, const VLLVMOptions &Options) {
+void addVLLVMPasses(ModulePassManager &MPM) {
   MPM.addPass(VLLVMAnnotationPass());
-  MPM.addPass(VLLVMEncryptoStrDispatchPass(Options));
+  MPM.addPass(VLLVMEncryptoStrDispatchPass());
   FunctionPassManager FPM;
-  FPM.addPass(VLLVMFunctionDispatchPass(Options));
+  FPM.addPass(VLLVMFunctionDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
 }
 } // namespace llvm::vllvm

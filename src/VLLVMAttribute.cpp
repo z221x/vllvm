@@ -54,17 +54,18 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.LocalVarStruct = true;
 }
 
+bool isOptionSeparator(char C) {
+  return C == ',';
+}
+
 VLLVMOptions parseOptionList(StringRef Text) {
   VLLVMOptions Options;
   Text = Text.trim();
   Text.consume_front("vllvm:");
-  Text.consume_front("vllvm=");
-  Text.consume_front("vllvm.");
 
   size_t Start = 0;
   for (size_t I = 0, E = Text.size(); I <= E; ++I) {
-    bool IsSep = I == E || Text[I] == ',' || Text[I] == '+' || Text[I] == '|' ||
-                 Text[I] == ';' || Text[I] == ' ';
+    bool IsSep = I == E || isOptionSeparator(Text[I]);
     if (!IsSep)
       continue;
     setOption(Options, Text.slice(Start, I));
@@ -190,9 +191,8 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
   return false;
 }
 
-VLLVMOptions getFunctionVLLVMOptions(Function &F,
-                                     const VLLVMOptions &GlobalOptions) {
-  VLLVMOptions Options = GlobalOptions;
+VLLVMOptions getFunctionVLLVMOptions(Function &F) {
+  VLLVMOptions Options;
   Options.EncryptoStr |= hasVLLVMAttribute(F, "enstr");
   Options.FlattenFunc |= hasVLLVMAttribute(F, "fla");
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
@@ -201,11 +201,7 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F,
   return Options;
 }
 
-bool moduleRequestsStringEncryption(Module &M,
-                                    const VLLVMOptions &GlobalOptions) {
-  if (GlobalOptions.EncryptoStr)
-    return true;
-
+bool moduleRequestsStringEncryption(Module &M) {
   for (Function &F : M)
     if (hasVLLVMAttribute(F, "enstr"))
       return true;

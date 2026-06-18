@@ -1,4 +1,13 @@
 #include <stdio.h>
+
+#if defined(VLLVM_TEST_LVARS)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:lvars")))
+#elif defined(VLLVM_TEST_COMBO)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:fla,icall,lvars")))
+#else
+#define VLLVM_TEST_OBF
+#endif
+
 typedef struct Pair {
   int x;
   long long y;
@@ -11,6 +20,7 @@ typedef struct Box {
   double weight;
 } Box;
 
+VLLVM_TEST_OBF
 static unsigned checksum_ptr(const int *ptr, int count) {
   unsigned acc = 2166136261u;
   unsigned salt = 13u;
@@ -24,6 +34,7 @@ static unsigned checksum_ptr(const int *ptr, int count) {
   return acc;
 }
 
+VLLVM_TEST_OBF
 static unsigned fold_arrays(int seed) {
   int ints[8];
   unsigned char bytes[11];
@@ -52,6 +63,7 @@ static unsigned fold_arrays(int seed) {
   return acc ^ checksum_ptr(ints, 8);
 }
 
+VLLVM_TEST_OBF
 static long long struct_flow(int n) {
   Pair first;
   Box box;
@@ -86,6 +98,7 @@ static long long struct_flow(int n) {
   return total + (long long)(boxes[0].weight * 4.0);
 }
 
+VLLVM_TEST_OBF
 static int early_return(int n) {
   int guard = n;
   int scratch[10];
@@ -107,6 +120,7 @@ static int early_return(int n) {
   return guard - scratch[4];
 }
 
+VLLVM_TEST_OBF
 static unsigned byte_shuffle(unsigned x) {
   unsigned char bytes[16];
   unsigned mix = x;
@@ -124,6 +138,7 @@ static unsigned byte_shuffle(unsigned x) {
   return sum ^ mix;
 }
 
+VLLVM_TEST_OBF
 int main(void) {
   unsigned combined = fold_arrays(9);
   combined ^= (unsigned)struct_flow(6);
@@ -131,6 +146,6 @@ int main(void) {
   combined ^= (unsigned)early_return(-3) * 3u;
   combined += (unsigned)early_return(5) * 5u;
   combined ^= byte_shuffle(0x12345678u);
-  printf("%d",combined & 127);
+  printf("%d", combined & 127);
   return (int)(combined & 127);
 }

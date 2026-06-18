@@ -35,7 +35,7 @@ strip_binary() {
 mkdir -p "$OUT_DIR"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -lvars "$SRC" \
+  -DVLLVM_TEST_LVARS=1 "$SRC" \
   -o "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.localvars" "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.localvars.table.* global " "$OUT_DIR/test_lvars.ll"
@@ -78,7 +78,8 @@ fi
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -lvars "$SRC" \
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
+  -DVLLVM_TEST_LVARS=1 "$SRC" \
   -o "$OUT_DIR/test_lvars"
 strip_binary "$OUT_DIR/test_lvars_base"
 strip_binary "$OUT_DIR/test_lvars"

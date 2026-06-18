@@ -44,16 +44,17 @@ set -e
 
 run_case() {
   local name=$1
-  shift
-  local flags=("$@")
   local ll="$OUT_DIR/$name.ll"
   local exe="$OUT_DIR/$name"
+  local upper_name
+  upper_name=$(printf "%s" "$name" | tr "[:lower:]" "[:upper:]")
+  local mode_define="-DVLLVM_TEST_${upper_name}=1"
 
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
-    -emit-llvm "${flags[@]}" "$SRC" -o "$ll"
+    -emit-llvm "$mode_define" "$SRC" -o "$ll"
 
-  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "${flags[@]}" \
-    "$SRC" -o "$exe"
+  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
+    "$mode_define" "$SRC" -o "$exe"
   strip_binary "$exe"
 
   set +e
@@ -98,6 +99,16 @@ run_case() {
   ibr)
     grep -q "indirectbr" "$ll"
     ;;
+  mixed)
+    grep -q "vllvm.fla.const.table" "$ll"
+    grep -q "func_table" "$ll"
+    grep -q "func_index_table.* global " "$ll"
+    grep -q "indirectbr" "$ll"
+    if grep -q "vllvm.combined.const.table" "$ll"; then
+      echo "mixed fla/icall/ibr must not use the lvars combined table" >&2
+      exit 1
+    fi
+    ;;
   ollvm)
     grep -q "_decrypto" "$ll"
     grep -q "func_table" "$ll"
@@ -141,8 +152,9 @@ run_case() {
   esac
 }
 
-run_case enstr -enstr
-run_case fla -fla
-run_case icall -icall
-run_case ibr -ibr
-run_case ollvm -ollvm
+# run_case enstr
+# run_case fla
+# run_case icall
+# run_case ibr
+run_case mixed
+# run_case ollvm

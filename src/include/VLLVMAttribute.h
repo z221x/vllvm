@@ -9,9 +9,7 @@ namespace llvm::vllvm {
 
 bool materializeAnnotationAttributes(Module &M);
 bool hasVLLVMAttribute(Function &F, StringRef Kind);
-VLLVMOptions getFunctionVLLVMOptions(Function &F,
-                                     const VLLVMOptions &GlobalOptions);
-bool moduleRequestsStringEncryption(Module &M,
-                                    const VLLVMOptions &GlobalOptions);
+VLLVMOptions getFunctionVLLVMOptions(Function &F);
+bool moduleRequestsStringEncryption(Module &M);
 
 } // namespace llvm::vllvm
