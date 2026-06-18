@@ -23,6 +23,38 @@ clang -enstr test.c -o test
 clang -ollvm test.c -o test
 ```
 
+也可以只给指定函数启用混淆。源码里使用 Clang/GCC 兼容的
+`annotate` attribute 标记函数即可，不需要额外传 `-fla` 等全局参数：
+
+```c
+#define VLLVM_OBF(kind) __attribute__((annotate("vllvm:" kind)))
+
+VLLVM_OBF("fla,icall,lvars")
+int protected_add(int a, int b) {
+  return a + b;
+}
+
+VLLVM_OBF("ibr")
+int protected_branch(int x) {
+  return x > 0 ? x : -x;
+}
+```
+
+支持的函数标记名和命令行参数一致：`enstr`、`fla`、`icall`、`ibr`、
+`lvars`、`ollvm`/`all`。多个标记可以用逗号、空格、`+`、`|` 或 `;`
+分隔。`enstr` 对应字符串加密，它是 Module Pass；在函数 attribute 中出现时会启用
+当前编译模块的字符串加密，而不是只加密该函数内的字符串。
+
+如果直接处理 LLVM IR，也可以写函数字符串属性：
+
+```llvm
+define i32 @protected_add(i32 %a, i32 %b) #0 {
+  ret i32 %a
+}
+
+attributes #0 = { "vllvm.fla" "vllvm.icall" "vllvm.lvars" }
+```
+
 ## 构建依赖
 
 三端统一使用 `clang`、`clang++` 和 `ninja` 作为构建环境，并需要 `cmake`、`git`。脚本会同时构建 `clang` 和同版本 `clangd`。

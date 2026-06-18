@@ -66,22 +66,18 @@ index 2f6d4c414..ba71ae473 100644
    }
    for (const auto &PassCallback : CodeGenOpts.PassBuilderCallbacks)
      PassCallback(PB);
-+  if (CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr ||
-+      CodeGenOpts.VLLVMFlattenFunc || CodeGenOpts.VLLVMIndirectCall ||
-+      CodeGenOpts.VLLVMIndirectBranch || CodeGenOpts.VLLVMLocalVarStruct) {
-+    llvm::vllvm::VLLVMOptions Options;
-+    Options.EncryptoStr = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr;
-+    Options.FlattenFunc = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMFlattenFunc;
-+    Options.IndirectCall = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectCall;
-+    Options.IndirectBranch =
-+        CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectBranch;
-+    Options.LocalVarStruct =
-+        CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMLocalVarStruct;
-+    PB.registerPipelineStartEPCallback(
-+        [Options](ModulePassManager &MPM, OptimizationLevel) {
-+          llvm::vllvm::addVLLVMPasses(MPM, Options);
-+        });
-+  }
++  llvm::vllvm::VLLVMOptions Options;
++  Options.EncryptoStr = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMEncryptoStr;
++  Options.FlattenFunc = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMFlattenFunc;
++  Options.IndirectCall = CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectCall;
++  Options.IndirectBranch =
++      CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMIndirectBranch;
++  Options.LocalVarStruct =
++      CodeGenOpts.VLLVMAll || CodeGenOpts.VLLVMLocalVarStruct;
++  PB.registerPipelineStartEPCallback(
++      [Options](ModulePassManager &MPM, OptimizationLevel) {
++        llvm::vllvm::addVLLVMPasses(MPM, Options);
++      });
  #define HANDLE_EXTENSION(Ext)                                                  \
    get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);
  #include "llvm/Support/Extension.def"

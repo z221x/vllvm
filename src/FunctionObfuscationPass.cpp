@@ -49,10 +49,9 @@ struct SharedConstTable {
   GlobalVariable *createGlobal(const Twine &Name,
                                ArrayRef<Constant *> InitEntries) {
     ArrayType *TableTy = ArrayType::get(ConstTy, InitEntries.size());
-    auto *NewGV =
-        new GlobalVariable(M, TableTy, false, GlobalValue::PrivateLinkage,
-                           ConstantArray::get(TableTy, InitEntries),
-                           Name.str());
+    auto *NewGV = new GlobalVariable(
+        M, TableTy, false, GlobalValue::PrivateLinkage,
+        ConstantArray::get(TableTy, InitEntries), Name.str());
     NewGV->setAlignment(DL.getABITypeAlign(TableTy));
     return NewGV;
   }
@@ -243,8 +242,8 @@ FlattenPlan planFlatten(Function &F, FunctionAnalysisManager &FAM,
 
   for (Function::iterator BB = F.begin(); BB != F.end(); ++BB) {
     if (auto *II = dyn_cast<InvokeInst>(BB->getTerminator())) {
-      auto RemoveBB = std::find(Plan.FlattenBBs.begin(),
-                                Plan.FlattenBBs.end(), II->getUnwindDest());
+      auto RemoveBB = std::find(Plan.FlattenBBs.begin(), Plan.FlattenBBs.end(),
+                                II->getUnwindDest());
       if (RemoveBB != Plan.FlattenBBs.end())
         Plan.FlattenBBs.erase(RemoveBB);
     }
@@ -302,8 +301,7 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
   IRBuilder<> IRB(EntryBB);
   EntryBB->getTerminator()->eraseFromParent();
   AllocaInst *SwitchVar = IRB.CreateAlloca(Int32Ty, 0, "switchVar");
-  IRB.CreateStore(ConstantInt::get(Int32Ty, Plan.InitialStateIndex),
-                  SwitchVar);
+  IRB.CreateStore(ConstantInt::get(Int32Ty, Plan.InitialStateIndex), SwitchVar);
 
   BasicBlock *SwitchLoopEntry =
       BasicBlock::Create(Ctx, "switchLoopEntry", &F, EntryBB);
@@ -348,8 +346,7 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
     IRB.SetInsertPoint(DispatchBBs[I]);
     Value *CaseConst =
         ConstTable.load(IRB, Plan.CaseConstIndexes[I], "loadCaseConst");
-    Value *CaseMatch =
-        IRB.CreateICmpEQ(CaseValue, CaseConst, "caseConstMatch");
+    Value *CaseMatch = IRB.CreateICmpEQ(CaseValue, CaseConst, "caseConstMatch");
     BasicBlock *NextBB =
         I + 1 < DispatchBBs.size() ? DispatchBBs[I + 1] : SwDefault;
     IRB.CreateCondBr(CaseMatch, Plan.FlattenBBs[I], NextBB);
@@ -390,11 +387,9 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
 
       unsigned TrueIndex = getStateIndexForBB(Plan, Term->getSuccessor(0));
       unsigned FalseIndex = getStateIndexForBB(Plan, Term->getSuccessor(1));
-      Value *TargetStateIndex =
-          BBIRB.CreateSelect(Br->getCondition(),
-                             ConstantInt::get(Int32Ty, TrueIndex),
-                             ConstantInt::get(Int32Ty, FalseIndex),
-                             "targetStateIndex");
+      Value *TargetStateIndex = BBIRB.CreateSelect(
+          Br->getCondition(), ConstantInt::get(Int32Ty, TrueIndex),
+          ConstantInt::get(Int32Ty, FalseIndex), "targetStateIndex");
       Value *OldStateIndex =
           BBIRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
       Value *StateDelta =
@@ -475,8 +470,7 @@ GlobalVariable *createFuncTable(Function &F, const IndirectCallPlan &Plan) {
   for (Function *Callee : Plan.Callees)
     FuncPtrs.push_back(ConstantExpr::getBitCast(Callee, VoidPtrTy));
 
-  return new GlobalVariable(*M, FuncTableTy, true,
-                            GlobalValue::PrivateLinkage,
+  return new GlobalVariable(*M, FuncTableTy, true, GlobalValue::PrivateLinkage,
                             ConstantArray::get(FuncTableTy, FuncPtrs),
                             (Twine("func_table") + F.getName()).str());
 }
@@ -505,8 +499,8 @@ bool applyIndirectCalls(Function &F, const IndirectCallPlan &Plan,
     Value *FuncPtr = IRB.CreateInBoundsGEP(
         FuncTableTy, FuncTableGV,
         {ConstantInt::get(Type::getInt32Ty(Ctx), 0), Index});
-    Value *FuncAddr = IRB.CreateLoad(IRB.getPtrTy(), FuncPtr,
-                                     "vllvm.icall.func");
+    Value *FuncAddr =
+        IRB.CreateLoad(IRB.getPtrTy(), FuncPtr, "vllvm.icall.func");
     Call->setCalledOperand(FuncAddr);
   }
 
@@ -614,23 +608,20 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
       StructSize, getIntPtrConstant(IntPtrTy, ExtraAlignBytes));
 
   CallInst *RawStructPtr = FirstIRB.CreateMalloc(
-      IntPtrTy, Plan.StructTy, AllocSize, nullptr, nullptr,
-      "vllvm.locals.raw");
+      IntPtrTy, Plan.StructTy, AllocSize, nullptr, nullptr, "vllvm.locals.raw");
   Value *StructPtr = RawStructPtr;
   if (Plan.MaxAlign.value() > 1) {
     Value *RawInt =
         FirstIRB.CreatePtrToInt(RawStructPtr, IntPtrTy, "vllvm.locals.int");
-    Value *Biased = FirstIRB.CreateAdd(
-        RawInt, getIntPtrConstant(IntPtrTy, ExtraAlignBytes),
-        "vllvm.locals.bias");
-    Constant *Mask =
-        ConstantInt::get(IntPtrTy,
-                         APInt(PtrBits, ~(Plan.MaxAlign.value() - 1)));
+    Value *Biased =
+        FirstIRB.CreateAdd(RawInt, getIntPtrConstant(IntPtrTy, ExtraAlignBytes),
+                           "vllvm.locals.bias");
+    Constant *Mask = ConstantInt::get(
+        IntPtrTy, APInt(PtrBits, ~(Plan.MaxAlign.value() - 1)));
     Value *AlignedInt =
         FirstIRB.CreateAnd(Biased, Mask, "vllvm.locals.aligned_int");
-    StructPtr =
-        FirstIRB.CreateIntToPtr(AlignedInt, FirstIRB.getPtrTy(),
-                                "vllvm.locals");
+    StructPtr = FirstIRB.CreateIntToPtr(AlignedInt, FirstIRB.getPtrTy(),
+                                        "vllvm.locals");
   }
 
   for (unsigned SlotNo = 0; SlotNo < Plan.Slots.size(); ++SlotNo) {
@@ -646,13 +637,12 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
     for (Use *U : Uses) {
       Instruction *InsertPt = getInsertionPointForUse(*U);
       IRBuilder<> UseIRB(InsertPt);
-      Value *EncryptedOffset = ConstTable.load(UseIRB, Slot.ConstIndex,
-                                               "vllvm.local.enc_offset");
-      Value *Offset32 =
-          UseIRB.CreateXor(EncryptedOffset,
-                           ConstantInt::get(Type::getInt32Ty(Ctx),
-                                            Slot.OffsetKey),
-                           "vllvm.local.offset32");
+      Value *EncryptedOffset =
+          ConstTable.load(UseIRB, Slot.ConstIndex, "vllvm.local.enc_offset");
+      Value *Offset32 = UseIRB.CreateXor(
+          EncryptedOffset,
+          ConstantInt::get(Type::getInt32Ty(Ctx), Slot.OffsetKey),
+          "vllvm.local.offset32");
       Value *Offset =
           UseIRB.CreateZExtOrBitCast(Offset32, IntPtrTy, "vllvm.local.offset");
       Value *SlotPtr =
