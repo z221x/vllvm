@@ -43,9 +43,20 @@ public:
     bool UseCombinedConstTable = FunctionOptions.FlattenFunc &&
                                  FunctionOptions.IndirectCall &&
                                  FunctionOptions.LocalVarStruct;
+
     if (UseCombinedConstTable) {
-      RunPass(FunctionObfuscationPass());
+      RunPass(FunctionObfuscationPass(FunctionOptions.BogusControlFlow));
+      FunctionOptions.BogusControlFlow = false;
     } else {
+      if (FunctionOptions.BogusControlFlow) {
+        RunPass(BogusControlFlowPass());
+        if (F.hasFnAttribute("vllvm.bcf")) {
+          F.removeFnAttr("vllvm.bcf");
+          PA.intersect(PreservedAnalyses::none());
+        }
+        FunctionOptions.BogusControlFlow = false;
+      }
+
       if (FunctionOptions.FlattenFunc)
         RunPass(FlattenFuncPass());
       if (FunctionOptions.IndirectCall)

@@ -26,6 +26,9 @@ StringRef normalizeKind(StringRef Kind) {
     return "ibr";
   if (Kind == "local-var-struct" || Kind == "localvars")
     return "lvars";
+  if (Kind == "bogus-control-flow" || Kind == "bogus_control_flow" ||
+      Kind == "bogus" || Kind == "fake-control-flow")
+    return "bcf";
   if (Kind == "encrypt-string")
     return "enstr";
   return Kind;
@@ -39,6 +42,7 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.IndirectCall = true;
     Options.IndirectBranch = true;
     Options.LocalVarStruct = true;
+    Options.BogusControlFlow = true;
     return;
   }
 
@@ -52,10 +56,13 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.IndirectBranch = true;
   else if (Kind == "lvars")
     Options.LocalVarStruct = true;
+  else if (Kind == "bcf")
+    Options.BogusControlFlow = true;
 }
 
 bool isOptionSeparator(char C) {
-  return C == ',';
+  return C == ',' || C == ' ' || C == '+' || C == '|' || C == ';' ||
+         C == '\t' || C == '\n' || C == '\r';
 }
 
 VLLVMOptions parseOptionList(StringRef Text) {
@@ -127,6 +134,7 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   AddAttr("icall", Options.IndirectCall);
   AddAttr("ibr", Options.IndirectBranch);
   AddAttr("lvars", Options.LocalVarStruct);
+  AddAttr("bcf", Options.BogusControlFlow);
   return Changed;
 }
 
@@ -188,6 +196,8 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
     return Options.IndirectBranch;
   if (Kind == "lvars")
     return Options.LocalVarStruct;
+  if (Kind == "bcf")
+    return Options.BogusControlFlow;
   return false;
 }
 
@@ -198,6 +208,7 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");
   Options.LocalVarStruct |= hasVLLVMAttribute(F, "lvars");
+  Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
   return Options;
 }
 

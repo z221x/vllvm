@@ -13,6 +13,92 @@
 #include <random>
 #include <vector>
 
+namespace {
+// 给 dispatch 树选择带随机扰动的切分点，避免每次都形成完全平衡的固定形态。
+unsigned chooseDispatchSplit(unsigned Begin, unsigned End,
+                             CryptoUtils &Crypto) {
+  unsigned Count = End - Begin;
+  if (Count <= 2)
+    return Begin + 1;
+
+  unsigned Base = Count / 2;
+  unsigned Window = std::max(1U, Count / 4);
+  unsigned Jitter = Crypto.getRandom32() % (Window * 2 + 1);
+  int SignedSplit = static_cast<int>(Begin + Base) + static_cast<int>(Jitter) -
+                    static_cast<int>(Window);
+  return static_cast<unsigned>(std::clamp(
+      SignedSplit, static_cast<int>(Begin + 1), static_cast<int>(End - 1)));
+}
+
+// 使用二叉路由树，替代旧的线性 caseDispatch 链。
+BasicBlock *buildDispatchTree(Function &F, BasicBlock *InsertBefore,
+                              Value *StateIndex, Value *CaseValue,
+                              Type *Int32Ty, ArrayType *CaseTableTy,
+                              GlobalVariable *CaseTable,
+                              const std::vector<BasicBlock *> &FlattenBBs,
+                              unsigned Begin, unsigned End,
+                              BasicBlock *DefaultBB, CryptoUtils &Crypto) {
+  LLVMContext &Ctx = F.getContext();
+  BasicBlock *Node = BasicBlock::Create(
+      Ctx, End - Begin == 1 ? "caseDispatch" : "caseRoute", &F, InsertBefore);
+  IRBuilder<> IRB(Node);
+
+  if (End - Begin == 1) {
+    Value *CaseConstPtr = IRB.CreateInBoundsGEP(
+        CaseTableTy, CaseTable,
+        {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, Begin)},
+        "caseConstPtr");
+    LoadInst *CaseConst =
+        IRB.CreateLoad(Int32Ty, CaseConstPtr, "loadCaseConst");
+    CaseConst->setVolatile(true);
+    Value *CaseMatch = IRB.CreateICmpEQ(CaseValue, CaseConst, "caseConstMatch");
+    IRB.CreateCondBr(CaseMatch, FlattenBBs[Begin], DefaultBB);
+    return Node;
+  }
+
+  unsigned Split = chooseDispatchSplit(Begin, End, Crypto);
+  BasicBlock *Left = buildDispatchTree(
+      F, InsertBefore, StateIndex, CaseValue, Int32Ty, CaseTableTy, CaseTable,
+      FlattenBBs, Begin, Split, DefaultBB, Crypto);
+  BasicBlock *Right = buildDispatchTree(
+      F, InsertBefore, StateIndex, CaseValue, Int32Ty, CaseTableTy, CaseTable,
+      FlattenBBs, Split, End, DefaultBB, Crypto);
+
+  Value *Threshold = ConstantInt::get(Int32Ty, Split);
+  if (Crypto.getRandom32() & 1) {
+    Value *GoLeft = IRB.CreateICmpULT(StateIndex, Threshold, "dispatch.left");
+    IRB.CreateCondBr(GoLeft, Left, Right);
+  } else {
+    Value *GoRight = IRB.CreateICmpUGE(StateIndex, Threshold, "dispatch.right");
+    IRB.CreateCondBr(GoRight, Right, Left);
+  }
+  return Node;
+}
+
+// 打乱基本块物理顺序，减少 CFG 视图按插入顺序排版时的规则感。
+void shuffleFunctionBlocks(Function &F, CryptoUtils &Crypto) {
+  if (F.size() <= 2)
+    return;
+
+  std::vector<BasicBlock *> Blocks;
+  BasicBlock *Entry = &F.getEntryBlock();
+  for (BasicBlock &BB : F)
+    if (&BB != Entry)
+      Blocks.push_back(&BB);
+
+  std::default_random_engine ShuffleEngine(Crypto.getRandom32());
+  std::shuffle(Blocks.begin(), Blocks.end(), ShuffleEngine);
+
+  BasicBlock *InsertAfter = Entry;
+  for (BasicBlock *BB : Blocks) {
+    if (BB == InsertAfter)
+      continue;
+    BB->moveAfter(InsertAfter);
+    InsertAfter = BB;
+  }
+}
+} // namespace
+
 PreservedAnalyses FlattenFuncPass::run(Function &F,
                                        FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] FlattenFuncPass:" << F.getName() << "\n";
@@ -112,10 +198,10 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   }
 
   ArrayType *caseTableTy = ArrayType::get(Int32Ty, caseConstants.size());
-  GlobalVariable *caseTable = new GlobalVariable(
-      *M, caseTableTy, true, GlobalValue::PrivateLinkage,
-      ConstantArray::get(caseTableTy, caseConstants),
-      (Twine("vllvm.fla.const.table.") + F.getName()).str());
+  GlobalVariable *caseTable =
+      new GlobalVariable(*M, caseTableTy, true, GlobalValue::PrivateLinkage,
+                         ConstantArray::get(caseTableTy, caseConstants),
+                         (Twine("vllvm.fla.const.table.") + F.getName()).str());
   caseTable->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
 
   // switch框架
@@ -131,14 +217,6 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
       BasicBlock::Create(Ctx, "switchDefault", &F, switchLoopEnd);
   BranchInst::Create(switchLoopEnd, swDefault);
 
-  std::vector<BasicBlock *> dispatchBBs;
-  dispatchBBs.reserve(flattenBBs.size());
-  for (unsigned i = 0; i < flattenBBs.size(); ++i) {
-    BasicBlock *dispatchBB =
-        BasicBlock::Create(Ctx, "caseDispatch", &F, swDefault);
-    dispatchBBs.push_back(dispatchBB);
-  }
-
   IRB.SetInsertPoint(switchLoopEntry);
   Value *stateIndex = IRB.CreateLoad(Int32Ty, switchVar, "loadSwitchIndex");
   Value *isValidIndex = IRB.CreateICmpULT(
@@ -150,26 +228,13 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   Value *caseValuePtr = IRB.CreateInBoundsGEP(
       caseTableTy, caseTable, {ConstantInt::get(Int32Ty, 0), stateIndex},
       "caseValuePtr");
-  LoadInst *caseValue =
-      IRB.CreateLoad(Int32Ty, caseValuePtr, "loadCaseValue");
+  LoadInst *caseValue = IRB.CreateLoad(Int32Ty, caseValuePtr, "loadCaseValue");
   caseValue->setVolatile(true);
-  IRB.CreateBr(dispatchBBs.front());
-
-  for (unsigned i = 0; i < dispatchBBs.size(); ++i) {
-    IRB.SetInsertPoint(dispatchBBs[i]);
-    Value *caseConstPtr = IRB.CreateInBoundsGEP(
-        caseTableTy, caseTable,
-        {ConstantInt::get(Int32Ty, 0), ConstantInt::get(Int32Ty, i)},
-        "caseConstPtr");
-    LoadInst *caseConst =
-        IRB.CreateLoad(Int32Ty, caseConstPtr, "loadCaseConst");
-    caseConst->setVolatile(true);
-    Value *caseMatch =
-        IRB.CreateICmpEQ(caseValue, caseConst, "caseConstMatch");
-    BasicBlock *nextBB =
-        i + 1 < dispatchBBs.size() ? dispatchBBs[i + 1] : swDefault;
-    IRB.CreateCondBr(caseMatch, flattenBBs[i], nextBB);
-  }
+  // 从 dispatcher 进入随机路由树，而不是顺序扫描每一个 case。
+  BasicBlock *dispatchRoot = buildDispatchTree(
+      F, swDefault, stateIndex, caseValue, Int32Ty, caseTableTy, caseTable,
+      flattenBBs, 0, flattenBBs.size(), swDefault, *cryptoUtils);
+  IRB.CreateBr(dispatchRoot);
 
   // 给每个块分配一个常量表下标作为状态值
   for (BasicBlock *bb : flattenBBs) {
@@ -196,11 +261,11 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
       BasicBlock *succBB = bb->getTerminator()->getSuccessor(0);
       Value *oldStateIndex =
           IRB.CreateLoad(Int32Ty, switchVar, "oldStateIndex");
-      Value *stateDelta = IRB.CreateSub(
-          ConstantInt::get(Int32Ty, getStateIndexForBB(succBB)),
-          oldStateIndex, "stateDelta");
-      Value *newStateIndex = IRB.CreateAdd(
-          oldStateIndex, stateDelta, "newStateIndex");
+      Value *stateDelta =
+          IRB.CreateSub(ConstantInt::get(Int32Ty, getStateIndexForBB(succBB)),
+                        oldStateIndex, "stateDelta");
+      Value *newStateIndex =
+          IRB.CreateAdd(oldStateIndex, stateDelta, "newStateIndex");
       IRB.CreateStore(newStateIndex, switchVar);
       IRB.CreateBr(switchLoopEntry);
       bb->getTerminator()->eraseFromParent();
@@ -213,11 +278,9 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
           getStateIndexForBB(bb->getTerminator()->getSuccessor(1));
       // 创建分支
       BranchInst *br = cast<BranchInst>(bb->getTerminator());
-      Value *targetStateIndex =
-          IRB.CreateSelect(br->getCondition(),
-                           ConstantInt::get(Int32Ty, trueIndex),
-                           ConstantInt::get(Int32Ty, falseIndex),
-                           "targetStateIndex");
+      Value *targetStateIndex = IRB.CreateSelect(
+          br->getCondition(), ConstantInt::get(Int32Ty, trueIndex),
+          ConstantInt::get(Int32Ty, falseIndex), "targetStateIndex");
       Value *oldStateIndex =
           IRB.CreateLoad(Int32Ty, switchVar, "oldStateIndex");
       Value *stateDelta =
@@ -233,5 +296,7 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   //  收尾工作
   fixStack(&F);
   lowerSwitchPass.run(F, FAM);
+  // 路由树和原始块都建好后再统一打乱布局顺序。
+  shuffleFunctionBlocks(F, *cryptoUtils);
   return true;
 }

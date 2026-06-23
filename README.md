@@ -24,15 +24,25 @@ VLLVM_OBF("ibr,icall,fla")
 int protected_mixed(int x) {
   return protected_branch(x) + 1;
 }
+
+VLLVM_OBF("bcf")
+int protected_bogus_flow(int x) {
+  return x * 3 + 1;
+}
 ```
 
-支持的标记名：`enstr`、`fla`、`icall`、`ibr`、`lvars`、`ollvm`/`all`。
+支持的标记名：`enstr`、`fla`、`icall`、`ibr`、`lvars`、`bcf`、`ollvm`/`all`。
 多个标记可以用逗号、空格、`+`、`|` 或 `;` 分隔，顺序不敏感。
+
+`bcf` 对应虚假控制流，会为可安全拆分的基本块插入基于私有可写全局状态和
+`volatile` load 的不透明谓词、真实后继和不会被执行的 fake 分支。它会保守跳过
+异常处理、`musttail`、`callbr`、`indirectbr` 等 ABI 或 CFG 敏感场景。
 
 当同一个函数同时标记 `fla`、`icall`、`lvars` 时，会自动使用组合 Pass：
 平坦化 case 值、间接调用加密下标、局部变量结构体偏移共用同一张
-四字节 `i32` 的 `vllvm.combined.const.table.*`。间接调用的函数地址仍保留在独立
-`func_table*` 指针表中。
+四字节 `i32` 的 `vllvm.combined.const.table.*`。如果同时启用 `bcf`，虚假控制流
+的不透明谓词种子和 junk 常量也会先写入这张表，再把混淆后的函数体搬进
+`*.vllvm.impl`。间接调用的函数地址仍保留在独立 `func_table*` 指针表中。
 
 `enstr` 对应字符串加密，它是 Module Pass；在函数 attribute 中出现时会启用当前
 编译模块的字符串加密，而不是只加密该函数内的字符串。

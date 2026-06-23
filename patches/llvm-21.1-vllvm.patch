@@ -10,7 +10,7 @@ index 2f6d4c414..ba71ae473 100644
  #include "llvm/Transforms/Scalar/GVN.h"
  #include "llvm/Transforms/Scalar/JumpThreading.h"
  #include "llvm/Transforms/Utils/Debugify.h"
-@@ -990,6 +991,11 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+@@ -990,6 +991,10 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
    }
    for (const auto &PassCallback : CodeGenOpts.PassBuilderCallbacks)
      PassCallback(PB);

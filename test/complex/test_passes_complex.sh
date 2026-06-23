@@ -80,7 +80,8 @@ run_case() {
       echo "fla left a switch instruction in IR" >&2
       exit 1
     fi
-    grep -q "icmp slt i32" "$ll"
+    grep -q "vllvm.fla.const.table" "$ll"
+    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     ;;
   icall)
     grep -q "func_table" "$ll"
@@ -100,12 +101,23 @@ run_case() {
     grep -q "indirectbr" "$ll"
     ;;
   mixed)
-    grep -q "vllvm.fla.const.table" "$ll"
+    grep -q "vllvm.combined.const.table.* global " "$ll"
+    grep -q "define private .*vllvm.impl.*ptr %" "$ll"
+    grep -q "call .*vllvm.impl.*ptr @vllvm.combined.const.table" "$ll"
+    grep -q "getelementptr i32, ptr %" "$ll"
     grep -q "func_table" "$ll"
-    grep -q "func_index_table.* global " "$ll"
-    grep -q "indirectbr" "$ll"
-    if grep -q "vllvm.combined.const.table" "$ll"; then
-      echo "mixed fla/icall/ibr must not use the lvars combined table" >&2
+    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
+    grep -q "store volatile i32 .*ptr %.*" "$ll"
+    if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
+      echo "mixed bcf constants must use the combined integer constant table" >&2
+      exit 1
+    fi
+    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.combined\\.const\\.table" "$ll"; then
+      echo "mixed bcf table loads must use the impl table parameter" >&2
+      exit 1
+    fi
+    if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" "$ll"; then
+      echo "mixed must use one combined integer constant table" >&2
       exit 1
     fi
     ;;
@@ -116,6 +128,19 @@ run_case() {
     grep -q "vllvm.localvars" "$ll"
     grep -q "vllvm.combined.const.table.* global " "$ll"
     grep -Eq "vllvm\\.combined\\.const\\.table.*global \\[[0-9]+ x i32\\]" "$ll"
+    grep -q "define private .*vllvm.impl.*ptr %" "$ll"
+    grep -q "call .*vllvm.impl.*ptr @vllvm.combined.const.table" "$ll"
+    grep -q "getelementptr i32, ptr %" "$ll"
+    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
+    grep -q "store volatile i32 .*ptr %.*" "$ll"
+    if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
+      echo "ollvm bcf constants must use the combined integer constant table" >&2
+      exit 1
+    fi
+    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.combined\\.const\\.table" "$ll"; then
+      echo "ollvm bcf table loads must use the impl table parameter" >&2
+      exit 1
+    fi
     if grep -q "vllvm.combined.const.table.* constant " "$ll"; then
       echo "ollvm combined table must be writable data" >&2
       exit 1

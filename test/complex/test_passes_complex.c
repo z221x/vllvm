@@ -1,3 +1,4 @@
+#include <stdio.h>
 typedef int (*local_op_t)(int, int);
 
 #if defined(VLLVM_TEST_ENSTR)
@@ -9,7 +10,7 @@ typedef int (*local_op_t)(int, int);
 #elif defined(VLLVM_TEST_IBR)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:ibr")))
 #elif defined(VLLVM_TEST_MIXED)
-#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:lvars,icall,fla")))
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:bcf,lvars,icall,fla")))
 #elif defined(VLLVM_TEST_OLLVM)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:ollvm")))
 #else
@@ -146,5 +147,6 @@ int main(void) {
   result += (unsigned)branch_flow(37);
   result ^= (unsigned)recursive_flow(6);
   result += (unsigned)local_flow(29);
+  printf("Result: %u\n", result);
   return (int)(result & 255u);
 }

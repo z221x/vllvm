@@ -6,9 +6,13 @@ using namespace llvm;
 class FunctionObfuscationPass
     : public PassInfoMixin<FunctionObfuscationPass> {
 public:
+  explicit FunctionObfuscationPass(bool RunBogusControlFlow = false)
+      : RunBogusControlFlow(RunBogusControlFlow) {}
+
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }
 
 private:
   bool runCombined(Function &F, FunctionAnalysisManager &FAM);
+  bool RunBogusControlFlow = false;
 };

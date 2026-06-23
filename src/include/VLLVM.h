@@ -9,10 +9,11 @@ struct VLLVMOptions {
   bool IndirectCall = false;
   bool IndirectBranch = false;
   bool LocalVarStruct = false;
+  bool BogusControlFlow = false;
 
   bool any() const {
     return EncryptoStr || FlattenFunc || IndirectCall || IndirectBranch ||
-           LocalVarStruct;
+           LocalVarStruct || BogusControlFlow;
   }
 };
 

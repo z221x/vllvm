@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMVLLVM
   Utils.cpp
   VLLVMAttribute.cpp
   FunctionObfuscationPass.cpp
+  BogusControlFlowPass.cpp
   FlattenFuncPass.cpp
   EncryptoStrPass.cpp
   IndirectCallPass.cpp
