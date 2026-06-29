@@ -7,6 +7,68 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/NoFolder.h"
+#include "llvm/ADT/SmallVector.h"
+
+namespace {
+bool hasEH(Function &F) {
+  for (Instruction &I : instructions(F)) {
+    if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
+        isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
+        isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
+        isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
+      return true;
+  }
+  return false;
+}
+
+bool shouldSkipEHValue(Instruction &I) {
+  return I.isEHPad() || isa<LandingPadInst>(&I) || isa<CatchPadInst>(&I) ||
+         isa<CleanupPadInst>(&I) || isa<CatchSwitchInst>(&I);
+}
+
+void updatePhiIncomingBlock(BasicBlock *SuccBB, BasicBlock *OldPred,
+                            BasicBlock *NewPred) {
+  for (PHINode &PN : SuccBB->phis()) {
+    for (unsigned I = 0, E = PN.getNumIncomingValues(); I != E; ++I)
+      if (PN.getIncomingBlock(I) == OldPred)
+        PN.setIncomingBlock(I, NewPred);
+  }
+}
+
+void splitInvokeNormalEdgesForPHI(Function &F) {
+  SmallVector<InvokeInst *, 8> Invokes;
+  for (Instruction &I : instructions(F))
+    if (auto *II = dyn_cast<InvokeInst>(&I))
+      Invokes.push_back(II);
+
+  for (InvokeInst *II : Invokes) {
+    BasicBlock *NormalDest = II->getNormalDest();
+    BasicBlock *InvokeBB = II->getParent();
+    bool NeedsSplit = false;
+    for (PHINode &PN : NormalDest->phis()) {
+      for (unsigned I = 0, E = PN.getNumIncomingValues(); I != E; ++I) {
+        if (PN.getIncomingBlock(I) == InvokeBB) {
+          NeedsSplit = true;
+          break;
+        }
+      }
+      if (NeedsSplit)
+        break;
+    }
+    if (!NeedsSplit)
+      continue;
+
+    // invoke 的返回值只能在 normal 边之后使用；把 PHI incoming 改到
+    // 专用跳板块，后续 DemotePHIToStack 才能把 store 插在合法位置。
+    BasicBlock *SplitBB = BasicBlock::Create(
+        F.getContext(), "invoke.phi.edge", &F, NormalDest);
+    BranchInst::Create(NormalDest, SplitBB);
+    updatePhiIncomingBlock(NormalDest, InvokeBB, SplitBB);
+    II->setNormalDest(SplitBB);
+  }
+}
+} // namespace
+
 // Shamefully borrowed from ../Scalar/RegToMem.cpp :(
 bool valueEscapes(Instruction *Inst) {
   BasicBlock *BB = Inst->getParent();
@@ -53,6 +115,47 @@ void fixStack(Function *f) {
     }
 
   } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
+}
+
+void fixStackForFlatten(Function *F) {
+  if (!hasEH(*F)) {
+    fixStack(F);
+    return;
+  }
+
+  // C++ EH 中 invoke/landingpad 有特殊定义域，不能套用全函数反复
+  // Demote 的旧 fixStack；这里只处理 flatten 必需的 SSA 跨块值。
+  splitInvokeNormalEdgesForPHI(*F);
+
+  SmallVector<Instruction *, 32> Regs;
+  SmallVector<PHINode *, 16> Phis;
+  BasicBlock *EntryBB = &F->getEntryBlock();
+
+  for (BasicBlock &BB : *F) {
+    for (Instruction &I : BB) {
+      if (auto *PN = dyn_cast<PHINode>(&I)) {
+        Phis.push_back(PN);
+        continue;
+      }
+
+      if (I.getType()->isVoidTy() || shouldSkipEHValue(I))
+        continue;
+      if (isa<AllocaInst>(&I) && I.getParent() == EntryBB)
+        continue;
+      if (I.isTerminator() && !isa<InvokeInst>(&I) && !isa<CallBrInst>(&I))
+        continue;
+      if (valueEscapes(&I) || I.isUsedOutsideOfBlock(&BB))
+        Regs.push_back(&I);
+    }
+  }
+
+  for (Instruction *I : Regs)
+    if (I->getParent())
+      DemoteRegToStack(*I);
+
+  for (PHINode *PN : Phis)
+    if (PN->getParent())
+      DemotePHIToStack(PN);
 }
 
 CallBase *fixEH(CallBase *CB) {

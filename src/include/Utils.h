@@ -8,6 +8,7 @@ using namespace llvm;
 
 bool valueEscapes(Instruction *Inst);
 void fixStack(Function *f);
+void fixStackForFlatten(Function *F);
 CallBase *fixEH(CallBase *CB);
 void LowerConstantExpr(Function &F);
 bool expandConstantExpr(Function &F);

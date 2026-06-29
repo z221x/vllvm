@@ -189,11 +189,60 @@ Constant *getIntPtrConstant(Type *IntPtrTy, uint64_t Value) {
   return ConstantInt::get(IntPtrTy, Value);
 }
 
-unsigned getStateIndexForBB(const FlattenPlan &Plan, BasicBlock *TargetBB) {
+std::optional<unsigned> findStateIndexForBB(const FlattenPlan &Plan,
+                                            BasicBlock *TargetBB) {
   for (unsigned I = 0; I < Plan.FlattenBBs.size(); ++I)
     if (Plan.FlattenBBs[I] == TargetBB)
       return I;
-  return Plan.FlattenBBs.size() - 1;
+  return std::nullopt;
+}
+
+bool isFlattenableBlock(BasicBlock &BB) {
+  Instruction *Term = BB.getTerminator();
+  if (!Term || BB.isEHPad())
+    return false;
+
+  // EH pad/indirect terminator 不能作为状态机 case 重写；invoke 单独处理，
+  // 只改 normal 边，unwind 边保持原状。
+  if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term) ||
+      isa<CatchSwitchInst>(Term) || isa<CatchReturnInst>(Term) ||
+      isa<CleanupReturnInst>(Term) || isa<ResumeInst>(Term))
+    return false;
+
+  return true;
+}
+
+void updatePhiIncomingBlock(BasicBlock *SuccBB, BasicBlock *OldPred,
+                            BasicBlock *NewPred) {
+  for (PHINode &PN : SuccBB->phis()) {
+    for (unsigned I = 0, E = PN.getNumIncomingValues(); I != E; ++I)
+      if (PN.getIncomingBlock(I) == OldPred)
+        PN.setIncomingBlock(I, NewPred);
+  }
+}
+
+void storeFlattenState(IRBuilder<> &IRB, AllocaInst *SwitchVar,
+                       Type *Int32Ty, unsigned TargetIndex) {
+  Value *OldStateIndex = IRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
+  Value *StateDelta =
+      IRB.CreateSub(ConstantInt::get(Int32Ty, TargetIndex), OldStateIndex,
+                    "stateDelta");
+  Value *NewStateIndex =
+      IRB.CreateAdd(OldStateIndex, StateDelta, "newStateIndex");
+  IRB.CreateStore(NewStateIndex, SwitchVar);
+}
+
+BasicBlock *createFlattenStateBlock(Function &F, BasicBlock *InsertBefore,
+                                    AllocaInst *SwitchVar, Type *Int32Ty,
+                                    unsigned TargetIndex,
+                                    BasicBlock *SwitchLoopEntry,
+                                    const Twine &Name) {
+  BasicBlock *StateBB =
+      BasicBlock::Create(F.getContext(), Name, &F, InsertBefore);
+  IRBuilder<> IRB(StateBB);
+  storeFlattenState(IRB, SwitchVar, Int32Ty, TargetIndex);
+  IRB.CreateBr(SwitchLoopEntry);
+  return StateBB;
 }
 
 bool hasUnsupportedExit(Function &F) {
@@ -215,7 +264,8 @@ bool hasEH(Function &F) {
     for (Instruction &I : BB) {
       if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
           isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-          isa<CatchSwitchInst>(&I) || isa<CleanupReturnInst>(&I))
+          isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
+          isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
         return true;
     }
   }
@@ -271,19 +321,6 @@ bool isSharedBogusGeneratedBlock(BasicBlock &BB) {
   return BB.hasName() && BB.getName().starts_with("vllvm.bcf.");
 }
 
-bool hasUnsupportedBogusFlowEH(Function &F) {
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
-          isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-          isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
-          isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
-        return true;
-    }
-  }
-  return false;
-}
-
 bool hasMustTailReturn(BasicBlock &BB) {
   auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
   if (!RI)
@@ -300,6 +337,8 @@ bool canSplitForSharedBogusFlow(BasicBlock &BB) {
       hasMustTailReturn(BB))
     return false;
 
+  // C++ EH 函数可以做 BCF，但 landingpad/resume/catchret 等 EH 专用块
+  // 不能被 fake 分支包裹；invoke 本身允许保留在 split 后的 tail 块里。
   if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term) ||
       isa<CatchSwitchInst>(Term) || isa<CatchReturnInst>(Term) ||
       isa<CleanupReturnInst>(Term) || isa<ResumeInst>(Term))
@@ -506,8 +545,7 @@ bool addSharedBogusFlow(BasicBlock &BB, SharedConstTable &ConstTable,
 
 bool applySharedBogusControlFlow(Function &F, SharedConstTable &ConstTable,
                                  CryptoUtils &Crypto) {
-  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
-      hasUnsupportedBogusFlowEH(F))
+  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
     return false;
 
   SmallVector<BasicBlock *, 32> Candidates;
@@ -542,7 +580,7 @@ bool applySharedBogusControlFlow(Function &F, SharedConstTable &ConstTable,
                                     YSeed, Crypto);
 
   if (Changed)
-    fixStack(&F);
+    fixStackForFlatten(&F);
   return Changed;
 }
 
@@ -710,25 +748,6 @@ FlattenPlan planFlatten(Function &F, FunctionAnalysisManager &FAM,
   LowerSwitchPass LowerSwitch;
   LowerSwitch.run(F, FAM);
 
-  for (BasicBlock &BB : F)
-    Plan.FlattenBBs.push_back(&BB);
-
-  if (Plan.FlattenBBs.size() <= 1)
-    return Plan;
-
-  for (Function::iterator BB = F.begin(); BB != F.end(); ++BB) {
-    if (auto *II = dyn_cast<InvokeInst>(BB->getTerminator())) {
-      auto RemoveBB = std::find(Plan.FlattenBBs.begin(), Plan.FlattenBBs.end(),
-                                II->getUnwindDest());
-      if (RemoveBB != Plan.FlattenBBs.end())
-        Plan.FlattenBBs.erase(RemoveBB);
-    }
-  }
-
-  Plan.FlattenBBs.erase(Plan.FlattenBBs.begin());
-  if (Plan.FlattenBBs.empty())
-    return Plan;
-
   BasicBlock *EntryBB = &F.getEntryBlock();
   BranchInst *EntryBr = dyn_cast<BranchInst>(EntryBB->getTerminator());
   if (EntryBB->getTerminator()->getNumSuccessors() > 1 && EntryBr &&
@@ -740,12 +759,38 @@ FlattenPlan planFlatten(Function &F, FunctionAnalysisManager &FAM,
 
     BasicBlock *TmpBB = EntryBB->splitBasicBlock(I, "first");
     Plan.FlattenBBs.insert(Plan.FlattenBBs.begin(), TmpBB);
+  } else if (isa<InvokeInst>(EntryBB->getTerminator())) {
+    // entry 自身要变成 dispatcher 初始化块；如果原入口以 invoke 结束，
+    // 先把 invoke 切到首个 case 中，unwind 边仍由 invoke 自己维护。
+    BasicBlock::iterator I = EntryBB->getTerminator()->getIterator();
+    BasicBlock *TmpBB = EntryBB->splitBasicBlock(I, "first");
+    Plan.FlattenBBs.insert(Plan.FlattenBBs.begin(), TmpBB);
   }
 
+  for (BasicBlock &BB : F) {
+    if (&BB == EntryBB || !isFlattenableBlock(BB))
+      continue;
+    if (std::find(Plan.FlattenBBs.begin(), Plan.FlattenBBs.end(), &BB) ==
+        Plan.FlattenBBs.end())
+      Plan.FlattenBBs.push_back(&BB);
+  }
+
+  if (Plan.FlattenBBs.empty())
+    return Plan;
+
   BasicBlock *InitialStateBB = Plan.FlattenBBs.front();
+  if (auto *EntryBranch = dyn_cast<BranchInst>(EntryBB->getTerminator())) {
+    if (EntryBranch->isUnconditional() &&
+        findStateIndexForBB(Plan, EntryBranch->getSuccessor(0))) {
+      InitialStateBB = EntryBranch->getSuccessor(0);
+    }
+  }
   std::default_random_engine ShuffleEngine(Crypto.getRandom32());
   std::shuffle(Plan.FlattenBBs.begin(), Plan.FlattenBBs.end(), ShuffleEngine);
-  Plan.InitialStateIndex = getStateIndexForBB(Plan, InitialStateBB);
+  std::optional<unsigned> InitialIndex = findStateIndexForBB(Plan, InitialStateBB);
+  if (!InitialIndex)
+    return FlattenPlan();
+  Plan.InitialStateIndex = *InitialIndex;
 
   std::vector<uint32_t> CaseValues;
   CaseValues.reserve(Plan.FlattenBBs.size());
@@ -823,22 +868,34 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
     Instruction *Term = BB->getTerminator();
     if (Term->getNumSuccessors() == 0)
       continue;
-    if (isa<InvokeInst>(Term))
+
+    if (auto *II = dyn_cast<InvokeInst>(Term)) {
+      BasicBlock *NormalDest = II->getNormalDest();
+      std::optional<unsigned> NormalIndex = findStateIndexForBB(Plan, NormalDest);
+      if (!NormalIndex)
+        continue;
+
+      // invoke 的 unwind 边必须保留给 EH CFG；normal 边落到跳板块，
+      // 在真正回到 dispatcher 前更新状态，invoke 返回值也能在这里被使用。
+      BasicBlock *StateBB = createFlattenStateBlock(
+          F, SwitchLoopEnd, SwitchVar, Int32Ty, *NormalIndex, SwitchLoopEntry,
+          "invoke.set.state");
+      updatePhiIncomingBlock(NormalDest, BB, StateBB);
+      II->setNormalDest(StateBB);
       continue;
+    }
+
     if (Term->getNumSuccessors() > 1 && isa<IndirectBrInst>(Term))
       continue;
 
     IRBuilder<> BBIRB(Term);
     if (Term->getNumSuccessors() == 1) {
       BasicBlock *SuccBB = Term->getSuccessor(0);
-      Value *OldStateIndex =
-          BBIRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
-      Value *StateDelta = BBIRB.CreateSub(
-          ConstantInt::get(Int32Ty, getStateIndexForBB(Plan, SuccBB)),
-          OldStateIndex, "stateDelta");
-      Value *NewStateIndex =
-          BBIRB.CreateAdd(OldStateIndex, StateDelta, "newStateIndex");
-      BBIRB.CreateStore(NewStateIndex, SwitchVar);
+      std::optional<unsigned> SuccIndex = findStateIndexForBB(Plan, SuccBB);
+      if (!SuccIndex)
+        continue;
+
+      storeFlattenState(BBIRB, SwitchVar, Int32Ty, *SuccIndex);
       BBIRB.CreateBr(SwitchLoopEntry);
       Term->eraseFromParent();
       continue;
@@ -849,11 +906,34 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
       if (!Br || !Br->isConditional())
         continue;
 
-      unsigned TrueIndex = getStateIndexForBB(Plan, Term->getSuccessor(0));
-      unsigned FalseIndex = getStateIndexForBB(Plan, Term->getSuccessor(1));
+      BasicBlock *TrueSucc = Term->getSuccessor(0);
+      BasicBlock *FalseSucc = Term->getSuccessor(1);
+      std::optional<unsigned> TrueIndex = findStateIndexForBB(Plan, TrueSucc);
+      std::optional<unsigned> FalseIndex = findStateIndexForBB(Plan, FalseSucc);
+      if (!TrueIndex && !FalseIndex)
+        continue;
+
+      if (!TrueIndex || !FalseIndex) {
+        BasicBlock *TrueTarget =
+            TrueIndex ? createFlattenStateBlock(F, SwitchLoopEnd, SwitchVar,
+                                                Int32Ty, *TrueIndex,
+                                                SwitchLoopEntry,
+                                                "branch.set.true")
+                      : TrueSucc;
+        BasicBlock *FalseTarget =
+            FalseIndex ? createFlattenStateBlock(F, SwitchLoopEnd, SwitchVar,
+                                                 Int32Ty, *FalseIndex,
+                                                 SwitchLoopEntry,
+                                                 "branch.set.false")
+                       : FalseSucc;
+        BBIRB.CreateCondBr(Br->getCondition(), TrueTarget, FalseTarget);
+        Term->eraseFromParent();
+        continue;
+      }
+
       Value *TargetStateIndex = BBIRB.CreateSelect(
-          Br->getCondition(), ConstantInt::get(Int32Ty, TrueIndex),
-          ConstantInt::get(Int32Ty, FalseIndex), "targetStateIndex");
+          Br->getCondition(), ConstantInt::get(Int32Ty, *TrueIndex),
+          ConstantInt::get(Int32Ty, *FalseIndex), "targetStateIndex");
       Value *OldStateIndex =
           BBIRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
       Value *StateDelta =
@@ -867,7 +947,7 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
     }
   }
 
-  fixStack(&F);
+  fixStackForFlatten(&F);
   LowerSwitchPass LowerSwitch;
   LowerSwitch.run(F, FAM);
   return true;

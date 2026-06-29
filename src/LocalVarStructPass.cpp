@@ -43,7 +43,8 @@ bool hasEH(Function &F) {
     for (Instruction &I : BB) {
       if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
           isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-          isa<CatchSwitchInst>(&I) || isa<CleanupReturnInst>(&I))
+          isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
+          isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
         return true;
     }
   }

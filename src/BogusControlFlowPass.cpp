@@ -23,17 +23,6 @@ bool isGeneratedBlock(BasicBlock &BB) {
   return BB.hasName() && BB.getName().starts_with("vllvm.bcf.");
 }
 
-bool hasUnsupportedEH(Function &F) {
-  for (Instruction &I : instructions(F)) {
-    if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
-        isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-        isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
-        isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
-      return true;
-  }
-  return false;
-}
-
 bool hasMustTailReturn(BasicBlock &BB) {
   auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
   if (!RI)
@@ -49,6 +38,8 @@ bool canSplitForBogusFlow(BasicBlock &BB) {
   if (!Term || isGeneratedBlock(BB) || BB.isEHPad() || hasMustTailReturn(BB))
     return false;
 
+  // C++ EH 函数可以做 BCF，但 landingpad/resume/catchret 等 EH 专用块
+  // 不能被 fake 分支包裹；invoke 本身允许保留在 split 后的 tail 块里。
   if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term) ||
       isa<CatchSwitchInst>(Term) || isa<CatchReturnInst>(Term) ||
       isa<CleanupReturnInst>(Term) || isa<ResumeInst>(Term))
@@ -86,8 +77,7 @@ PreservedAnalyses BogusControlFlowPass::run(Function &F,
 }
 
 bool BogusControlFlowPass::runBogusControlFlow(Function &F) {
-  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
-      hasUnsupportedEH(F))
+  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
     return false;
 
   CryptoUtils Crypto(F.getParent());
@@ -120,7 +110,7 @@ bool BogusControlFlowPass::runBogusControlFlow(Function &F) {
   }
 
   if (Changed)
-    fixStack(&F);
+    fixStackForFlatten(&F);
   else {
     X->eraseFromParent();
     Y->eraseFromParent();
