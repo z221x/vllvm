@@ -1,5 +1,6 @@
 #include "LocalVarStructPass.h"
 
+#include "Utils.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/Constants.h"
@@ -34,19 +35,6 @@ bool hasUnsupportedExit(Function &F) {
     auto *CB = dyn_cast_or_null<CallBase>(Prev);
     if (CB && CB->isMustTailCall())
       return true;
-  }
-  return false;
-}
-
-bool hasEH(Function &F) {
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
-          isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-          isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
-          isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
-        return true;
-    }
   }
   return false;
 }
@@ -120,10 +108,10 @@ PreservedAnalyses LocalVarStructPass::run(Function &F,
 }
 
 bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
-  // 这些场景插入 malloc/free 容易破坏 ABI 敏感控制流或异常处理语义，
-  // 因此先保守跳过。
+  // musttail/naked 这类 ABI 敏感场景仍然跳过；C++ EH 函数可以处理，
+  // 释放逻辑会覆盖 return 和 resume 等异常退出路径。
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
-      hasUnsupportedExit(F) || hasEH(F))
+      hasUnsupportedExit(F))
     return false;
 
   Module *M = F.getParent();
@@ -280,17 +268,9 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
   for (LocalSlot &Slot : Slots)
     Slot.Alloca->eraseFromParent();
 
-  SmallVector<ReturnInst *, 8> Returns;
-  for (BasicBlock &BB : F)
-    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-      Returns.push_back(RI);
-
-  // 在每条普通 return 路径前释放原始 malloc 指针；对齐后的指针可能已经
+  // 在普通返回和异常逃逸前释放原始 malloc 指针；对齐后的指针可能已经
   // 发生偏移，不能直接传给 free。
-  for (ReturnInst *RI : Returns) {
-    IRBuilder<> FreeIRB(RI);
-    FreeIRB.CreateFree(RawStructPtr);
-  }
+  insertFreeOnFunctionExits(F, RawStructPtr);
 
   return true;
 }

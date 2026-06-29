@@ -259,19 +259,6 @@ bool hasUnsupportedExit(Function &F) {
   return false;
 }
 
-bool hasEH(Function &F) {
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (isa<InvokeInst>(&I) || isa<LandingPadInst>(&I) ||
-          isa<CatchPadInst>(&I) || isa<CleanupPadInst>(&I) ||
-          isa<CatchSwitchInst>(&I) || isa<CatchReturnInst>(&I) ||
-          isa<CleanupReturnInst>(&I) || isa<ResumeInst>(&I))
-        return true;
-    }
-  }
-  return false;
-}
-
 bool isSupportedAlloca(AllocaInst &AI, const DataLayout &DL) {
   if (!AI.isStaticAlloca() || AI.isUsedWithInAlloca() || AI.isSwiftError())
     return false;
@@ -1054,7 +1041,7 @@ bool applyIndirectCalls(Function &F, const IndirectCallPlan &Plan,
 LocalVarPlan planLocalVars(Function &F, SharedConstTable &ConstTable) {
   LocalVarPlan Plan;
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
-      hasUnsupportedExit(F) || hasEH(F))
+      hasUnsupportedExit(F))
     return Plan;
 
   Module *M = F.getParent();
@@ -1198,15 +1185,7 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
   for (const LocalSlot &Slot : Plan.Slots)
     Slot.Alloca->eraseFromParent();
 
-  SmallVector<ReturnInst *, 8> Returns;
-  for (BasicBlock &BB : F)
-    if (auto *RI = dyn_cast<ReturnInst>(BB.getTerminator()))
-      Returns.push_back(RI);
-
-  for (ReturnInst *RI : Returns) {
-    IRBuilder<> FreeIRB(RI);
-    FreeIRB.CreateFree(RawStructPtr);
-  }
+  insertFreeOnFunctionExits(F, RawStructPtr);
 
   return true;
 }

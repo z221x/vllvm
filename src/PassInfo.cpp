@@ -8,6 +8,20 @@ using namespace llvm;
 
 namespace llvm::vllvm {
 namespace {
+bool needsOptimizerProtection(const VLLVMOptions &Options) {
+  return Options.FlattenFunc || Options.IndirectCall ||
+         Options.IndirectBranch || Options.LocalVarStruct ||
+         Options.BogusControlFlow;
+}
+
+void protectFromLaterOptimization(Function &F) {
+  // 控制流类混淆插在优化管线开头；如果不阻止后续 -O2，LLVM 可能把
+  // wrapper/impl 内联、再把 CFG 和局部变量结构化访问重新化简掉。
+  F.removeFnAttr(Attribute::AlwaysInline);
+  F.addFnAttr(Attribute::NoInline);
+  F.addFnAttr(Attribute::OptimizeNone);
+}
+
 class VLLVMAnnotationPass : public PassInfoMixin<VLLVMAnnotationPass> {
 public:
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
@@ -36,6 +50,9 @@ public:
     FunctionOptions.EncryptoStr = false;
     if (!FunctionOptions.any())
       return PreservedAnalyses::all();
+
+    if (needsOptimizerProtection(FunctionOptions))
+      protectFromLaterOptimization(F);
 
     PreservedAnalyses PA = PreservedAnalyses::all();
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };

@@ -10,6 +10,7 @@ bool valueEscapes(Instruction *Inst);
 void fixStack(Function *f);
 void fixStackForFlatten(Function *F);
 CallBase *fixEH(CallBase *CB);
+void insertFreeOnFunctionExits(Function &F, Value *Ptr);
 void LowerConstantExpr(Function &F);
 bool expandConstantExpr(Function &F);
 #endif

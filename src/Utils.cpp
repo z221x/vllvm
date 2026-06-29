@@ -191,6 +191,27 @@ CallBase *fixEH(CallBase *CB) {
   return NewCall;
 }
 
+void insertFreeOnFunctionExits(Function &F, Value *Ptr) {
+  SmallVector<Instruction *, 8> ExitTerms;
+  for (BasicBlock &BB : F) {
+    Instruction *Term = BB.getTerminator();
+    if (isa<ReturnInst>(Term) || isa<ResumeInst>(Term)) {
+      ExitTerms.push_back(Term);
+      continue;
+    }
+
+    auto *CRI = dyn_cast<CleanupReturnInst>(Term);
+    if (CRI && CRI->unwindsToCaller())
+      ExitTerms.push_back(Term);
+  }
+
+  for (Instruction *Term : ExitTerms) {
+    IRBuilder<> FreeIRB(Term);
+    CallInst *FreeCall = FreeIRB.CreateFree(Ptr);
+    fixEH(FreeCall);
+  }
+}
+
 void LowerConstantExpr(Function &F) {
   SmallPtrSet<Instruction *, 8> WorkList;
 
