@@ -1,4 +1,6 @@
 #include "EncryptoStrPass.h"
+#include "VLLVMAttribute.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -14,6 +16,35 @@ using namespace llvm;
 
 namespace {
 constexpr size_t KeySize = 16;
+
+bool reachesGlobalAnnotations(User *U, SmallPtrSetImpl<User *> &Visited) {
+  if (!U || !Visited.insert(U).second)
+    return false;
+  if (auto *GV = dyn_cast<GlobalVariable>(U))
+    return GV->getName() == "llvm.global.annotations";
+
+  for (User *Next : U->users())
+    if (reachesGlobalAnnotations(Next, Visited))
+      return true;
+  return false;
+}
+
+bool isGlobalAnnotationUser(User *U) {
+  SmallPtrSet<User *, 8> Visited;
+  return reachesGlobalAnnotations(U, Visited);
+}
+
+bool isMarkedStringTarget(GlobalVariable &StringGV) {
+  if (llvm::vllvm::hasVLLVMStringEncryptionAnnotation(StringGV))
+    return true;
+
+  for (User *UserFirst : StringGV.users()) {
+    auto *GV = dyn_cast<GlobalVariable>(UserFirst);
+    if (GV && llvm::vllvm::hasVLLVMStringEncryptionAnnotation(*GV))
+      return true;
+  }
+  return false;
+}
 }
 
 class EncryptoStrPass::EncryptoStr {
@@ -200,6 +231,7 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
 std::vector<EncryptoStrPass::EncryptoStr *>
 EncryptoStrPass::makeEncryptoStrPool(Module &M) {
   std::vector<EncryptoStr *> encStringPool;
+  bool EncryptAllStrings = llvm::vllvm::moduleRequestsFunctionStringEncryption(M);
   uint64_t ID = 0;
   for (GlobalVariable &globalVar : M.globals()) {
     ++ID;
@@ -212,12 +244,20 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
     if (!cda || !cda->isString())
       continue;
 
+    // 函数级 enstr 保持旧行为：扫描整个 Module。
+    // 变量级 enstr 只加密被标记的字符串变量，或被标记指针变量引用的字符串。
+    if (!EncryptAllStrings && !isMarkedStringTarget(globalVar))
+      continue;
+
     auto *encryptoStr = new EncryptoStr(ID, &globalVar, false, M);
     std::vector<EncryptoStr *> pendingDoubleStrings;
     bool supported = true;
 
     // 第一层调用
     for (User *userFirst : globalVar.users()) {
+      if (isGlobalAnnotationUser(userFirst))
+        continue;
+
       if (isa<Instruction>(userFirst)) {
         encryptoStr->callUser.push_back(userFirst);
         continue;
@@ -232,6 +272,9 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
 
       auto *encryptoStrDouble = new EncryptoStr(ID, global, true, M);
       for (User *userSecond : global->users()) {
+        if (isGlobalAnnotationUser(userSecond))
+          continue;
+
         if (isa<Instruction>(userSecond)) {
           encryptoStrDouble->callUser.push_back(userSecond);
           continue;

@@ -6,6 +6,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instruction.h"
+#include "llvm/IR/Metadata.h"
 
 using namespace llvm;
 
@@ -13,6 +14,7 @@ namespace llvm::vllvm {
 namespace {
 constexpr StringRef AttrPrefix = "vllvm.";
 constexpr StringRef ObfuscateAttr = "vllvm.obfuscate";
+constexpr StringRef EnstrGlobalMetadata = "vllvm.enstr";
 
 StringRef normalizeKind(StringRef Kind) {
   Kind = Kind.trim();
@@ -116,6 +118,19 @@ Function *getAnnotatedFunction(Constant *C) {
   return nullptr;
 }
 
+GlobalVariable *getAnnotatedGlobal(Constant *C) {
+  if (!C)
+    return nullptr;
+  C = C->stripPointerCasts();
+  if (auto *GV = dyn_cast<GlobalVariable>(C))
+    return GV;
+  if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+    if (CE->getOpcode() == Instruction::GetElementPtr)
+      return getAnnotatedGlobal(dyn_cast<Constant>(CE->getOperand(0)));
+  }
+  return nullptr;
+}
+
 bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   bool Changed = false;
   auto AddAttr = [&](StringRef Kind, bool Enabled) {
@@ -138,22 +153,37 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   return Changed;
 }
 
+bool addOptionsAsMetadata(GlobalVariable &GV, const VLLVMOptions &Options) {
+  if (!Options.EncryptoStr || GV.getMetadata(EnstrGlobalMetadata))
+    return false;
+
+  // 变量级 enstr 不能写成 Function attribute；用 metadata 留给字符串
+  // 加密 Module Pass 做目标筛选。
+  GV.setMetadata(EnstrGlobalMetadata, MDNode::get(GV.getContext(), {}));
+  return true;
+}
+
 bool parseAnnotationEntry(Constant *Entry) {
   auto *CS = dyn_cast<ConstantStruct>(Entry);
   if (!CS || CS->getNumOperands() < 2)
     return false;
 
-  Function *F = getAnnotatedFunction(dyn_cast<Constant>(CS->getOperand(0)));
+  auto *Target = dyn_cast<Constant>(CS->getOperand(0));
   GlobalVariable *TextGV =
       getStringGlobal(dyn_cast<Constant>(CS->getOperand(1)));
   StringRef Text = getGlobalString(TextGV);
-  if (!F || Text.empty())
+  if (!Target || Text.empty())
     return false;
 
   VLLVMOptions Options = parseOptionList(Text);
   if (!Options.any())
     return false;
-  return addOptionsAsAttributes(*F, Options);
+
+  if (Function *F = getAnnotatedFunction(Target))
+    return addOptionsAsAttributes(*F, Options);
+  if (GlobalVariable *GV = getAnnotatedGlobal(Target))
+    return addOptionsAsMetadata(*GV, Options);
+  return false;
 }
 } // namespace
 
@@ -212,9 +242,23 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   return Options;
 }
 
-bool moduleRequestsStringEncryption(Module &M) {
+bool moduleRequestsFunctionStringEncryption(Module &M) {
   for (Function &F : M)
     if (hasVLLVMAttribute(F, "enstr"))
+      return true;
+  return false;
+}
+
+bool hasVLLVMStringEncryptionAnnotation(GlobalVariable &GV) {
+  return GV.getMetadata(EnstrGlobalMetadata) != nullptr;
+}
+
+bool moduleRequestsStringEncryption(Module &M) {
+  if (moduleRequestsFunctionStringEncryption(M))
+    return true;
+
+  for (GlobalVariable &GV : M.globals())
+    if (hasVLLVMStringEncryptionAnnotation(GV))
       return true;
   return false;
 }
