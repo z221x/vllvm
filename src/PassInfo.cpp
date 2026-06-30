@@ -74,12 +74,12 @@ public:
         FunctionOptions.BogusControlFlow = false;
       }
 
-      if (FunctionOptions.FlattenFunc)
-        RunPass(FlattenFuncPass());
       if (FunctionOptions.IndirectCall)
         RunPass(IndirectCallPass());
       if (FunctionOptions.LocalVarStruct)
         RunPass(LocalVarStructPass());
+      if (FunctionOptions.FlattenFunc)
+        RunPass(FlattenFuncPass());
     }
 
     if (FunctionOptions.IndirectBranch)

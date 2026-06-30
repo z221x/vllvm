@@ -39,10 +39,13 @@ int protected_bogus_flow(int x) {
 异常处理、`musttail`、`callbr`、`indirectbr` 等 ABI 或 CFG 敏感场景。
 
 当同一个函数同时标记 `fla`、`icall`、`lvars` 时，会自动使用组合 Pass：
-平坦化 case 值、间接调用加密下标、局部变量结构体偏移共用同一张
-四字节 `i32` 的 `vllvm.combined.const.table.*`。如果同时启用 `bcf`，虚假控制流
-的不透明谓词种子和 junk 常量也会先写入这张表，再把混淆后的函数体搬进
-`*.vllvm.impl`。间接调用的函数地址仍保留在独立 `func_table*` 指针表中。
+平坦化 case 值、间接调用加密下标和 key、局部变量结构体偏移和 key 共用同一张
+四字节 `i32` 的 `vllvm.combined.const.table.*`。flatten 运行时状态保存的是当前
+case 值在这张表里的下标，icall/lvars 的 key 读取也会基于这个变化的下标派生。
+组合 Pass 的实际改写顺序是 `icall` -> `lvars` -> `fla`。
+如果同时启用 `bcf`，虚假控制流的不透明谓词种子和 junk 常量也会先写入这张表，
+再把混淆后的函数体搬进 `*.vllvm.impl`。间接调用的函数地址仍保留在独立
+`func_table*` 指针表中。
 
 `enstr` 对应字符串加密，它是 Module Pass；在函数 attribute 中出现时会启用当前
 编译模块的字符串加密，而不是只加密该函数内的字符串。

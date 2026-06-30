@@ -108,6 +108,7 @@ run_case() {
     grep -q "func_table" "$ll"
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     grep -q "store volatile i32 .*ptr %.*" "$ll"
+    grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
     if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
       echo "mixed bcf constants must use the combined integer constant table" >&2
       exit 1
@@ -149,8 +150,8 @@ run_case() {
       echo "ollvm must use one combined integer constant table" >&2
       exit 1
     fi
-    if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" "$ll"; then
-      echo "ollvm local variable table must keep keys out of global data" >&2
+    if grep -Eq "vllvm\\.local\\.(enc_index|field_index|offset_key\\.ptr)" "$ll"; then
+      echo "ollvm local variable table used an old decrypt sequence" >&2
       exit 1
     fi
     grep -q "load volatile" "$ll"
@@ -160,19 +161,7 @@ run_case() {
       echo "ollvm local variable table must load encrypted offsets" >&2
       exit 1
     fi
-    grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$ll"
-    local unique_offset_keys_in_code
-    unique_offset_keys_in_code=$(
-      grep -oE "xor i32 %[0-9]+, [-0-9]+" "$ll" |
-        sed -E "s/.*xor i32 %[0-9]+, ([-0-9]+).*/\\1/" |
-        sort -u |
-        wc -l |
-        tr -d " "
-    )
-    if [ "$unique_offset_keys_in_code" -lt 2 ]; then
-      echo "ollvm local variable table must use per-slot local offset keys" >&2
-      exit 1
-    fi
+    grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
     ;;
   esac
 }

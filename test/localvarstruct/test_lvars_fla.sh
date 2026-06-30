@@ -61,25 +61,13 @@ if [ "$VOLATILE_LOADS" -lt 1 ]; then
   echo "expected volatile loads for encrypted offsets" >&2
   exit 1
 fi
-grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"
-UNIQUE_OFFSET_KEYS_IN_CODE=$(
-  grep -oE "xor i32 %[0-9]+, [-0-9]+" \
-    "$OUT_DIR/test_lvars.ll" |
-    sed -E "s/.*xor i32 %[0-9]+, ([-0-9]+).*/\\1/" |
-    sort -u |
-    wc -l |
-    tr -d " "
-)
-if [ "$UNIQUE_OFFSET_KEYS_IN_CODE" -lt 2 ]; then
-  echo "expected per-slot random offset xor keys in local code" >&2
+grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$OUT_DIR/test_lvars.ll"
+if grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"; then
+  echo "combined mode keys must be loaded from the shared table" >&2
   exit 1
 fi
 grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
 grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
-if grep -q "alloca" "$OUT_DIR/test_lvars.ll"; then
-  echo "unexpected alloca left in transformed IR" >&2
-  exit 1
-fi
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"

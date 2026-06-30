@@ -136,6 +136,8 @@ struct FlattenPlan {
   SmallVector<unsigned, 32> CaseConstIndexes;
   unsigned FirstCaseConstIndex = 0;
   unsigned InitialStateIndex = 0;
+  AllocaInst *RuntimeIndexAlloca = nullptr;
+  Value *RuntimeIndexPtr = nullptr;
 };
 
 struct IndirectCallPlan {
@@ -143,15 +145,15 @@ struct IndirectCallPlan {
   std::vector<Function *> Callees;
   DenseMap<Function *, unsigned> CalleeNums;
   std::vector<CallInst *> CallSites;
-  DenseMap<CallInst *, uint32_t> CallSiteIndexKeys;
   DenseMap<CallInst *, unsigned> CallSiteConstIndexes;
+  DenseMap<CallInst *, unsigned> CallSiteKeyConstIndexes;
 };
 
 struct LocalSlot {
   AllocaInst *Alloca = nullptr;
   unsigned FieldIndex = 0;
   unsigned ConstIndex = 0;
-  uint32_t OffsetKey = 0;
+  unsigned KeyConstIndex = 0;
 };
 
 struct LocalVarPlan {
@@ -197,6 +199,73 @@ std::optional<unsigned> findStateIndexForBB(const FlattenPlan &Plan,
   return std::nullopt;
 }
 
+std::optional<unsigned> findCaseConstIndexForBB(const FlattenPlan &Plan,
+                                                BasicBlock *TargetBB) {
+  std::optional<unsigned> StateIndex = findStateIndexForBB(Plan, TargetBB);
+  if (!StateIndex)
+    return std::nullopt;
+  return Plan.CaseConstIndexes[*StateIndex];
+}
+
+LoadInst *loadFlattenRuntimeIndex(IRBuilder<> &IRB, Value *RuntimeIndexPtr,
+                                  Type *Int32Ty, const Twine &Name) {
+  LoadInst *Loaded = IRB.CreateLoad(Int32Ty, RuntimeIndexPtr, Name);
+  Loaded->setVolatile(true);
+  return Loaded;
+}
+
+StoreInst *storeFlattenRuntimeIndex(IRBuilder<> &IRB,
+                                    Value *RuntimeIndexPtr, Value *Index) {
+  StoreInst *Store = IRB.CreateStore(Index, RuntimeIndexPtr);
+  Store->setVolatile(true);
+  return Store;
+}
+
+Value *moveFromCurrentTableIndex(IRBuilder<> &IRB, Value *CurrentIndex,
+                                 Type *Int32Ty, unsigned CurrentConstIndex,
+                                 unsigned TargetConstIndex,
+                                 const Twine &Name) {
+  if (CurrentConstIndex == TargetConstIndex)
+    return CurrentIndex;
+
+  if (TargetConstIndex > CurrentConstIndex) {
+    return IRB.CreateAdd(
+        CurrentIndex,
+        ConstantInt::get(Int32Ty, TargetConstIndex - CurrentConstIndex), Name);
+  }
+
+  return IRB.CreateSub(
+      CurrentIndex,
+      ConstantInt::get(Int32Ty, CurrentConstIndex - TargetConstIndex), Name);
+}
+
+// icall/lvars 的常量项不直接用固定下标取；优先从当前 flatten case
+// 的表下标加减偏移得到目标下标，让运行时只围绕这一个 index 变化。
+Value *loadConstViaFlattenIndex(IRBuilder<> &IRB, SharedConstTable &ConstTable,
+                                const FlattenPlan *Plan,
+                                unsigned TargetConstIndex,
+                                const Twine &Name) {
+  if (!Plan || !Plan->Enabled || !Plan->RuntimeIndexPtr)
+    return ConstTable.load(IRB, TargetConstIndex, Name);
+
+  BasicBlock *BB = IRB.GetInsertBlock();
+  std::optional<unsigned> AnchorConstIndex =
+      findCaseConstIndexForBB(*Plan, BB);
+  if (!AnchorConstIndex && BB == &BB->getParent()->getEntryBlock())
+    AnchorConstIndex = Plan->CaseConstIndexes[Plan->InitialStateIndex];
+  if (!AnchorConstIndex)
+    return ConstTable.load(IRB, TargetConstIndex, Name);
+
+  Type *Int32Ty = Type::getInt32Ty(BB->getContext());
+  Value *CurrentIndex =
+      loadFlattenRuntimeIndex(IRB, Plan->RuntimeIndexPtr, Int32Ty,
+                              Name + ".runtime_index");
+  Value *TableIndex = moveFromCurrentTableIndex(
+      IRB, CurrentIndex, Int32Ty, *AnchorConstIndex, TargetConstIndex,
+      Name + ".table_index");
+  return ConstTable.load(IRB, TableIndex, Name);
+}
+
 bool isFlattenableBlock(BasicBlock &BB) {
   Instruction *Term = BB.getTerminator();
   if (!Term || BB.isEHPad())
@@ -221,28 +290,71 @@ void updatePhiIncomingBlock(BasicBlock *SuccBB, BasicBlock *OldPred,
   }
 }
 
-void storeFlattenState(IRBuilder<> &IRB, AllocaInst *SwitchVar,
-                       Type *Int32Ty, unsigned TargetIndex) {
-  Value *OldStateIndex = IRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
-  Value *StateDelta =
-      IRB.CreateSub(ConstantInt::get(Int32Ty, TargetIndex), OldStateIndex,
-                    "stateDelta");
+uint32_t makeTableIndexDelta(unsigned CurrentTableIndex,
+                             unsigned TargetTableIndex) {
+  return static_cast<uint32_t>(TargetTableIndex) -
+         static_cast<uint32_t>(CurrentTableIndex);
+}
+
+void addFlattenStateDelta(IRBuilder<> &IRB, Value *SwitchVar,
+                          Type *Int32Ty, Value *StateDelta) {
+  Value *OldStateIndex =
+      loadFlattenRuntimeIndex(IRB, SwitchVar, Int32Ty, "oldTableIndex");
   Value *NewStateIndex =
-      IRB.CreateAdd(OldStateIndex, StateDelta, "newStateIndex");
-  IRB.CreateStore(NewStateIndex, SwitchVar);
+      IRB.CreateAdd(OldStateIndex, StateDelta, "newTableIndex");
+  storeFlattenRuntimeIndex(IRB, SwitchVar, NewStateIndex);
+}
+
+void addFlattenStateDelta(IRBuilder<> &IRB, Value *SwitchVar,
+                          Type *Int32Ty, unsigned CurrentTableIndex,
+                          unsigned TargetTableIndex) {
+  Value *StateDelta = ConstantInt::get(
+      Int32Ty, makeTableIndexDelta(CurrentTableIndex, TargetTableIndex));
+  addFlattenStateDelta(IRB, SwitchVar, Int32Ty, StateDelta);
 }
 
 BasicBlock *createFlattenStateBlock(Function &F, BasicBlock *InsertBefore,
-                                    AllocaInst *SwitchVar, Type *Int32Ty,
-                                    unsigned TargetIndex,
+                                    Value *SwitchVar, Type *Int32Ty,
+                                    unsigned CurrentTableIndex,
+                                    unsigned TargetTableIndex,
                                     BasicBlock *SwitchLoopEntry,
                                     const Twine &Name) {
   BasicBlock *StateBB =
       BasicBlock::Create(F.getContext(), Name, &F, InsertBefore);
   IRBuilder<> IRB(StateBB);
-  storeFlattenState(IRB, SwitchVar, Int32Ty, TargetIndex);
+  addFlattenStateDelta(IRB, SwitchVar, Int32Ty, CurrentTableIndex,
+                       TargetTableIndex);
   IRB.CreateBr(SwitchLoopEntry);
   return StateBB;
+}
+
+Instruction *getRuntimeIndexInitPoint(Function &F, FlattenPlan &Plan) {
+  if (auto *I = dyn_cast_or_null<Instruction>(Plan.RuntimeIndexPtr)) {
+    if (I->getFunction() == &F && I->getNextNode())
+      return I->getNextNode();
+  }
+
+  return &*F.getEntryBlock().getFirstInsertionPt();
+}
+
+Value *ensureFlattenRuntimeIndex(Function &F, FlattenPlan &Plan,
+                                 Type *Int32Ty) {
+  if (!Plan.Enabled)
+    return nullptr;
+
+  if (!Plan.RuntimeIndexPtr) {
+    Instruction *InsertPt = &*F.getEntryBlock().getFirstInsertionPt();
+    IRBuilder<> IRB(InsertPt);
+    AllocaInst *SwitchVar = IRB.CreateAlloca(Int32Ty, 0, "switchVar");
+    Plan.RuntimeIndexAlloca = SwitchVar;
+    Plan.RuntimeIndexPtr = SwitchVar;
+  }
+
+  IRBuilder<> IRB(getRuntimeIndexInitPoint(F, Plan));
+  storeFlattenRuntimeIndex(
+      IRB, Plan.RuntimeIndexPtr,
+      ConstantInt::get(Int32Ty, Plan.CaseConstIndexes[Plan.InitialStateIndex]));
+  return Plan.RuntimeIndexPtr;
 }
 
 bool hasUnsupportedExit(Function &F) {
@@ -590,7 +702,7 @@ unsigned chooseDispatchSplit(unsigned Begin, unsigned End, CryptoUtils &Crypto) 
 
 // 将 flatten 的线性 case 链改成随机切分的二叉路由树，避免 CFG 被排成规则阶梯。
 BasicBlock *buildDispatchTree(Function &F, BasicBlock *InsertBefore,
-                              Value *StateIndex, Value *CaseValue,
+                              Value *StateTableIndex, Value *CaseValue,
                               Type *Int32Ty, const FlattenPlan &Plan,
                               SharedConstTable &ConstTable, unsigned Begin,
                               unsigned End, BasicBlock *DefaultBB,
@@ -609,18 +721,20 @@ BasicBlock *buildDispatchTree(Function &F, BasicBlock *InsertBefore,
   }
 
   unsigned Split = chooseDispatchSplit(Begin, End, Crypto);
-  BasicBlock *Left = buildDispatchTree(F, InsertBefore, StateIndex, CaseValue,
-                                       Int32Ty, Plan, ConstTable, Begin, Split,
-                                       DefaultBB, Crypto);
-  BasicBlock *Right = buildDispatchTree(F, InsertBefore, StateIndex, CaseValue,
-                                        Int32Ty, Plan, ConstTable, Split, End,
-                                        DefaultBB, Crypto);
-  Value *Threshold = ConstantInt::get(Int32Ty, Split);
+  BasicBlock *Left = buildDispatchTree(F, InsertBefore, StateTableIndex,
+                                       CaseValue, Int32Ty, Plan, ConstTable,
+                                       Begin, Split, DefaultBB, Crypto);
+  BasicBlock *Right = buildDispatchTree(F, InsertBefore, StateTableIndex,
+                                        CaseValue, Int32Ty, Plan, ConstTable,
+                                        Split, End, DefaultBB, Crypto);
+  Value *Threshold = ConstantInt::get(Int32Ty, Plan.CaseConstIndexes[Split]);
   if (Crypto.getRandom32() & 1) {
-    Value *GoLeft = IRB.CreateICmpULT(StateIndex, Threshold, "dispatch.left");
+    Value *GoLeft =
+        IRB.CreateICmpULT(StateTableIndex, Threshold, "dispatch.left");
     IRB.CreateCondBr(GoLeft, Left, Right);
   } else {
-    Value *GoRight = IRB.CreateICmpUGE(StateIndex, Threshold, "dispatch.right");
+    Value *GoRight =
+        IRB.CreateICmpUGE(StateTableIndex, Threshold, "dispatch.right");
     IRB.CreateCondBr(GoRight, Right, Left);
   }
   return Node;
@@ -774,7 +888,8 @@ FlattenPlan planFlatten(Function &F, FunctionAnalysisManager &FAM,
   }
   std::default_random_engine ShuffleEngine(Crypto.getRandom32());
   std::shuffle(Plan.FlattenBBs.begin(), Plan.FlattenBBs.end(), ShuffleEngine);
-  std::optional<unsigned> InitialIndex = findStateIndexForBB(Plan, InitialStateBB);
+  std::optional<unsigned> InitialIndex =
+      findStateIndexForBB(Plan, InitialStateBB);
   if (!InitialIndex)
     return FlattenPlan();
   Plan.InitialStateIndex = *InitialIndex;
@@ -798,7 +913,7 @@ FlattenPlan planFlatten(Function &F, FunctionAnalysisManager &FAM,
 }
 
 bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
-                  const FlattenPlan &Plan, SharedConstTable &ConstTable,
+                  FlattenPlan &Plan, SharedConstTable &ConstTable,
                   CryptoUtils &Crypto) {
   if (!Plan.Enabled)
     return false;
@@ -807,10 +922,7 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
   Type *Int32Ty = Type::getInt32Ty(Ctx);
   BasicBlock *EntryBB = &F.getEntryBlock();
 
-  IRBuilder<> IRB(EntryBB);
-  EntryBB->getTerminator()->eraseFromParent();
-  AllocaInst *SwitchVar = IRB.CreateAlloca(Int32Ty, 0, "switchVar");
-  IRB.CreateStore(ConstantInt::get(Int32Ty, Plan.InitialStateIndex), SwitchVar);
+  Value *SwitchVar = ensureFlattenRuntimeIndex(F, Plan, Int32Ty);
 
   BasicBlock *SwitchLoopEntry =
       BasicBlock::Create(Ctx, "switchLoopEntry", &F, EntryBB);
@@ -819,6 +931,7 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
   BasicBlock *SwitchLoopEnd =
       BasicBlock::Create(Ctx, "switchLoopEnd", &F, EntryBB);
 
+  EntryBB->getTerminator()->eraseFromParent();
   EntryBB->moveBefore(SwitchLoopEntry);
   BranchInst::Create(SwitchLoopEntry, EntryBB);
   BranchInst::Create(SwitchLoopEntry, SwitchLoopEnd);
@@ -826,32 +939,32 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
       BasicBlock::Create(Ctx, "switchDefault", &F, SwitchLoopEnd);
   BranchInst::Create(SwitchLoopEnd, SwDefault);
 
+  IRBuilder<> IRB(Ctx);
   IRB.SetInsertPoint(SwitchLoopEntry);
-  Value *StateIndex = IRB.CreateLoad(Int32Ty, SwitchVar, "loadSwitchIndex");
+  Value *StateTableIndex =
+      loadFlattenRuntimeIndex(IRB, SwitchVar, Int32Ty, "loadSwitchIndex");
+  Value *StateOrdinal = IRB.CreateSub(
+      StateTableIndex, ConstantInt::get(Int32Ty, Plan.FirstCaseConstIndex),
+      "switchOrdinal");
   Value *IsValidIndex = IRB.CreateICmpULT(
-      StateIndex, ConstantInt::get(Int32Ty, Plan.FlattenBBs.size()),
+      StateOrdinal, ConstantInt::get(Int32Ty, Plan.FlattenBBs.size()),
       "switchIndexInRange");
   IRB.CreateCondBr(IsValidIndex, SwitchDispatchEntry, SwDefault);
 
   IRB.SetInsertPoint(SwitchDispatchEntry);
-  Value *CaseTableIndex = StateIndex;
-  if (Plan.FirstCaseConstIndex != 0) {
-    CaseTableIndex = IRB.CreateAdd(
-        StateIndex, ConstantInt::get(Int32Ty, Plan.FirstCaseConstIndex),
-        "caseTableIndex");
-  }
-  Value *CaseValue = ConstTable.load(IRB, CaseTableIndex, "loadCaseValue");
+  Value *CaseValue = ConstTable.load(IRB, StateTableIndex, "loadCaseValue");
   // 从 dispatcher 进入随机路由树，而不是顺序扫描每一个 case。
-  BasicBlock *DispatchRoot =
-      buildDispatchTree(F, SwDefault, StateIndex, CaseValue, Int32Ty, Plan,
-                        ConstTable, 0, Plan.FlattenBBs.size(), SwDefault,
-                        Crypto);
+  BasicBlock *DispatchRoot = buildDispatchTree(
+      F, SwDefault, StateTableIndex, CaseValue, Int32Ty, Plan, ConstTable, 0,
+      Plan.FlattenBBs.size(), SwDefault, Crypto);
   IRB.CreateBr(DispatchRoot);
 
   for (BasicBlock *BB : Plan.FlattenBBs)
     BB->moveBefore(SwitchLoopEnd);
 
-  for (BasicBlock *BB : Plan.FlattenBBs) {
+  for (unsigned BBNo = 0; BBNo < Plan.FlattenBBs.size(); ++BBNo) {
+    BasicBlock *BB = Plan.FlattenBBs[BBNo];
+    unsigned CurrentTableIndex = Plan.CaseConstIndexes[BBNo];
     Instruction *Term = BB->getTerminator();
     if (Term->getNumSuccessors() == 0)
       continue;
@@ -865,7 +978,9 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
       // invoke 的 unwind 边必须保留给 EH CFG；normal 边落到跳板块，
       // 在真正回到 dispatcher 前更新状态，invoke 返回值也能在这里被使用。
       BasicBlock *StateBB = createFlattenStateBlock(
-          F, SwitchLoopEnd, SwitchVar, Int32Ty, *NormalIndex, SwitchLoopEntry,
+          F, SwitchLoopEnd, SwitchVar, Int32Ty,
+          CurrentTableIndex,
+          Plan.CaseConstIndexes[*NormalIndex], SwitchLoopEntry,
           "invoke.set.state");
       updatePhiIncomingBlock(NormalDest, BB, StateBB);
       II->setNormalDest(StateBB);
@@ -882,7 +997,8 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
       if (!SuccIndex)
         continue;
 
-      storeFlattenState(BBIRB, SwitchVar, Int32Ty, *SuccIndex);
+      addFlattenStateDelta(BBIRB, SwitchVar, Int32Ty, CurrentTableIndex,
+                           Plan.CaseConstIndexes[*SuccIndex]);
       BBIRB.CreateBr(SwitchLoopEntry);
       Term->eraseFromParent();
       continue;
@@ -901,15 +1017,20 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
         continue;
 
       if (!TrueIndex || !FalseIndex) {
+        unsigned TrueTableIndex =
+            TrueIndex ? Plan.CaseConstIndexes[*TrueIndex] : 0;
+        unsigned FalseTableIndex =
+            FalseIndex ? Plan.CaseConstIndexes[*FalseIndex] : 0;
         BasicBlock *TrueTarget =
             TrueIndex ? createFlattenStateBlock(F, SwitchLoopEnd, SwitchVar,
-                                                Int32Ty, *TrueIndex,
-                                                SwitchLoopEntry,
+                                                Int32Ty, CurrentTableIndex,
+                                                TrueTableIndex, SwitchLoopEntry,
                                                 "branch.set.true")
                       : TrueSucc;
         BasicBlock *FalseTarget =
             FalseIndex ? createFlattenStateBlock(F, SwitchLoopEnd, SwitchVar,
-                                                 Int32Ty, *FalseIndex,
+                                                 Int32Ty, CurrentTableIndex,
+                                                 FalseTableIndex,
                                                  SwitchLoopEntry,
                                                  "branch.set.false")
                        : FalseSucc;
@@ -918,16 +1039,18 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
         continue;
       }
 
-      Value *TargetStateIndex = BBIRB.CreateSelect(
-          Br->getCondition(), ConstantInt::get(Int32Ty, *TrueIndex),
-          ConstantInt::get(Int32Ty, *FalseIndex), "targetStateIndex");
-      Value *OldStateIndex =
-          BBIRB.CreateLoad(Int32Ty, SwitchVar, "oldStateIndex");
-      Value *StateDelta =
-          BBIRB.CreateSub(TargetStateIndex, OldStateIndex, "stateDelta");
-      Value *NewStateIndex =
-          BBIRB.CreateAdd(OldStateIndex, StateDelta, "newStateIndex");
-      BBIRB.CreateStore(NewStateIndex, SwitchVar);
+      Value *StateDelta = BBIRB.CreateSelect(
+          Br->getCondition(),
+          ConstantInt::get(
+              Int32Ty,
+              makeTableIndexDelta(CurrentTableIndex,
+                                  Plan.CaseConstIndexes[*TrueIndex])),
+          ConstantInt::get(
+              Int32Ty,
+              makeTableIndexDelta(CurrentTableIndex,
+                                  Plan.CaseConstIndexes[*FalseIndex])),
+          "stateDelta");
+      addFlattenStateDelta(BBIRB, SwitchVar, Int32Ty, StateDelta);
       BBIRB.CreateBr(SwitchLoopEntry);
       Term->eraseFromParent();
       continue;
@@ -979,8 +1102,8 @@ IndirectCallPlan planIndirectCalls(Function &F, CryptoUtils &Crypto,
     uint32_t Key = makeNonZeroKey(Crypto, I);
     uint32_t EncryptedIndex =
         static_cast<uint32_t>(Plan.CalleeNums[Callee]) ^ Key;
-    Plan.CallSiteIndexKeys[CallSite] = Key;
     Plan.CallSiteConstIndexes[CallSite] = ConstTable.add(EncryptedIndex);
+    Plan.CallSiteKeyConstIndexes[CallSite] = ConstTable.add(Key);
   }
 
   Plan.Enabled = true;
@@ -1007,7 +1130,8 @@ GlobalVariable *createFuncTable(Function &F, const IndirectCallPlan &Plan) {
 }
 
 bool applyIndirectCalls(Function &F, const IndirectCallPlan &Plan,
-                        SharedConstTable &ConstTable) {
+                        SharedConstTable &ConstTable,
+                        const FlattenPlan *FPlan) {
   if (!Plan.Enabled)
     return false;
 
@@ -1016,17 +1140,18 @@ bool applyIndirectCalls(Function &F, const IndirectCallPlan &Plan,
     return false;
 
   LLVMContext &Ctx = F.getContext();
-  Type *Int32Ty = Type::getInt32Ty(Ctx);
   auto *FuncTableTy = cast<ArrayType>(FuncTableGV->getValueType());
 
   for (CallInst *Call : Plan.CallSites) {
     IRBuilder<> IRB(Call);
-    Value *EncryptedIndex = ConstTable.load(
-        IRB, Plan.CallSiteConstIndexes.lookup(Call), "vllvm.icall.enc_index");
-    Value *Index = IRB.CreateXor(
-        EncryptedIndex,
-        ConstantInt::get(Int32Ty, Plan.CallSiteIndexKeys.lookup(Call)),
-        "vllvm.icall.index");
+    Value *EncryptedIndex = loadConstViaFlattenIndex(
+        IRB, ConstTable, FPlan, Plan.CallSiteConstIndexes.lookup(Call),
+        "vllvm.icall.enc_index");
+    Value *IndexKey = loadConstViaFlattenIndex(
+        IRB, ConstTable, FPlan, Plan.CallSiteKeyConstIndexes.lookup(Call),
+        "vllvm.icall.index_key");
+    Value *Index =
+        IRB.CreateXor(EncryptedIndex, IndexKey, "vllvm.icall.index");
     Value *FuncPtr = IRB.CreateInBoundsGEP(
         FuncTableTy, FuncTableGV,
         {ConstantInt::get(Type::getInt32Ty(Ctx), 0), Index});
@@ -1109,8 +1234,8 @@ LocalVarPlan planLocalVars(Function &F, SharedConstTable &ConstTable) {
         static_cast<uint32_t>(Layout->getElementOffset(Slot.FieldIndex)) ^
         OffsetKey;
 
-    Slot.OffsetKey = OffsetKey;
     Slot.ConstIndex = ConstTable.add(EncryptedOffset);
+    Slot.KeyConstIndex = ConstTable.add(OffsetKey);
   }
 
   Plan.Enabled = true;
@@ -1118,7 +1243,8 @@ LocalVarPlan planLocalVars(Function &F, SharedConstTable &ConstTable) {
 }
 
 bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
-                    SharedConstTable &ConstTable) {
+                    SharedConstTable &ConstTable,
+                    FlattenPlan *FPlan = nullptr) {
   if (!Plan.Enabled)
     return false;
 
@@ -1155,6 +1281,23 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
                                         "vllvm.locals");
   }
 
+  // runtime index 是其他表访问的根。它本身搬进结构体时用直接 GEP 定位，
+  // 避免“先读取 index 才能算出 index 地址”的自引用。
+  const LocalSlot *RuntimeIndexSlot = nullptr;
+  if (FPlan && FPlan->RuntimeIndexAlloca) {
+    for (const LocalSlot &Slot : Plan.Slots) {
+      if (Slot.Alloca == FPlan->RuntimeIndexAlloca) {
+        RuntimeIndexSlot = &Slot;
+        break;
+      }
+    }
+  }
+  if (RuntimeIndexSlot) {
+    FPlan->RuntimeIndexPtr = FirstIRB.CreateStructGEP(
+        Plan.StructTy, StructPtr, RuntimeIndexSlot->FieldIndex,
+        "vllvm.switch.index.slot");
+  }
+
   for (unsigned SlotNo = 0; SlotNo < Plan.Slots.size(); ++SlotNo) {
     const LocalSlot &Slot = Plan.Slots[SlotNo];
     std::string SlotName = Slot.Alloca->hasName()
@@ -1166,14 +1309,22 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
       Uses.push_back(&U);
 
     for (Use *U : Uses) {
+      if (FPlan && Slot.Alloca == FPlan->RuntimeIndexAlloca &&
+          FPlan->RuntimeIndexPtr) {
+        U->set(FPlan->RuntimeIndexPtr);
+        continue;
+      }
+
       Instruction *InsertPt = getInsertionPointForUse(*U);
       IRBuilder<> UseIRB(InsertPt);
-      Value *EncryptedOffset =
-          ConstTable.load(UseIRB, Slot.ConstIndex, "vllvm.local.enc_offset");
-      Value *Offset32 = UseIRB.CreateXor(
-          EncryptedOffset,
-          ConstantInt::get(Type::getInt32Ty(Ctx), Slot.OffsetKey),
-          "vllvm.local.offset32");
+      Value *EncryptedOffset = loadConstViaFlattenIndex(
+          UseIRB, ConstTable, FPlan, Slot.ConstIndex,
+          "vllvm.local.enc_offset");
+      Value *OffsetKey = loadConstViaFlattenIndex(
+          UseIRB, ConstTable, FPlan, Slot.KeyConstIndex,
+          "vllvm.local.offset_key");
+      Value *Offset32 =
+          UseIRB.CreateXor(EncryptedOffset, OffsetKey, "vllvm.local.offset32");
       Value *Offset =
           UseIRB.CreateZExtOrBitCast(Offset32, IntPtrTy, "vllvm.local.offset");
       Value *SlotPtr =
@@ -1254,14 +1405,20 @@ bool FunctionObfuscationPass::runCombined(Function &F,
   Changed = true;
 
   if (FPlan.Enabled)
-    Changed |= applyFlatten(*Impl, FAM, FPlan, ConstTable, Crypto);
+    ensureFlattenRuntimeIndex(*Impl, FPlan,
+                              Type::getInt32Ty(Impl->getContext()));
 
   if (IPlan.Enabled)
-    Changed |= applyIndirectCalls(*Impl, IPlan, ConstTable);
+    Changed |= applyIndirectCalls(*Impl, IPlan, ConstTable,
+                                  FPlan.Enabled ? &FPlan : nullptr);
 
   LocalVarPlan LPlan = planLocalVars(*Impl, ConstTable);
   if (LPlan.Enabled)
-    Changed |= applyLocalVars(*Impl, LPlan, ConstTable);
+    Changed |= applyLocalVars(*Impl, LPlan, ConstTable,
+                              FPlan.Enabled ? &FPlan : nullptr);
+
+  if (FPlan.Enabled)
+    Changed |= applyFlatten(*Impl, FAM, FPlan, ConstTable, Crypto);
 
   if (RunBogusControlFlow) {
     // 第二轮 BCF 作用在最终 impl 上，用来打散 flatten 后重新形成的模板骨架。
