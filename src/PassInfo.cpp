@@ -9,9 +9,9 @@ using namespace llvm;
 namespace llvm::vllvm {
 namespace {
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
-  return Options.FlattenFunc || Options.IndirectCall ||
-         Options.IndirectBranch || Options.LocalVarStruct ||
-         Options.BogusControlFlow;
+  return Options.FunctionObfuscation || Options.FlattenFunc ||
+         Options.IndirectCall || Options.IndirectBranch ||
+         Options.LocalVarStruct || Options.BogusControlFlow;
 }
 
 void protectFromLaterOptimization(Function &F) {
@@ -57,30 +57,26 @@ public:
     PreservedAnalyses PA = PreservedAnalyses::all();
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };
 
-    bool UseCombinedConstTable = FunctionOptions.FlattenFunc &&
-                                 FunctionOptions.IndirectCall &&
-                                 FunctionOptions.LocalVarStruct;
-
-    if (UseCombinedConstTable) {
+    if (FunctionOptions.FunctionObfuscation) {
       RunPass(FunctionObfuscationPass(FunctionOptions.BogusControlFlow));
       FunctionOptions.BogusControlFlow = false;
-    } else {
-      if (FunctionOptions.BogusControlFlow) {
-        RunPass(BogusControlFlowPass());
-        if (F.hasFnAttribute("vllvm.bcf")) {
-          F.removeFnAttr("vllvm.bcf");
-          PA.intersect(PreservedAnalyses::none());
-        }
-        FunctionOptions.BogusControlFlow = false;
-      }
-
-      if (FunctionOptions.IndirectCall)
-        RunPass(IndirectCallPass());
-      if (FunctionOptions.LocalVarStruct)
-        RunPass(LocalVarStructPass());
-      if (FunctionOptions.FlattenFunc)
-        RunPass(FlattenFuncPass());
     }
+
+    if (FunctionOptions.BogusControlFlow) {
+      RunPass(BogusControlFlowPass());
+      if (F.hasFnAttribute("vllvm.bcf")) {
+        F.removeFnAttr("vllvm.bcf");
+        PA.intersect(PreservedAnalyses::none());
+      }
+      FunctionOptions.BogusControlFlow = false;
+    }
+
+    if (FunctionOptions.IndirectCall)
+      RunPass(IndirectCallPass());
+    if (FunctionOptions.LocalVarStruct)
+      RunPass(LocalVarStructPass());
+    if (FunctionOptions.FlattenFunc)
+      RunPass(FlattenFuncPass());
 
     if (FunctionOptions.IndirectBranch)
       RunPass(IndirectBranchPass());

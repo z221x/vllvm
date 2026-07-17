@@ -35,19 +35,31 @@ strip_binary() {
 mkdir -p "$OUT_DIR"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -DVLLVM_TEST_COMBO=1 "$SRC" \
-  -o "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.combined.const.table" "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.combined.const.table.* global " "$OUT_DIR/test_lvars.ll"
-grep -Eq "vllvm\\.combined\\.const\\.table.*global \\[[0-9]+ x i32\\]" \
-  "$OUT_DIR/test_lvars.ll"
-if grep -q "vllvm.combined.const.table.* constant " "$OUT_DIR/test_lvars.ll"; then
-  echo "combined table must be writable data, not constant data" >&2
+  -DVLLVM_TEST_LEGACY_COMBO=1 "$SRC" \
+  -o "$OUT_DIR/test_lvars_legacy_combo.ll"
+if grep -Eq "vllvm\\.(fop|combined)\\.const\\.table" \
+  "$OUT_DIR/test_lvars_legacy_combo.ll"; then
+  echo "fla,icall,lvars must not trigger fop" >&2
   exit 1
 fi
-if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" \
+grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+grep -q "func_index_table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
+  -DVLLVM_TEST_FOP=1 "$SRC" \
+  -o "$OUT_DIR/test_lvars.ll"
+grep -q "vllvm.fop.const.table" "$OUT_DIR/test_lvars.ll"
+grep -q "vllvm.fop.const.table.* global " "$OUT_DIR/test_lvars.ll"
+grep -Eq "vllvm\\.fop\\.const\\.table.*global \\[[0-9]+ x i32\\]" \
+  "$OUT_DIR/test_lvars.ll"
+if grep -q "vllvm.fop.const.table.* constant " "$OUT_DIR/test_lvars.ll"; then
+  echo "fop table must be writable data, not constant data" >&2
+  exit 1
+fi
+if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" \
   "$OUT_DIR/test_lvars.ll"; then
-  echo "combined mode must not emit separate integer tables" >&2
+  echo "fop mode must not emit separate integer tables" >&2
   exit 1
 fi
 if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" \
@@ -63,7 +75,7 @@ if [ "$VOLATILE_LOADS" -lt 1 ]; then
 fi
 grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$OUT_DIR/test_lvars.ll"
 if grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"; then
-  echo "combined mode keys must be loaded from the shared table" >&2
+  echo "fop mode keys must be loaded from the shared table" >&2
   exit 1
 fi
 grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
@@ -72,7 +84,7 @@ grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-  -DVLLVM_TEST_COMBO=1 "$SRC" \
+  -DVLLVM_TEST_FOP=1 "$SRC" \
   -o "$OUT_DIR/test_lvars"
 strip_binary "$OUT_DIR/test_lvars_base"
 strip_binary "$OUT_DIR/test_lvars"

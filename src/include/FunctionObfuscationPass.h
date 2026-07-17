@@ -13,6 +13,6 @@ public:
   static bool isRequired() { return true; }
 
 private:
-  bool runCombined(Function &F, FunctionAnalysisManager &FAM);
+  bool runFOP(Function &F, FunctionAnalysisManager &FAM);
   bool RunBogusControlFlow = false;
 };

@@ -2,7 +2,9 @@
 
 #if defined(VLLVM_TEST_LVARS)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:lvars")))
-#elif defined(VLLVM_TEST_COMBO)
+#elif defined(VLLVM_TEST_FOP)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:fop")))
+#elif defined(VLLVM_TEST_LEGACY_COMBO)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:fla,icall,lvars")))
 #else
 #define VLLVM_TEST_OBF

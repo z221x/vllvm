@@ -28,6 +28,10 @@ StringRef normalizeKind(StringRef Kind) {
     return "ibr";
   if (Kind == "local-var-struct" || Kind == "localvars")
     return "lvars";
+  if (Kind == "function-obfuscation" || Kind == "function_obfuscation" ||
+      Kind == "function-obfuscation-pass" ||
+      Kind == "function_obfuscation_pass")
+    return "fop";
   if (Kind == "bogus-control-flow" || Kind == "bogus_control_flow" ||
       Kind == "bogus" || Kind == "fake-control-flow")
     return "bcf";
@@ -38,18 +42,10 @@ StringRef normalizeKind(StringRef Kind) {
 
 void setOption(VLLVMOptions &Options, StringRef Kind) {
   Kind = normalizeKind(Kind);
-  if (Kind == "ollvm" || Kind == "all") {
-    Options.EncryptoStr = true;
-    Options.FlattenFunc = true;
-    Options.IndirectCall = true;
-    Options.IndirectBranch = true;
-    Options.LocalVarStruct = true;
-    Options.BogusControlFlow = true;
-    return;
-  }
-
   if (Kind == "enstr")
     Options.EncryptoStr = true;
+  else if (Kind == "fop")
+    Options.FunctionObfuscation = true;
   else if (Kind == "fla")
     Options.FlattenFunc = true;
   else if (Kind == "icall")
@@ -145,6 +141,7 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   };
 
   AddAttr("enstr", Options.EncryptoStr);
+  AddAttr("fop", Options.FunctionObfuscation);
   AddAttr("fla", Options.FlattenFunc);
   AddAttr("icall", Options.IndirectCall);
   AddAttr("ibr", Options.IndirectBranch);
@@ -218,6 +215,8 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
   VLLVMOptions Options = parseOptionList(Attr.getValueAsString());
   if (Kind == "enstr")
     return Options.EncryptoStr;
+  if (Kind == "fop")
+    return Options.FunctionObfuscation;
   if (Kind == "fla")
     return Options.FlattenFunc;
   if (Kind == "icall")
@@ -234,6 +233,7 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
 VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   VLLVMOptions Options;
   Options.EncryptoStr |= hasVLLVMAttribute(F, "enstr");
+  Options.FunctionObfuscation |= hasVLLVMAttribute(F, "fop");
   Options.FlattenFunc |= hasVLLVMAttribute(F, "fla");
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");

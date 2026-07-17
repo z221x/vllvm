@@ -100,68 +100,27 @@ run_case() {
   ibr)
     grep -q "indirectbr" "$ll"
     ;;
-  mixed)
-    grep -q "vllvm.combined.const.table.* global " "$ll"
+  fop)
+    grep -q "vllvm.fop.const.table.* global " "$ll"
     grep -q "define private .*vllvm.impl.*ptr %" "$ll"
-    grep -q "call .*vllvm.impl.*ptr @vllvm.combined.const.table" "$ll"
+    grep -q "call .*vllvm.impl.*ptr @vllvm.fop.const.table" "$ll"
     grep -q "getelementptr i32, ptr %" "$ll"
     grep -q "func_table" "$ll"
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     grep -q "store volatile i32 .*ptr %.*" "$ll"
     grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
     if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
-      echo "mixed bcf constants must use the combined integer constant table" >&2
+      echo "fop bcf constants must use the fop integer constant table" >&2
       exit 1
     fi
-    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.combined\\.const\\.table" "$ll"; then
-      echo "mixed bcf table loads must use the impl table parameter" >&2
+    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.fop\\.const\\.table" "$ll"; then
+      echo "fop bcf table loads must use the impl table parameter" >&2
       exit 1
     fi
-    if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" "$ll"; then
-      echo "mixed must use one combined integer constant table" >&2
+    if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" "$ll"; then
+      echo "fop must use one fop integer constant table" >&2
       exit 1
     fi
-    ;;
-  ollvm)
-    grep -q "_decrypto" "$ll"
-    grep -q "func_table" "$ll"
-    grep -q "indirectbr" "$ll"
-    grep -q "vllvm.localvars" "$ll"
-    grep -q "vllvm.combined.const.table.* global " "$ll"
-    grep -Eq "vllvm\\.combined\\.const\\.table.*global \\[[0-9]+ x i32\\]" "$ll"
-    grep -q "define private .*vllvm.impl.*ptr %" "$ll"
-    grep -q "call .*vllvm.impl.*ptr @vllvm.combined.const.table" "$ll"
-    grep -q "getelementptr i32, ptr %" "$ll"
-    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
-    grep -q "store volatile i32 .*ptr %.*" "$ll"
-    if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
-      echo "ollvm bcf constants must use the combined integer constant table" >&2
-      exit 1
-    fi
-    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.combined\\.const\\.table" "$ll"; then
-      echo "ollvm bcf table loads must use the impl table parameter" >&2
-      exit 1
-    fi
-    if grep -q "vllvm.combined.const.table.* constant " "$ll"; then
-      echo "ollvm combined table must be writable data" >&2
-      exit 1
-    fi
-    if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table)|func_index_table" "$ll"; then
-      echo "ollvm must use one combined integer constant table" >&2
-      exit 1
-    fi
-    if grep -Eq "vllvm\\.local\\.(enc_index|field_index|offset_key\\.ptr)" "$ll"; then
-      echo "ollvm local variable table used an old decrypt sequence" >&2
-      exit 1
-    fi
-    grep -q "load volatile" "$ll"
-    local volatile_loads
-    volatile_loads=$(grep -Ec "load volatile i32" "$ll")
-    if [ "$volatile_loads" -lt 1 ]; then
-      echo "ollvm local variable table must load encrypted offsets" >&2
-      exit 1
-    fi
-    grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
     ;;
   esac
 }
@@ -170,5 +129,4 @@ run_case() {
 # run_case fla
 # run_case icall
 # run_case ibr
-run_case mixed
-# run_case ollvm
+run_case fop

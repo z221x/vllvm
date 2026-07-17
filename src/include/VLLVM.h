@@ -5,6 +5,7 @@
 namespace llvm::vllvm {
 struct VLLVMOptions {
   bool EncryptoStr = false;
+  bool FunctionObfuscation = false;
   bool FlattenFunc = false;
   bool IndirectCall = false;
   bool IndirectBranch = false;
@@ -12,8 +13,8 @@ struct VLLVMOptions {
   bool BogusControlFlow = false;
 
   bool any() const {
-    return EncryptoStr || FlattenFunc || IndirectCall || IndirectBranch ||
-           LocalVarStruct || BogusControlFlow;
+    return EncryptoStr || FunctionObfuscation || FlattenFunc || IndirectCall ||
+           IndirectBranch || LocalVarStruct || BogusControlFlow;
   }
 };
 
