@@ -1,0 +1,12 @@
+diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.cpp
+index ba71ae473..6b86b006a 100644
+--- a/clang/lib/CodeGen/BackendUtil.cpp
++++ b/clang/lib/CodeGen/BackendUtil.cpp
+@@ -998,3 +998,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+ #define HANDLE_EXTENSION(Ext)                                                  \
+   get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);
+ #include "llvm/Support/Extension.def"
++  PB.registerOptimizerLastEPCallback(
++      [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
++        llvm::vllvm::addVLLVMLatePasses(MPM);
++      });

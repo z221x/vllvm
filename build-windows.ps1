@@ -25,6 +25,8 @@ $LLVMSource = Get-FullPathOrDefault $LLVMSource (Join-Path $RepoRoot "llvm-proje
 $LLVMBuild = Get-FullPathOrDefault $LLVMBuild (Join-Path (Join-Path $RepoRoot "build") "llvm-windows")
 $LLVMInstallPrefix = Get-FullPathOrDefault $LLVMInstallPrefix (Join-Path (Join-Path $RepoRoot "out") "llvm-windows")
 $PatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vllvm.patch"
+$VmpPatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vmp.patch"
+$VmpCallPatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vmp-call.patch"
 
 function Require-Command {
   param([string]$Name)
@@ -51,9 +53,11 @@ function Copy-VllvmSources {
   $Dst = Join-Path (Join-Path (Join-Path (Join-Path $LLVMSource "llvm") "lib") "Transforms") "VLLVM"
   $DstInclude = Join-Path $Dst "include"
   $PublicInclude = Join-Path (Join-Path (Join-Path (Join-Path $LLVMSource "llvm") "include") "llvm") "Transforms\VLLVM"
+  $VmpTarget = Join-Path (Join-Path (Join-Path (Join-Path $LLVMSource "llvm") "lib") "Target") "VMP"
 
   cmake -E make_directory $DstInclude
   cmake -E make_directory $PublicInclude
+  cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "vmtarget") "VMP") $VmpTarget
 
   cmake -E copy_if_different (Join-Path (Join-Path $RepoRoot "src") "CMakeLists.txt") (Join-Path $Dst "CMakeLists.txt")
   Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src") -Filter *.cpp | ForEach-Object {
@@ -62,15 +66,19 @@ function Copy-VllvmSources {
   Get-ChildItem -LiteralPath (Join-Path (Join-Path $RepoRoot "src") "include") -Filter *.h | ForEach-Object {
     cmake -E copy_if_different $_.FullName (Join-Path $DstInclude $_.Name)
   }
+  cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "vminterpreter") (Join-Path $Dst "vminterpreter")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VLLVM.h") `
   (Join-Path $PublicInclude "VLLVM.h")
+  cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VmpCommon.h") `
+  (Join-Path $PublicInclude "VmpCommon.h")
 }
 
 function Apply-VllvmPatch {
+  param([string]$PatchPath)
   $OldErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
-    & git -C $LLVMSource apply --reverse --check $PatchFile *> $null
+    & git -C $LLVMSource apply --reverse --check --unidiff-zero $PatchPath *> $null
     $ReverseCheckExitCode = $LASTEXITCODE
   }
   finally {
@@ -78,14 +86,14 @@ function Apply-VllvmPatch {
   }
 
   if ($ReverseCheckExitCode -eq 0) {
-    Write-Host "VLLVM clang patch is already applied"
+    Write-Host "$(Split-Path $PatchPath -Leaf) is already applied"
     return
   }
 
   $OldErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
-    & git -C $LLVMSource apply --check $PatchFile *> $null
+    & git -C $LLVMSource apply --check $PatchPath *> $null
     $ApplyCheckExitCode = $LASTEXITCODE
   }
   finally {
@@ -93,11 +101,11 @@ function Apply-VllvmPatch {
   }
 
   if ($ApplyCheckExitCode -ne 0) {
-    & git -C $LLVMSource apply --check $PatchFile
+    & git -C $LLVMSource apply --check $PatchPath
     throw "VLLVM clang patch cannot be applied"
   }
 
-  & git -C $LLVMSource apply $PatchFile
+  & git -C $LLVMSource apply $PatchPath
   if ($LASTEXITCODE -ne 0) {
     throw "failed to apply VLLVM clang patch"
   }
@@ -115,7 +123,8 @@ function Configure-AndBuild {
     "-DCMAKE_INSTALL_PREFIX=$LLVMInstallPrefix",
     "-DLLVM_ENABLE_PROJECTS=clang;clang-tools-extra;lld",
     "-DCLANG_DEFAULT_LINKER=lld",
-    "-DLLVM_TARGETS_TO_BUILD=host",
+    "-DLLVM_TARGETS_TO_BUILD=host;AArch64",
+    "-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=VMP",
     "-DLLVM_INCLUDE_TESTS=OFF",
     "-DLLVM_INCLUDE_EXAMPLES=OFF",
     "-DLLVM_INCLUDE_BENCHMARKS=OFF",
@@ -126,7 +135,7 @@ function Configure-AndBuild {
   )
 
   cmake @Args
-  cmake --build $LLVMBuild --target clang clangd lld --parallel $Jobs
+  cmake --build $LLVMBuild --target clang clangd lld llc --parallel $Jobs
 }
 
 Require-Command cmake
@@ -136,11 +145,14 @@ Require-Command $CXXCompiler
 
 Clone-LlvmIfNeeded
 Copy-VllvmSources
-Apply-VllvmPatch
+Apply-VllvmPatch $PatchFile
+Apply-VllvmPatch $VmpPatchFile
+Apply-VllvmPatch $VmpCallPatchFile
 Configure-AndBuild
 
 Write-Host "vllvm clang build finished:"
 Write-Host "  $(Join-Path (Join-Path $LLVMBuild "bin") "clang.exe")"
 Write-Host "  $(Join-Path (Join-Path $LLVMBuild "bin") "clangd.exe")"
+Write-Host "  $(Join-Path (Join-Path $LLVMBuild "bin") "llc.exe")"
 Write-Host "example:"
-Write-Host "  $(Join-Path (Join-Path $LLVMBuild "bin") "clang.exe") -enstr input.c -o input.exe"
+Write-Host "  $(Join-Path (Join-Path $LLVMBuild "bin") "clang.exe") input.c -o input.exe"

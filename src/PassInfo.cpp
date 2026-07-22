@@ -1,6 +1,7 @@
 #include "PassInfo.h"
 #include "VLLVM.h"
 #include "VLLVMAttribute.h"
+#include "VmpPass.h"
 
 #include <utility>
 
@@ -8,6 +9,9 @@ using namespace llvm;
 
 namespace llvm::vllvm {
 namespace {
+constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
+constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
+
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
   return Options.FunctionObfuscation || Options.FlattenFunc ||
          Options.IndirectCall || Options.IndirectBranch ||
@@ -51,6 +55,23 @@ public:
     if (!FunctionOptions.any())
       return PreservedAnalyses::all();
 
+    // VMP 在 OptimizerLast 独立处理。它与函数级混淆组合时拥有优先级，避免
+    // 先改写 CFG 后使虚拟化资格和语义不可预测。
+    if (FunctionOptions.Vmp) {
+      const bool HadAlwaysInline = F.hasFnAttribute(Attribute::AlwaysInline);
+      const bool HadNoInline = F.hasFnAttribute(Attribute::NoInline);
+      if (HadAlwaysInline) {
+        F.removeFnAttr(Attribute::AlwaysInline);
+        F.addFnAttr(VmpHadAlwaysInlineAttr);
+      }
+      if (!HadNoInline) {
+        F.addFnAttr(Attribute::NoInline);
+        F.addFnAttr(VmpInjectedNoInlineAttr);
+      }
+      return HadAlwaysInline || !HadNoInline ? PreservedAnalyses::none()
+                                             : PreservedAnalyses::all();
+    }
+
     if (needsOptimizerProtection(FunctionOptions))
       protectFromLaterOptimization(F);
 
@@ -93,4 +114,6 @@ void addVLLVMPasses(ModulePassManager &MPM) {
   FPM.addPass(VLLVMFunctionDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
 }
+
+void addVLLVMLatePasses(ModulePassManager &MPM) { MPM.addPass(VmpPass()); }
 } // namespace llvm::vllvm

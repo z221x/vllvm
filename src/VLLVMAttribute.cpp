@@ -37,6 +37,8 @@ StringRef normalizeKind(StringRef Kind) {
     return "bcf";
   if (Kind == "encrypt-string")
     return "enstr";
+  if (Kind == "virtual-machine-protection" || Kind == "virtualize")
+    return "vmp";
   return Kind;
 }
 
@@ -56,6 +58,8 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.LocalVarStruct = true;
   else if (Kind == "bcf")
     Options.BogusControlFlow = true;
+  else if (Kind == "vmp")
+    Options.Vmp = true;
 }
 
 bool isOptionSeparator(char C) {
@@ -147,6 +151,7 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   AddAttr("ibr", Options.IndirectBranch);
   AddAttr("lvars", Options.LocalVarStruct);
   AddAttr("bcf", Options.BogusControlFlow);
+  AddAttr("vmp", Options.Vmp);
   return Changed;
 }
 
@@ -227,6 +232,8 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
     return Options.LocalVarStruct;
   if (Kind == "bcf")
     return Options.BogusControlFlow;
+  if (Kind == "vmp")
+    return Options.Vmp;
   return false;
 }
 
@@ -239,6 +246,7 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");
   Options.LocalVarStruct |= hasVLLVMAttribute(F, "lvars");
   Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
+  Options.Vmp |= hasVLLVMAttribute(F, "vmp");
   return Options;
 }
 

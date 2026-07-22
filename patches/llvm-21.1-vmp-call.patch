@@ -1,0 +1,16 @@
+diff --git a/llvm/lib/Target/BPF/BPFISelLowering.cpp b/llvm/lib/Target/BPF/BPFISelLowering.cpp
+index e4001f45d..ce6071c0c 100644
+--- a/llvm/lib/Target/BPF/BPFISelLowering.cpp
++++ b/llvm/lib/Target/BPF/BPFISelLowering.cpp
+@@ -416,7 +416,11 @@ SDValue BPFTargetLowering::LowerFormalArguments(
+   return Chain;
+ }
+ 
++#if defined(VLLVM_VMP_TARGET)
++const size_t BPFTargetLowering::MaxArgs = 6;
++#else
+ const size_t BPFTargetLowering::MaxArgs = 5;
++#endif
+ 
+ static void resetRegMaskBit(const TargetRegisterInfo *TRI, uint32_t *RegMask,
+                             MCRegister Reg) {

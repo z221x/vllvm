@@ -11,12 +11,14 @@ struct VLLVMOptions {
   bool IndirectBranch = false;
   bool LocalVarStruct = false;
   bool BogusControlFlow = false;
+  bool Vmp = false;
 
   bool any() const {
     return EncryptoStr || FunctionObfuscation || FlattenFunc || IndirectCall ||
-           IndirectBranch || LocalVarStruct || BogusControlFlow;
+           IndirectBranch || LocalVarStruct || BogusControlFlow || Vmp;
   }
 };
 
 void addVLLVMPasses(ModulePassManager &MPM);
+void addVLLVMLatePasses(ModulePassManager &MPM);
 } // namespace llvm::vllvm

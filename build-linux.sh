@@ -12,6 +12,8 @@ CXX=${CXX:-clang++}
 JOBS=${JOBS:-$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)}
 NO_CLONE=${NO_CLONE:-0}
 PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vllvm.patch"
+VMP_PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vmp.patch"
+VMP_CALL_PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vmp-call.patch"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -38,9 +40,11 @@ clone_llvm_if_needed() {
 copy_vllvm_sources() {
   local dst="$LLVM_SRC/llvm/lib/Transforms/VLLVM"
   local public_include="$LLVM_SRC/llvm/include/llvm/Transforms/VLLVM"
+  local vmp_target="$LLVM_SRC/llvm/lib/Target/VMP"
 
   cmake -E make_directory "$dst/include"
   cmake -E make_directory "$public_include"
+  cmake -E copy_directory "$ROOT_DIR/src/vmtarget/VMP" "$vmp_target"
 
   cmake -E copy_if_different "$ROOT_DIR/src/CMakeLists.txt" "$dst/CMakeLists.txt"
   for file in "$ROOT_DIR"/src/*.cpp; do
@@ -49,18 +53,23 @@ copy_vllvm_sources() {
   for file in "$ROOT_DIR"/src/include/*.h; do
     cmake -E copy_if_different "$file" "$dst/include/$(basename "$file")"
   done
+  cmake -E copy_directory "$ROOT_DIR/src/vminterpreter" "$dst/vminterpreter"
   cmake -E copy_if_different "$ROOT_DIR/src/include/VLLVM.h" \
     "$public_include/VLLVM.h"
+  cmake -E copy_if_different "$ROOT_DIR/src/include/VmpCommon.h" \
+    "$public_include/VmpCommon.h"
 }
 
-apply_vllvm_patch() {
-  if git -C "$LLVM_SRC" apply --reverse --check "$PATCH_FILE" >/dev/null 2>&1; then
-    echo "VLLVM clang patch is already applied"
+apply_one_patch() {
+  local patch_file=$1
+  if git -C "$LLVM_SRC" apply --reverse --check --unidiff-zero \
+      "$patch_file" >/dev/null 2>&1; then
+    echo "$(basename "$patch_file") is already applied"
     return
   fi
 
-  git -C "$LLVM_SRC" apply --check "$PATCH_FILE"
-  git -C "$LLVM_SRC" apply "$PATCH_FILE"
+  git -C "$LLVM_SRC" apply --check "$patch_file"
+  git -C "$LLVM_SRC" apply "$patch_file"
 }
 
 configure_and_build() {
@@ -72,7 +81,8 @@ configure_and_build() {
     -DCMAKE_INSTALL_PREFIX="$LLVM_INSTALL_PREFIX" \
     "-DLLVM_ENABLE_PROJECTS=clang;clang-tools-extra;lld" \
     -DCLANG_DEFAULT_LINKER=lld \
-    -DLLVM_TARGETS_TO_BUILD=host \
+    "-DLLVM_TARGETS_TO_BUILD=host;AArch64" \
+    -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=VMP \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -81,7 +91,7 @@ configure_and_build() {
     -DLLVM_ENABLE_LIBXML2=OFF \
     -DLLVM_ENABLE_TERMINFO=OFF
 
-  cmake --build "$LLVM_BUILD" --target clang clangd lld --parallel "$JOBS"
+  cmake --build "$LLVM_BUILD" --target clang clangd lld llc --parallel "$JOBS"
 }
 
 require_command cmake
@@ -91,11 +101,14 @@ require_command "$CXX"
 
 clone_llvm_if_needed
 copy_vllvm_sources
-apply_vllvm_patch
+apply_one_patch "$PATCH_FILE"
+apply_one_patch "$VMP_PATCH_FILE"
+apply_one_patch "$VMP_CALL_PATCH_FILE"
 configure_and_build
 
 echo "vllvm clang build finished:"
 echo "  $LLVM_BUILD/bin/clang"
 echo "  $LLVM_BUILD/bin/clangd"
+echo "  $LLVM_BUILD/bin/llc"
 echo "example:"
-echo "  $LLVM_BUILD/bin/clang -enstr input.c -o input"
+echo "  $LLVM_BUILD/bin/clang input.c -o input"

@@ -31,7 +31,7 @@ int protected_bogus_flow(int x) {
 }
 ```
 
-支持的标记名：`enstr`、`fop`、`fla`、`icall`、`ibr`、`lvars`、`bcf`。
+支持的标记名：`enstr`、`fop`、`fla`、`icall`、`ibr`、`lvars`、`bcf`、`vmp`。
 多个标记可以用逗号、空格、`+`、`|` 或 `;` 分隔，顺序不敏感。
 
 `bcf` 对应虚假控制流，会为可安全拆分的基本块插入基于私有可写全局状态和
@@ -50,6 +50,27 @@ case 值在这张表里的下标，icall/lvars 的 key 读取也会基于这个�
 `enstr` 对应字符串加密，它是 Module Pass；在函数 attribute 中出现时会启用当前
 编译模块的字符串加密，而不是只加密该函数内的字符串。
 
+`vmp` 对应整数型 Virtual Machine Protection。首个端到端版本支持 AArch64
+macOS/Linux/Windows、至多六个整数或普通指针参数、标量返回、整数控制流、
+静态标量局部变量和普通 load/store：
+
+```c
+__attribute__((annotate("vllvm:vmp")))
+uint64_t protected_value(uint64_t a, uint64_t b) {
+  return a < b ? a * 7 + b : a - b;
+}
+```
+
+`vmp` 与函数级混淆组合时由 VMP 独占处理；`enstr` 仍可作为模块级 Pass 生效。
+非 AArch64 目标以及 GEP、浮点、间接调用、聚合、可变参数、volatile/atomic 等
+未支持函数会保留原生实现，可用 `-Rpass-missed=vmp` 查看具体回退原因。直接调用
+支持整数/指针参数以及整数、指针或 void 返回；前六个参数使用 `R0-R5`，其余参数
+使用 VM frame 尾部的专用溢出参数区。
+
+当前 VMP 运行时分别接收只读的 64 位代码表、HOSTCALL 目标函数地址表和
+64 位常量表；代码表不包含镜像 Header。解释器正常返回 R0，任何 Trap 在解释器
+内部直接终止。具体 ABI 见 `docs/VMP_DESIGN.md` 第 12 节。
+
 如果直接处理 LLVM IR，也可以写函数字符串属性：
 
 ```llvm
@@ -62,7 +83,8 @@ attributes #0 = { "vllvm.fop" }
 
 ## 构建依赖
 
-三端统一使用 `clang`、`clang++` 和 `ninja` 作为构建环境，并需要 `cmake`、`git`。脚本会同时构建 `clang` 和同版本 `clangd`。
+三端统一使用 `clang`、`clang++` 和 `ninja` 作为构建环境，并需要 `cmake`、`git`。
+脚本会同时构建 `clang`、同版本 `clangd`、`lld` 和实验性 VMP `llc`。
 
 Windows 如果使用 LLVM/MinGW 风格 clang，默认参数即可；如果你要用 MSVC ABI，可以显式传入 `clang-cl`。
 
@@ -124,3 +146,18 @@ cmake --install .\build\llvm-windows --prefix C:\vllvm
 ```
 
 默认安装前缀只是写进 CMake 配置，不会在脚本中执行安装。可以通过 `LLVM_INSTALL_PREFIX` 或 `-LLVMInstallPrefix` 改掉这个默认值。
+
+## VMP 验证
+
+构建完成后可运行：
+
+```bash
+./test/vmp/test_interpreter.sh
+./test/vmp/test_target.sh
+./test/vmp/test_vmp.sh
+./test/vmp/test_fallback.sh
+./test/vmp/test_cross_targets.sh
+```
+
+其中 `test_vmp.sh` 会比较 `-O0`、`-O2` 和完整 LTO 下的原生/VMP 结果，
+并覆盖多线程、窄整数、spill/reload、指针副作用以及 `vmp` 与其他标记的组合。
