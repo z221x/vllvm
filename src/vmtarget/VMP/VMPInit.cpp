@@ -1,51 +1,76 @@
-#include "BPFTargetMachine.h"
-#include "TargetInfo/BPFTargetInfo.h"
-#include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
+#include "TargetInfo/VMPTargetInfo.h"
+#include "VMP.h"
+
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/Compiler.h"
+#include "llvm/Target/TargetLoweringObjectFile.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/VLLVM/VmpFunctionCompiler.h"
+
+#include <optional>
 
 using namespace llvm;
 
-// LLVM 根据实验 Target 名称寻找 VMP 初始化入口。底层 SelectionDAG 骨架沿用
-// BPF 类名，因此这里把标准入口转发到复用实现。
-extern "C" LLVM_ABI void LLVMInitializeBPFTarget();
-
-namespace llvm {
 namespace {
-class VMPTargetMachine final : public BPFTargetMachine {
-public:
-  VMPTargetMachine(const Target &T, const Triple &RequestedTriple,
-                   StringRef CPU, StringRef Features,
-                   const TargetOptions &Options, std::optional<Reloc::Model> RM,
-                   std::optional<CodeModel::Model> CM, CodeGenOptLevel OL,
-                   bool JIT)
-      : BPFTargetMachine(T, Triple("bpfel-unknown-none"),
-                         CPU.empty() ? "v4" : CPU, Features, Options, RM, CM,
-                         OL, JIT),
-        HasLittleElfTriple(RequestedTriple.getArch() == Triple::bpfel) {}
 
-  bool
-  addPassesToEmitFile(PassManagerBase &PM, raw_pwrite_stream &Output,
-                      raw_pwrite_stream *DwoOutput, CodeGenFileType FileType,
-                      bool DisableVerify = true,
-                      MachineModuleInfoWrapperPass *MMIWP = nullptr) override {
-    // Pass 内部总是显式使用 bpfel 临时 Triple。外部 llc 若遗漏该约束，
-    // 清晰拒绝输出，不能把 ELF writer 与宿主 Mach-O/COFF streamer 混用。
-    if (!HasLittleElfTriple)
-      return true;
-    return BPFTargetMachine::addPassesToEmitFile(
-        PM, Output, DwoOutput, FileType, DisableVerify, MMIWP);
+class VMPNullObjectFile final : public TargetLoweringObjectFile {
+public:
+  void Initialize(MCContext &, const TargetMachine &) override {
+    // llc 无条件初始化 TargetLoweringObjectFile。VMP 不创建 MC section，也不
+    // 需要 MCAsmInfo，因此这里有意保持为空。
+  }
+
+  MCSection *getExplicitSectionGlobal(const GlobalObject *, SectionKind,
+                                      const TargetMachine &) const override {
+    return nullptr;
+  }
+
+protected:
+  MCSection *SelectSectionForGlobal(const GlobalObject *, SectionKind,
+                                    const TargetMachine &) const override {
+    return nullptr;
+  }
+};
+
+class VMPTargetMachine final : public TargetMachine {
+public:
+  VMPTargetMachine(const Target &T, const Triple &TT, StringRef CPU,
+                   StringRef Features, const TargetOptions &Options,
+                   std::optional<Reloc::Model> RM,
+                   std::optional<CodeModel::Model> CM, CodeGenOptLevel OL, bool)
+      : TargetMachine(T, llvm::vllvm::kVMPDataLayout, TT, CPU, Features,
+                      Options) {
+    this->RM = RM.value_or(Reloc::Static);
+    this->CMModel = CM.value_or(CodeModel::Small);
+    this->OptLevel = OL;
+  }
+
+  bool addPassesToEmitFile(PassManagerBase &PM, raw_pwrite_stream &Output,
+                           raw_pwrite_stream *, CodeGenFileType, bool,
+                           MachineModuleInfoWrapperPass *) override {
+    // 纯 VMP 流不经过 MC/ObjectFile。该 ModulePass 直接完成 IR 指令选择、
+    // 栈槽分配、PHI 边拷贝、REL32 修正和最终 64 位编码。
+    PM.add(createVMPCodeEmitterPass(Output));
+    return false;
+  }
+
+  TargetLoweringObjectFile *getObjFileLowering() const override {
+    return &ObjectFile;
   }
 
 private:
-  bool HasLittleElfTriple;
+  mutable VMPNullObjectFile ObjectFile;
 };
+
 } // namespace
-} // namespace llvm
 
 extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeVMPTarget() {
-  LLVMInitializeBPFTarget();
-  // 无公开 VMP Triple；无论宿主 Module 是 Mach-O/ELF/COFF，内部 Target
-  // 都规范化为固定的小端 ELF，避免对象 streamer 受宿主格式影响。
-  RegisterTargetMachine<VMPTargetMachine> TargetMachine(getTheBPFTarget());
+  RegisterTargetMachine<VMPTargetMachine> X(getTheVMPTarget());
 }
+
+// VMP 没有汇编文本或宿主对象格式；保留初始化符号以满足 LLVM 的统一 Target
+// 初始化入口。真正的编码器由 VMPTargetMachine 直接安装。
+extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void
+LLVMInitializeVMPAsmPrinter() {}

@@ -46,6 +46,16 @@ host_call_ten_narrow(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
          (uint64_t)a9 * 29u;
 }
 
+static NOINLINE uint64_t
+host_call_fifteen(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                  uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
+                  uint64_t a8, uint64_t a9, uint64_t a10, uint64_t a11,
+                  uint64_t a12, uint64_t a13, uint64_t a14) {
+  return a0 + a1 * 2u + a2 * 3u + a3 * 4u + a4 * 5u + a5 * 6u +
+         a6 * 7u + a7 * 8u + a8 * 9u + a9 * 10u + a10 * 11u +
+         a11 * 12u + a12 * 13u + a13 * 14u + a14 * 15u;
+}
+
 VMP uint64_t protected_mix(uint64_t a, uint64_t b) {
   uint64_t value = a * 0x100000001ULL + b;
   if (a < b)
@@ -134,7 +144,11 @@ VMP uint64_t protected_hostcall(uint64_t seed, uint64_t *pointer) {
   uint64_t fourth = host_call_ten_narrow(
       seed, seed + 1, seed + 2, seed + 3, seed + 4, seed + 5, seed + 6,
       seed + 7, (int8_t)-31, (uint16_t)(seed + 0x7654u));
-  return first ^ second ^ third ^ fourth;
+  uint64_t fifth = host_call_fifteen(
+      seed, seed + 1, seed + 2, seed + 3, seed + 4, seed + 5, seed + 6,
+      seed + 7, seed + 8, seed + 9, seed + 10, seed + 11, seed + 12,
+      seed + 13, seed + 14);
+  return first ^ second ^ third ^ fourth ^ fifth;
 }
 
 #if !defined(_WIN32)

@@ -223,13 +223,32 @@ inline constexpr std::uint32_t kFrameAlignment = 16;
 inline constexpr std::uint32_t kMaxArgumentCount = 6;
 inline constexpr std::uint32_t kHostCallIndexMask = 0x00FFFFFFU;
 inline constexpr unsigned kHostCallArgumentShift = 24;
-inline constexpr std::uint32_t kMaxHostCallArgumentCount = 0xFFU;
+inline constexpr std::uint32_t kHostCallArgumentMask = 0xFFU;
+inline constexpr std::uint32_t kMaxHostCallArgumentCount = 15;
+
+// VMP Target 与 VmpPass 之间的纯 CodeGen 流。它不是运行时镜像，也不依赖
+// ELF/Mach-O/COFF。所有字段和后续 uint64_t 表均使用小端编码。
+//
+//  0  u32 magic ("VMPC")
+//  4  u16 version
+//  6  u16 headerSize
+//  8  u32 totalSize
+// 12  u32 instructionCount
+// 16  u32 valueCount
+// 20  u32 frameSize
+// 24  u32 entryPc
+// 28  u32 flags/reserved
+// 32  instructionCount 个已编码 VMP 指令，随后是 valueCount 个常量。
+inline constexpr std::uint32_t kCodegenStreamMagic = 0x43504D56U;
+inline constexpr std::uint32_t kCodegenFailureMagic = 0x45504D56U;
+inline constexpr std::uint16_t kCodegenStreamVersion = 1;
+inline constexpr std::uint16_t kCodegenHeaderSize = 32;
 
 [[nodiscard]] constexpr std::uint32_t
 packHostCallPayload(std::uint32_t FunctionIndex,
                     std::uint32_t ArgumentCount) noexcept {
   return (FunctionIndex & kHostCallIndexMask) |
-         ((ArgumentCount & kMaxHostCallArgumentCount)
+         ((ArgumentCount & kHostCallArgumentMask)
           << kHostCallArgumentShift);
 }
 
@@ -442,7 +461,8 @@ validateM3Instruction(const Instruction &Inst, std::uint32_t Pc,
   }
   case Opcode::HOSTCALL:
     if (Inst.format != InstFormat::CALL || Inst.dst != Reg::ZR ||
-        Inst.src1 != Reg::ZR || Inst.src2 != Reg::ZR || Inst.aux != 0)
+        Inst.src1 != Reg::ZR || Inst.src2 != Reg::ZR || Inst.aux != 0 ||
+        hostCallArgumentCount(Inst.payload) > kMaxHostCallArgumentCount)
       return VmpTrap::InvalidFormat;
     return VmpTrap::None;
   case Opcode::RET:

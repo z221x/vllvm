@@ -24,6 +24,8 @@ fi
 grep -q '只支持可静态解析的直接调用' "$OUT_DIR/fallback-aarch64.remarks"
 grep -q '暂不支持 GEP' "$OUT_DIR/fallback-aarch64.remarks"
 grep -q '参数数量超过' "$OUT_DIR/fallback-aarch64.remarks"
+grep -q 'HOSTCALL 参数数量超过统一 bridge 的 15 参数上限' \
+  "$OUT_DIR/fallback-aarch64.remarks"
 grep -q '非 volatile' "$OUT_DIR/fallback-aarch64.remarks"
 if grep -q '__vllvm_vmp_code' "$OUT_DIR/fallback-aarch64.ll"; then
   echo "unsupported functions unexpectedly produced VMP code tables" >&2

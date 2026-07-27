@@ -13,7 +13,6 @@ JOBS=${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 8)}
 NO_CLONE=${NO_CLONE:-0}
 PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vllvm.patch"
 VMP_PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vmp.patch"
-VMP_CALL_PATCH_FILE="$ROOT_DIR/patches/llvm-21.1-vmp-call.patch"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -44,6 +43,10 @@ copy_vllvm_sources() {
 
   cmake -E make_directory "$dst/include"
   cmake -E make_directory "$public_include"
+  cmake -E remove_directory "$vmp_target"
+  cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.inc"
+  cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.cpp"
+  cmake -E rm -f "$dst/include/VmpTargetBytecodeCompiler.h"
   cmake -E copy_directory "$ROOT_DIR/src/vmtarget/VMP" "$vmp_target"
 
   cmake -E copy_if_different "$ROOT_DIR/src/CMakeLists.txt" "$dst/CMakeLists.txt"
@@ -58,6 +61,8 @@ copy_vllvm_sources() {
     "$public_include/VLLVM.h"
   cmake -E copy_if_different "$ROOT_DIR/src/include/VmpCommon.h" \
     "$public_include/VmpCommon.h"
+  cmake -E copy_if_different "$ROOT_DIR/src/include/VmpFunctionCompiler.h" \
+    "$public_include/VmpFunctionCompiler.h"
 }
 
 apply_one_patch() {
@@ -114,7 +119,6 @@ clone_llvm_if_needed
 copy_vllvm_sources
 apply_one_patch "$PATCH_FILE"
 apply_one_patch "$VMP_PATCH_FILE"
-apply_one_patch "$VMP_CALL_PATCH_FILE"
 configure_and_build
 
 echo "vllvm clang build finished:"

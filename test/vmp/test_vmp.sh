@@ -39,7 +39,7 @@ for opt in 0 2; do
   grep -q '__vllvm_vmp_code' "$OUT_DIR/vmp_O$opt.ll"
   grep -q '__vllvm_vmp_values' "$OUT_DIR/vmp_O$opt.ll"
   grep -q '__vllvm_vmp_functions\.protected_hostcall' "$OUT_DIR/vmp_O$opt.ll"
-  grep -q '__vllvm_vmp_functions\.protected_hostcall.*\[3 x ptr\].*host_call_eight.*host_call_nine.*host_call_ten_narrow' \
+  grep -q '__vllvm_vmp_functions\.protected_hostcall.*\[4 x ptr\].*host_call_eight.*host_call_nine.*host_call_ten_narrow.*host_call_fifteen' \
     "$OUT_DIR/vmp_O$opt.ll"
   grep -q 'define linkonce_odr hidden i64 @__vllvm_vmp_hostcall_bridge' \
     "$OUT_DIR/vmp_O$opt.ll"

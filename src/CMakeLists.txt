@@ -22,11 +22,7 @@ add_llvm_component_library(LLVMVLLVM
 
   LINK_COMPONENTS
   Analysis
-  AsmPrinter
-  CodeGen
   Core
-  MC
-  Object
   Passes
   Support
   Target

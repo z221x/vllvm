@@ -47,6 +47,18 @@ std::uint64_t testHostTarget(std::uint64_t A0, std::uint64_t A1,
          A7 * 8;
 }
 
+std::uint64_t
+testHostTargetFifteen(std::uint64_t A0, std::uint64_t A1, std::uint64_t A2,
+                      std::uint64_t A3, std::uint64_t A4, std::uint64_t A5,
+                      std::uint64_t A6, std::uint64_t A7, std::uint64_t A8,
+                      std::uint64_t A9, std::uint64_t A10, std::uint64_t A11,
+                      std::uint64_t A12, std::uint64_t A13,
+                      std::uint64_t A14) {
+  return A0 + A1 * 2 + A2 * 3 + A3 * 4 + A4 * 5 + A5 * 6 + A6 * 7 +
+         A7 * 8 + A8 * 9 + A9 * 10 + A10 * 11 + A11 * 12 + A12 * 13 +
+         A13 * 14 + A14 * 15;
+}
+
 Instruction ret() { return {.opcode = Opcode::RET}; }
 
 void testEncodeDecode() {
@@ -64,12 +76,14 @@ void testEncodeDecode() {
   assert(Decoded.src1 == Original.src1);
   assert(Decoded.src2 == Original.src2);
   assert(Decoded.format == Original.format);
-  const std::uint32_t HostPayload = packHostCallPayload(0x123456U, 17);
+  const std::uint32_t HostPayload = packHostCallPayload(0x123456U, 15);
   assert(hostCallFunctionIndex(HostPayload) == 0x123456U);
-  assert(hostCallArgumentCount(HostPayload) == 17);
+  assert(hostCallArgumentCount(HostPayload) == 15);
+  assert(kMaxHostCallArgumentCount == 15);
   assert(hostCallOverflowSize(6) == 0);
   assert(hostCallOverflowSize(7) == 16);
   assert(hostCallOverflowSize(8) == 16);
+  assert(hostCallOverflowSize(15) == 80);
 }
 
 void testArithmeticAndConstantPool() {
@@ -341,6 +355,33 @@ void testHostCall() {
   assert(
       run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, Stack, 8, FunctionTable) ==
       static_cast<std::uint32_t>(VmpTrap::StackOutOfRange));
+
+  Program FifteenProgram = makeImage(
+      {{.opcode = Opcode::HOSTCALL,
+        .payload = packHostCallPayload(0, 15),
+        .format = InstFormat::CALL},
+       ret()},
+      {}, 6, 80);
+  alignas(16) std::uint8_t FifteenStack[80]{};
+  auto *FifteenStackArguments =
+      reinterpret_cast<std::uint64_t *>(FifteenStack);
+  for (std::uint64_t I = 0; I != 9; ++I)
+    FifteenStackArguments[I] = I + 7;
+  std::vector<const void *> FifteenFunctionTable = {
+      reinterpret_cast<const void *>(&testHostTargetFifteen)};
+  assert(run(FifteenProgram, {1, 2, 3, 4, 5, 6}, Result, FifteenStack,
+             sizeof(FifteenStack), FifteenFunctionTable) == 0);
+  assert(Result == 1240);
+
+  Program TooManyArguments = makeImage(
+      {{.opcode = Opcode::HOSTCALL,
+        .payload = 16U << kHostCallArgumentShift,
+        .format = InstFormat::CALL},
+       ret()},
+      {}, 6, 80);
+  assert(run(TooManyArguments, {1, 2, 3, 4, 5, 6}, Result, FifteenStack,
+             sizeof(FifteenStack), FifteenFunctionTable) ==
+         static_cast<std::uint32_t>(VmpTrap::InvalidFormat));
 }
 
 void testTraps() {

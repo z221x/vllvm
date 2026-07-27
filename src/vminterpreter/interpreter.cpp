@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <utility>
 
 namespace vllvm::vm {
 // FunctionTable 直接保存宿主目标地址。所有整数/指针 HOSTCALL 共用一个
@@ -341,6 +342,10 @@ void dispatch(VMContext &Context, const Instruction &Inst) noexcept {
   case Opcode::HOSTCALL: {
     const std::uint32_t Index = hostCallFunctionIndex(Inst.payload);
     const std::uint32_t ArgumentCount = hostCallArgumentCount(Inst.payload);
+    if (ArgumentCount > kMaxHostCallArgumentCount) {
+      Context.trap = VmpTrap::InvalidHostCall;
+      return;
+    }
     const std::uint32_t OverflowSize = hostCallOverflowSize(ArgumentCount);
     if (Context.program.functionTable == nullptr ||
         Context.program.functionTable[Index] == nullptr) {
@@ -470,14 +475,17 @@ __vllvm_vmp_execute(const std::uint64_t *Code, std::uint32_t CodeSize,
 
 #if defined(VLLVM_VMP_AARCH64_RUNTIME) || defined(__aarch64__)
 
-// VM 调用约定把前六个参数放在 R0-R5，其余参数放在 StackArguments。这里把
-// 第七、八个参数补到 AArch64 x6/x7，并把第九个及以后复制到宿主 SP。
+// VM 调用约定把前六个参数放在 R0-R5，其余参数放在 StackArguments。bridge
+// 根据 argc 分发参数：第七、八个参数补到 AArch64 x6/x7，第九至第十五个
+// 参数复制到宿主 SP。大于 15 的 argc 已由解释器拒绝，这里仍做防御性检查。
 // naked 函数只包含 basic asm，符号名仍由 LLVM 按最终 Mach-O/ELF/COFF
 // 目标生成，因此同一份 runtime bitcode 可用于三个 AArch64 平台。
 extern "C" __attribute__((naked, noinline)) std::uint64_t
 __vllvm_vmp_hostcall_bridge(std::uint64_t *, std::uint64_t *, std::uint32_t,
                             void *) noexcept {
   __asm__ volatile(
+      "cmp w2, #15\n"
+      "b.hi 4f\n"
       "stp x29, x30, [sp, #-48]!\n"
       "mov x29, sp\n"
       "stp x19, x20, [sp, #16]\n"
@@ -518,25 +526,92 @@ __vllvm_vmp_hostcall_bridge(std::uint64_t *, std::uint64_t *, std::uint32_t,
       "ldp x19, x20, [sp, #16]\n"
       "ldp x21, x22, [sp, #32]\n"
       "ldp x29, x30, [sp], #48\n"
+      "ret\n"
+      "4:\n"
+      "mov x0, xzr\n"
       "ret\n");
 }
 
 #elif defined(VLLVM_VMP_TESTING)
 
 // 非 AArch64 主机只会运行解释器单测，不会进入正式 VMP Pass。保留一个
-// 纯 C++ 的八参数测试实现，使 ISA Handler 测试不依赖测试机架构。
+// 纯 C++ 的 0-15 参数分发实现，使 ISA Handler 测试不依赖测试机架构。
+template <std::size_t> using TestHostCallWord = std::uint64_t;
+
+template <std::size_t Index>
+std::uint64_t testHostCallArgument(std::uint64_t *Registers,
+                                   std::uint64_t *StackArguments) noexcept {
+  if constexpr (Index < kMaxArgumentCount)
+    return Registers[Index];
+  else
+    return StackArguments[Index - kMaxArgumentCount];
+}
+
+template <std::size_t... Indices>
+std::uint64_t
+dispatchTestHostCall(std::uint64_t *Registers, std::uint64_t *StackArguments,
+                     void *FunctionAddress,
+                     std::index_sequence<Indices...>) noexcept {
+  using TestTarget = std::uint64_t (*)(TestHostCallWord<Indices>...);
+  return reinterpret_cast<TestTarget>(FunctionAddress)(
+      testHostCallArgument<Indices>(Registers, StackArguments)...);
+}
+
 extern "C" std::uint64_t __vllvm_vmp_hostcall_bridge(
     std::uint64_t *Registers, std::uint64_t *StackArguments,
     std::uint32_t ArgumentCount, void *FunctionAddress) noexcept {
-  using TestTarget = std::uint64_t (*)(std::uint64_t, std::uint64_t,
-                                       std::uint64_t, std::uint64_t,
-                                       std::uint64_t, std::uint64_t,
-                                       std::uint64_t, std::uint64_t);
-  if (ArgumentCount != 8)
+  switch (ArgumentCount) {
+  case 0:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<0>{});
+  case 1:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<1>{});
+  case 2:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<2>{});
+  case 3:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<3>{});
+  case 4:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<4>{});
+  case 5:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<5>{});
+  case 6:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<6>{});
+  case 7:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<7>{});
+  case 8:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<8>{});
+  case 9:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<9>{});
+  case 10:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<10>{});
+  case 11:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<11>{});
+  case 12:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<12>{});
+  case 13:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<13>{});
+  case 14:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<14>{});
+  case 15:
+    return dispatchTestHostCall(Registers, StackArguments, FunctionAddress,
+                                std::make_index_sequence<15>{});
+  default:
     return 0;
-  return reinterpret_cast<TestTarget>(FunctionAddress)(
-      Registers[0], Registers[1], Registers[2], Registers[3], Registers[4],
-      Registers[5], StackArguments[0], StackArguments[1]);
+  }
 }
 
 #endif

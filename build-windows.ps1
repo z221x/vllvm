@@ -26,7 +26,6 @@ $LLVMBuild = Get-FullPathOrDefault $LLVMBuild (Join-Path (Join-Path $RepoRoot "b
 $LLVMInstallPrefix = Get-FullPathOrDefault $LLVMInstallPrefix (Join-Path (Join-Path $RepoRoot "out") "llvm-windows")
 $PatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vllvm.patch"
 $VmpPatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vmp.patch"
-$VmpCallPatchFile = Join-Path (Join-Path $RepoRoot "patches") "llvm-21.1-vmp-call.patch"
 
 function Require-Command {
   param([string]$Name)
@@ -57,6 +56,10 @@ function Copy-VllvmSources {
 
   cmake -E make_directory $DstInclude
   cmake -E make_directory $PublicInclude
+  cmake -E remove_directory $VmpTarget
+  cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.inc")
+  cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.cpp")
+  cmake -E rm -f (Join-Path $DstInclude "VmpTargetBytecodeCompiler.h")
   cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "vmtarget") "VMP") $VmpTarget
 
   cmake -E copy_if_different (Join-Path (Join-Path $RepoRoot "src") "CMakeLists.txt") (Join-Path $Dst "CMakeLists.txt")
@@ -71,6 +74,8 @@ function Copy-VllvmSources {
   (Join-Path $PublicInclude "VLLVM.h")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VmpCommon.h") `
   (Join-Path $PublicInclude "VmpCommon.h")
+  cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VmpFunctionCompiler.h") `
+  (Join-Path $PublicInclude "VmpFunctionCompiler.h")
 }
 
 function Apply-VllvmPatch {
@@ -147,7 +152,6 @@ Clone-LlvmIfNeeded
 Copy-VllvmSources
 Apply-VllvmPatch $PatchFile
 Apply-VllvmPatch $VmpPatchFile
-Apply-VllvmPatch $VmpCallPatchFile
 Configure-AndBuild
 
 Write-Host "vllvm clang build finished:"

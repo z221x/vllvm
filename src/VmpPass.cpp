@@ -2,6 +2,7 @@
 
 #include "VLLVMAttribute.h"
 #include "VmpCommon.h"
+#include "VmpFunctionCompiler.h"
 #include "VmpRuntimeEmbed.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -21,14 +22,9 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Linker/Linker.h"
-#include "llvm/MC/TargetRegistry.h"
-#include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Alignment.h"
-#include "llvm/Support/CodeGen.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBufferRef.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/Target/TargetMachine.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -45,23 +41,10 @@
 #include <vector>
 
 using namespace llvm;
-using namespace llvm::object;
-using ::vllvm::vm::InstFormat;
-using ::vllvm::vm::IntPredicate;
 using ::vllvm::vm::kFrameAlignment;
 using ::vllvm::vm::kInstructionSize;
 using ::vllvm::vm::kMaxArgumentCount;
 using ::vllvm::vm::kMaxFrameSize;
-using ::vllvm::vm::Opcode;
-using ::vllvm::vm::Reg;
-using ::vllvm::vm::ValueWidth;
-using ::vllvm::vm::VmpTrap;
-using VmInstruction = ::vllvm::vm::Instruction;
-
-extern "C" void LLVMInitializeVMPTargetInfo();
-extern "C" void LLVMInitializeVMPTarget();
-extern "C" void LLVMInitializeVMPTargetMC();
-extern "C" void LLVMInitializeVMPAsmPrinter();
 
 namespace llvm::vllvm {
 namespace {
@@ -70,8 +53,7 @@ constexpr StringLiteral VmpProcessedAttr = "vllvm.vmp.processed";
 constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
 constexpr StringLiteral RuntimeName = "__vllvm_vmp_execute";
-constexpr StringLiteral RuntimeHostBridgeName =
-    "__vllvm_vmp_hostcall_bridge";
+constexpr StringLiteral RuntimeHostBridgeName = "__vllvm_vmp_hostcall_bridge";
 constexpr StringLiteral RuntimeAttr = "vllvm.vmp.runtime";
 
 struct CompiledFunction {
@@ -96,6 +78,7 @@ struct CompiledFunction {
                  ITy->getBitWidth() == 64);
 }
 
+// 忽略常规的调试指令、lifetime、assume 等 LLVM intrinsic
 [[nodiscard]] bool isIgnorableIntrinsic(const Instruction &I) {
   const auto *II = dyn_cast<IntrinsicInst>(&I);
   if (!II)
@@ -114,8 +97,7 @@ struct CompiledFunction {
   }
 }
 
-[[nodiscard]] std::string
-checkFastCallNormalization(const Function &Target) {
+[[nodiscard]] std::string checkFastCallNormalization(const Function &Target) {
   if (Target.getCallingConv() == CallingConv::C)
     return {};
   if (Target.getCallingConv() != CallingConv::Fast)
@@ -152,8 +134,7 @@ checkFastCallNormalization(const Function &Target) {
   if (Target->getCallingConv() != CallingConv::C &&
       Target->getCallingConv() != CallingConv::Fast)
     return "M3 HOSTCALL 只支持 C 或优化生成的 fastcc 调用";
-  if (std::string Reason = checkFastCallNormalization(*Target);
-      !Reason.empty())
+  if (std::string Reason = checkFastCallNormalization(*Target); !Reason.empty())
     return Reason;
   if (Target->isVarArg())
     return "M3 HOSTCALL 不支持可变参数目标";
@@ -161,7 +142,7 @@ checkFastCallNormalization(const Function &Target) {
       Call.getFunctionType() != Target->getFunctionType())
     return "HOSTCALL 调用点类型与直接目标函数类型不一致";
   if (Call.arg_size() > ::vllvm::vm::kMaxHostCallArgumentCount)
-    return "HOSTCALL 参数数量超过 Payload 的 8 位 argc 上限";
+    return "HOSTCALL 参数数量超过统一 bridge 的 15 参数上限";
   if (!Call.getType()->isVoidTy() && !isScalarVmType(Call.getType()))
     return "HOSTCALL 返回类型不是整数、指针或 void";
   for (unsigned I = 0; I != Call.arg_size(); ++I) {
@@ -243,8 +224,18 @@ checkFastCallNormalization(const Function &Target) {
         return "store 必须是非 volatile、非 atomic 的 M3 标量访问";
       continue;
     }
-    if (isa<ICmpInst, PHINode, BranchInst, SwitchInst, SelectInst, ReturnInst,
-            UnreachableInst>(&I))
+    if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
+      if (isScalarVmType(Cmp->getOperand(0)->getType()))
+        continue;
+      return "icmp 只能比较受支持的整数或普通指针";
+    }
+    if (auto *Phi = dyn_cast<PHINode>(&I)) {
+      if (isScalarVmType(Phi->getType()))
+        continue;
+      return "PHI 只能承载受支持的整数或普通指针";
+    }
+    if (isa<BranchInst, SwitchInst, SelectInst, ReturnInst, UnreachableInst>(
+            &I))
       continue;
     if (auto *CI = dyn_cast<CastInst>(&I)) {
       if (isa<TruncInst, ZExtInst, SExtInst, BitCastInst>(CI) &&
@@ -360,7 +351,8 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
         return false;
       }
       Targets.push_back({OriginalTarget,
-                         "__vllvm_vmp_hostcall." + utostr(Targets.size()),
+                         "__vllvm_vmp_hostcall." + utostr(Targets.size()) +
+                             "." + utostr(Call->arg_size()),
                          static_cast<std::uint32_t>(Call->arg_size())});
     } else if (Targets[It->second].ArgumentCount != Call->arg_size()) {
       Error = "同一 HOSTCALL 目标使用了不一致的参数数量";
@@ -388,6 +380,11 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
     OutgoingArguments = EntryBuilder.CreateAlloca(OutgoingType, nullptr,
                                                   "vmp.hostcall.stack.args");
     OutgoingArguments->setAlignment(Align(kFrameAlignment));
+    // LLVM 可在嵌套 CodeGen 前重命名或丢弃 SSA 名称；使用 metadata 稳定标识
+    // 必须固定在 frame 尾部的 HOSTCALL outgoing 区。
+    OutgoingArguments->setMetadata(
+        "vllvm.vmp.hostcall.outgoing",
+        MDNode::get(Context, ArrayRef<Metadata *>()));
   }
 
   SmallVector<Function *, 16> PseudoFunctions(Targets.size(), nullptr);
@@ -411,8 +408,7 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
     SmallVector<Value *, kMaxArgumentCount> RegisterArguments;
     for (unsigned I = 0;
          I != std::min<std::uint32_t>(Call->arg_size(), kMaxArgumentCount); ++I)
-      RegisterArguments.push_back(
-          packHostCallScalar(Builder, *Call, I));
+      RegisterArguments.push_back(packHostCallScalar(Builder, *Call, I));
 
     if (Call->arg_size() > kMaxArgumentCount) {
       const std::uint32_t CurrentBytes =
@@ -428,11 +424,11 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
           Offset = (I - kMaxArgumentCount) * sizeof(std::uint64_t);
         } else if (UsesApplePackedStack) {
           Type *ArgumentType = Call->getArgOperand(I)->getType();
-          StoreBytes = ArgumentType->isPointerTy()
-                           ? 8
-                           : std::max(1U, cast<IntegerType>(ArgumentType)
-                                               ->getBitWidth() /
-                                           8);
+          StoreBytes =
+              ArgumentType->isPointerTy()
+                  ? 8
+                  : std::max(
+                        1U, cast<IntegerType>(ArgumentType)->getBitWidth() / 8);
           NativeStackOffset = alignTo(NativeStackOffset, StoreBytes);
           Offset = NativeStackOffset;
           NativeStackOffset += StoreBytes;
@@ -448,8 +444,8 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
             {Builder.getInt32(0), Builder.getInt32(BaseByte + Offset)});
         Value *Packed = packHostCallScalar(Builder, *Call, I);
         if (StoreBytes != sizeof(std::uint64_t))
-          Packed = Builder.CreateTrunc(
-              Packed, Builder.getIntNTy(StoreBytes * 8));
+          Packed =
+              Builder.CreateTrunc(Packed, Builder.getIntNTy(StoreBytes * 8));
         StoreInst *Store = Builder.CreateStore(Packed, Slot);
         Store->setAlignment(Align(StoreBytes));
         Store->setVolatile(true);
@@ -466,742 +462,6 @@ bool lowerHostCalls(Function &F, Module &OriginalModule,
   }
   return true;
 }
-
-struct MachineBranchFixup {
-  std::size_t InstructionIndex = 0;
-  std::uint32_t TargetSlot = 0;
-};
-
-struct MachineHostCall {
-  std::uint32_t FunctionIndex = 0;
-  std::uint32_t ArgumentCount = 0;
-};
-
-// M2 使用 LLVM 的 SelectionDAG、PHI 消除和寄存器分配生成临时小端 ELF。
-// 当前 Target 以裁剪的 BPF Machine IR 为过渡层；此处只读取已分配后的固定
-// 64 位机器指令，并立即翻译到冻结的 VMP ISA，BPF 编码不会进入最终程序。
-class TargetBytecodeCompiler {
-public:
-  explicit TargetBytecodeCompiler(
-      Function &F, ArrayRef<CompiledFunction::HostCallTarget> HostCalls)
-      : F(F), HostCalls(HostCalls) {}
-
-  bool compile(CompiledFunction &Output, std::string &Error) {
-    SmallVector<char, 0> ObjectBytes;
-    if (!emitObject(ObjectBytes, Error))
-      return false;
-
-    Expected<std::unique_ptr<ObjectFile>> Object = ObjectFile::createObjectFile(
-        MemoryBufferRef(StringRef(ObjectBytes.data(), ObjectBytes.size()),
-                        "vmp-temporary.o"));
-    if (!Object) {
-      Error = "无法解析 VMP Target 临时 ELF：" + toString(Object.takeError());
-      return false;
-    }
-
-    StringRef MachineCode;
-    StringRef MetaContents;
-    bool HasConstantSection = false;
-    bool HasMetaSection = false;
-    std::string SectionNames;
-    for (SectionRef Section : (*Object)->sections()) {
-      Expected<StringRef> Name = Section.getName();
-      if (!Name) {
-        Error = toString(Name.takeError());
-        return false;
-      }
-      if (!Name->empty())
-        SectionNames += (Twine("[") + *Name + "]").str();
-      if (*Name == ".vmp.const")
-        HasConstantSection = true;
-      if (*Name == ".vmp.meta")
-        HasMetaSection = true;
-      if (*Name != ".vmp.code") {
-        if (*Name == ".vmp.meta") {
-          Expected<StringRef> Contents = Section.getContents();
-          if (!Contents) {
-            Error = toString(Contents.takeError());
-            return false;
-          }
-          MetaContents = *Contents;
-        }
-        continue;
-      }
-      Expected<StringRef> Contents = Section.getContents();
-      if (!Contents) {
-        Error = toString(Contents.takeError());
-        return false;
-      }
-      MachineCode = *Contents;
-    }
-    for (SectionRef Section : (*Object)->sections()) {
-      Expected<StringRef> Name = Section.getName();
-      if (!Name) {
-        Error = toString(Name.takeError());
-        return false;
-      }
-      if (*Name != ".rel.vmp.code" && *Name != ".rela.vmp.code")
-        continue;
-      for (RelocationRef Relocation : Section.relocations()) {
-        symbol_iterator Symbol = Relocation.getSymbol();
-        if (Symbol == (*Object)->symbol_end()) {
-          Error = "VMP CALL relocation 缺少目标符号";
-          return false;
-        }
-        Expected<StringRef> SymbolName = Symbol->getName();
-        if (!SymbolName) {
-          Error = toString(SymbolName.takeError());
-          return false;
-        }
-        auto Target = llvm::find_if(
-            HostCalls, [&](const CompiledFunction::HostCallTarget &Candidate) {
-              return Candidate.PseudoSymbol == *SymbolName;
-            });
-        if (Target == HostCalls.end()) {
-          Error = "VMP 代码节包含未知 relocation: " + SymbolName->str();
-          return false;
-        }
-        const std::uint64_t Offset = Relocation.getOffset();
-        if (Offset >= MachineCode.size()) {
-          Error = "VMP CALL relocation 超出代码节";
-          return false;
-        }
-        const std::uint32_t Slot = Offset / kInstructionSize;
-        if (!MachineHostCalls
-                 .try_emplace(Slot,
-                              MachineHostCall{static_cast<std::uint32_t>(
-                                                  Target - HostCalls.begin()),
-                                              Target->ArgumentCount})
-                 .second) {
-          Error = "同一 VMP 机器指令存在多个 CALL relocation";
-          return false;
-        }
-      }
-    }
-    if (MachineCode.empty() || !HasConstantSection || !HasMetaSection) {
-      Error = "VMP Target 对象节不完整(code=" + utostr(MachineCode.size()) +
-              ", const=" + (HasConstantSection ? "1" : "0") +
-              ", meta=" + (HasMetaSection ? "1" : "0") +
-              ", sections=" + SectionNames + ")";
-      return false;
-    }
-    if (MetaContents.empty()) {
-      Error = ".vmp.meta 为空";
-      return false;
-    }
-    if (!translateMachineCode(MachineCode, Error) ||
-        !validateGeneratedCode(Error) || !finalizeOutput(Output, Error))
-      return false;
-    Output.Source = &F;
-    return true;
-  }
-
-private:
-  Function &F;
-  ArrayRef<CompiledFunction::HostCallTarget> HostCalls;
-  SmallVector<VmInstruction, 128> Code;
-  SmallVector<MachineBranchFixup, 32> Fixups;
-  DenseMap<std::uint32_t, MachineHostCall> MachineHostCalls;
-  DenseMap<std::uint64_t, std::uint32_t> ConstantIndices;
-  std::vector<std::uint64_t> Constants;
-  std::uint32_t FrameSize = 0;
-
-  static void initializeTarget() {
-    static const bool Initialized = [] {
-      LLVMInitializeVMPTargetInfo();
-      LLVMInitializeVMPTarget();
-      LLVMInitializeVMPTargetMC();
-      LLVMInitializeVMPAsmPrinter();
-      return true;
-    }();
-    (void)Initialized;
-  }
-
-  bool emitObject(SmallVectorImpl<char> &Bytes, std::string &Error) {
-    initializeTarget();
-    Triple TargetTriple("bpfel-unknown-none");
-    const Target *TheTarget =
-        TargetRegistry::lookupTarget("vmp", TargetTriple, Error);
-    if (!TheTarget)
-      return false;
-
-    TargetOptions Options;
-    std::unique_ptr<TargetMachine> TM(TheTarget->createTargetMachine(
-        TargetTriple, "v4", "", Options, Reloc::PIC_, CodeModel::Small,
-        CodeGenOptLevel::Default));
-    if (!TM) {
-      Error = "无法创建实验性 VMP TargetMachine";
-      return false;
-    }
-
-    Module &M = *F.getParent();
-    M.setTargetTriple(TargetTriple);
-    M.setDataLayout(TM->createDataLayout());
-    F.setSection(".vmp.code");
-    for (Function &Current : M) {
-      Current.removeFnAttr("target-cpu");
-      Current.removeFnAttr("target-features");
-      Current.removeFnAttr("tune-cpu");
-      Current.removeFnAttr(Attribute::StackProtect);
-      Current.removeFnAttr(Attribute::StackProtectReq);
-      Current.removeFnAttr(Attribute::StackProtectStrong);
-      if (&Current != &F && !Current.isDeclaration())
-        Current.deleteBody();
-    }
-
-    legacy::PassManager PM;
-    raw_svector_ostream Stream(Bytes);
-    if (TM->addPassesToEmitFile(PM, Stream, nullptr,
-                                CodeGenFileType::ObjectFile, false)) {
-      Error = "实验性 VMP Target 不支持临时 ELF 输出";
-      return false;
-    }
-    PM.run(M);
-    return true;
-  }
-
-  static std::uint16_t read16(const std::uint8_t *Data) {
-    return static_cast<std::uint16_t>(Data[0]) |
-           (static_cast<std::uint16_t>(Data[1]) << 8);
-  }
-
-  static std::uint32_t read32(const std::uint8_t *Data) {
-    std::uint32_t Value = 0;
-    for (unsigned I = 0; I != 4; ++I)
-      Value |= static_cast<std::uint32_t>(Data[I]) << (I * 8);
-    return Value;
-  }
-
-  static unsigned memoryWidth(std::uint8_t MachineOpcode) {
-    switch ((MachineOpcode >> 3) & 3U) {
-    case 0:
-      return 4;
-    case 1:
-      return 2;
-    case 2:
-      return 1;
-    default:
-      return 8;
-    }
-  }
-
-  static std::uint8_t widthForBytes(unsigned Bytes) {
-    switch (Bytes) {
-    case 1:
-      return static_cast<std::uint8_t>(ValueWidth::I8);
-    case 2:
-      return static_cast<std::uint8_t>(ValueWidth::I16);
-    case 4:
-      return static_cast<std::uint8_t>(ValueWidth::I32);
-    default:
-      return static_cast<std::uint8_t>(ValueWidth::I64);
-    }
-  }
-
-  static Opcode loadForBytes(unsigned Bytes) {
-    switch (Bytes) {
-    case 1:
-      return Opcode::LOAD8;
-    case 2:
-      return Opcode::LOAD16;
-    case 4:
-      return Opcode::LOAD32;
-    default:
-      return Opcode::LOAD64;
-    }
-  }
-
-  static Opcode storeForBytes(unsigned Bytes) {
-    return static_cast<Opcode>(static_cast<unsigned>(loadForBytes(Bytes)) + 4);
-  }
-
-  bool mapRegister(unsigned MachineReg, Reg &Mapped, std::string &Error) const {
-    if (MachineReg <= 9) {
-      Mapped = static_cast<Reg>(MachineReg);
-      return true;
-    }
-    Error = "VMP Target 产生了非通用保留寄存器 R" + utostr(MachineReg);
-    return false;
-  }
-
-  std::uint32_t addConstant(std::uint64_t Value) {
-    auto It = ConstantIndices.find(Value);
-    if (It != ConstantIndices.end())
-      return It->second;
-    const std::uint32_t Index = static_cast<std::uint32_t>(Constants.size());
-    ConstantIndices[Value] = Index;
-    Constants.push_back(Value);
-    return Index;
-  }
-
-  void emit(const VmInstruction &Inst) { Code.push_back(Inst); }
-
-  void emitConstant(Reg Dst, std::uint64_t Value) {
-    if (Value == 0) {
-      emit({.opcode = Opcode::MOV,
-            .dst = Dst,
-            .src1 = Reg::ZR,
-            .format = InstFormat::RRR});
-      return;
-    }
-    emit({.opcode = Opcode::LDC,
-          .dst = Dst,
-          .payload = addConstant(Value),
-          .format = InstFormat::CONST_POOL});
-  }
-
-  bool scanFrame(StringRef Bytes, std::string &Error) {
-    const auto *Data = reinterpret_cast<const std::uint8_t *>(Bytes.data());
-    const std::uint32_t Slots = Bytes.size() / kInstructionSize;
-    std::uint64_t Depth = 0;
-    for (std::uint32_t Slot = 0; Slot < Slots; ++Slot) {
-      const std::uint8_t Op = Data[Slot * 8];
-      if (Op == 0x18) {
-        ++Slot;
-        continue;
-      }
-      const unsigned Class = Op & 7U;
-      if (Class != 1 && Class != 2 && Class != 3)
-        continue;
-      const std::uint8_t Regs = Data[Slot * 8 + 1];
-      const unsigned Base = Class == 1 ? Regs >> 4 : Regs & 0x0fU;
-      if (Base != 10)
-        continue;
-      const std::int16_t Offset =
-          static_cast<std::int16_t>(read16(Data + Slot * 8 + 2));
-      if (Offset >= 0) {
-        Error = "VMP Target 产生了非负 FrameIndex 偏移";
-        return false;
-      }
-      Depth =
-          std::max<std::uint64_t>(Depth, -static_cast<std::int64_t>(Offset));
-    }
-    Depth = alignTo(Depth, kFrameAlignment);
-    if (Depth > kMaxFrameSize) {
-      Error = "寄存器分配后的 VM 栈帧超过 1 MiB";
-      return false;
-    }
-    FrameSize = static_cast<std::uint32_t>(Depth);
-    return true;
-  }
-
-  bool translateMemory(const std::uint8_t *Inst, std::uint8_t MachineOpcode,
-                       std::string &Error) {
-    const unsigned Class = MachineOpcode & 7U;
-    const unsigned Mode = MachineOpcode >> 5;
-    const unsigned Width = memoryWidth(MachineOpcode);
-    const unsigned DstMachine = Inst[1] & 0x0fU;
-    const unsigned SrcMachine = Inst[1] >> 4;
-    const std::int16_t MachineOffset =
-        static_cast<std::int16_t>(read16(Inst + 2));
-    Reg Base = Reg::ZR;
-    const unsigned BaseMachine = DstMachine;
-    std::int64_t Offset = MachineOffset;
-    if (BaseMachine == 10) {
-      Base = Reg::SA;
-      Offset += FrameSize;
-      if (Offset < 0 || Offset + Width > FrameSize) {
-        Error = "FrameIndex 消除后的栈访问越界";
-        return false;
-      }
-    } else if (!mapRegister(BaseMachine, Base, Error)) {
-      return false;
-    }
-
-    if (Class == 1) {
-      // LDX 的 base 位于 src nibble，而 dst 位于 dst nibble。
-      if (SrcMachine == 10) {
-        Base = Reg::SA;
-        Offset = static_cast<std::int64_t>(MachineOffset) + FrameSize;
-        if (Offset < 0 || Offset + Width > FrameSize) {
-          Error = "FrameIndex 消除后的栈 load 越界";
-          return false;
-        }
-      } else if (!mapRegister(SrcMachine, Base, Error)) {
-        return false;
-      }
-      Reg Dst = Reg::ZR;
-      if (!mapRegister(DstMachine, Dst, Error))
-        return false;
-      emit({.opcode = loadForBytes(Width),
-            .dst = Dst,
-            .src1 = Base,
-            .payload = static_cast<std::uint32_t>(Offset),
-            .format = InstFormat::MEM_SRC});
-      if (Mode == 4) {
-        emit({.opcode = Opcode::SEXT,
-              .aux = widthForBytes(Width),
-              .dst = Dst,
-              .src1 = Dst,
-              .format = InstFormat::RRR});
-      } else if (Mode != 3) {
-        Error = "VMP Target 产生了不支持的 load 模式";
-        return false;
-      }
-      return true;
-    }
-
-    if (Mode != 3) {
-      Error = "VMP Target 产生了不支持的 store 模式";
-      return false;
-    }
-    Reg Value = Reg::R12;
-    if (Class == 3) {
-      if (!mapRegister(SrcMachine, Value, Error))
-        return false;
-    } else {
-      const std::int64_t Immediate =
-          static_cast<std::int32_t>(read32(Inst + 4));
-      emitConstant(Value, static_cast<std::uint64_t>(Immediate));
-    }
-    emit({.opcode = storeForBytes(Width),
-          .dst = Base,
-          .src1 = Value,
-          .payload = static_cast<std::uint32_t>(Offset),
-          .format = InstFormat::MEM_DST});
-    return true;
-  }
-
-  static bool predicateForJump(unsigned JumpOp, IntPredicate &Predicate) {
-    switch (JumpOp) {
-    case 1:
-      Predicate = IntPredicate::EQ;
-      return true;
-    case 2:
-      Predicate = IntPredicate::UGT;
-      return true;
-    case 3:
-      Predicate = IntPredicate::UGE;
-      return true;
-    case 5:
-      Predicate = IntPredicate::NE;
-      return true;
-    case 6:
-      Predicate = IntPredicate::SGT;
-      return true;
-    case 7:
-      Predicate = IntPredicate::SGE;
-      return true;
-    case 10:
-      Predicate = IntPredicate::ULT;
-      return true;
-    case 11:
-      Predicate = IntPredicate::ULE;
-      return true;
-    case 12:
-      Predicate = IntPredicate::SLT;
-      return true;
-    case 13:
-      Predicate = IntPredicate::SLE;
-      return true;
-    default:
-      return false;
-    }
-  }
-
-  bool translateJump(const std::uint8_t *Inst, std::uint8_t MachineOpcode,
-                     std::uint32_t Slot, std::string &Error) {
-    const unsigned JumpOp = MachineOpcode >> 4;
-    const unsigned Class = MachineOpcode & 7U;
-    const bool RegisterRhs = (MachineOpcode & 8U) != 0;
-    const std::int16_t Relative = static_cast<std::int16_t>(read16(Inst + 2));
-    const std::uint32_t TargetSlot = static_cast<std::uint32_t>(
-        static_cast<std::int64_t>(Slot) + 1 + Relative);
-    if (JumpOp == 0) {
-      Fixups.push_back({Code.size(), TargetSlot});
-      emit({.opcode = Opcode::BR, .format = InstFormat::REL32});
-      return true;
-    }
-    if (JumpOp == 9) {
-      emit({.opcode = Opcode::RET});
-      return true;
-    }
-    if (JumpOp == 8) {
-      auto Call = MachineHostCalls.find(Slot);
-      if (Call == MachineHostCalls.end()) {
-        Error = "VMP 机器 CALL 缺少目标 relocation，slot=" + utostr(Slot) +
-                "，已记录=";
-        for (const auto &Entry : MachineHostCalls)
-          Error += utostr(Entry.first) + ",";
-        return false;
-      }
-      emit({.opcode = Opcode::HOSTCALL,
-            .payload = ::vllvm::vm::packHostCallPayload(
-                Call->second.FunctionIndex, Call->second.ArgumentCount),
-            .format = InstFormat::CALL});
-      return true;
-    }
-
-    Reg Lhs = Reg::ZR;
-    Reg Rhs = Reg::R13;
-    if (!mapRegister(Inst[1] & 0x0fU, Lhs, Error))
-      return false;
-    if (RegisterRhs) {
-      if (!mapRegister(Inst[1] >> 4, Rhs, Error))
-        return false;
-    } else {
-      const std::int64_t Immediate =
-          static_cast<std::int32_t>(read32(Inst + 4));
-      emitConstant(Rhs, static_cast<std::uint64_t>(Immediate));
-    }
-
-    const bool Is32 = Class == 6;
-    const bool IsSigned =
-        JumpOp == 6 || JumpOp == 7 || JumpOp == 12 || JumpOp == 13;
-    if (Is32) {
-      emit({.opcode = IsSigned ? Opcode::SEXT : Opcode::TRUNC,
-            .aux = static_cast<std::uint8_t>(ValueWidth::I32),
-            .dst = Reg::R12,
-            .src1 = Lhs,
-            .format = InstFormat::RRR});
-      emit({.opcode = IsSigned ? Opcode::SEXT : Opcode::TRUNC,
-            .aux = static_cast<std::uint8_t>(ValueWidth::I32),
-            .dst = Reg::R13,
-            .src1 = Rhs,
-            .format = InstFormat::RRR});
-      Lhs = Reg::R12;
-      Rhs = Reg::R13;
-    }
-
-    if (JumpOp == 4) {
-      emit({.opcode = Opcode::AND,
-            .aux = static_cast<std::uint8_t>(Is32 ? ValueWidth::I32
-                                                  : ValueWidth::I64),
-            .dst = Reg::R12,
-            .src1 = Lhs,
-            .src2 = Rhs,
-            .format = InstFormat::RRR});
-    } else {
-      IntPredicate Predicate = IntPredicate::EQ;
-      if (!predicateForJump(JumpOp, Predicate)) {
-        Error = "VMP Target 产生了未知条件分支";
-        return false;
-      }
-      emit({.opcode = Opcode::ICMP,
-            .aux = static_cast<std::uint8_t>(Predicate),
-            .dst = Reg::R12,
-            .src1 = Lhs,
-            .src2 = Rhs,
-            .format = InstFormat::RRR});
-    }
-    Fixups.push_back({Code.size(), TargetSlot});
-    emit({.opcode = Opcode::BRCOND,
-          .src1 = Reg::R12,
-          .format = InstFormat::REL32});
-    return true;
-  }
-
-  bool translateAlu(const std::uint8_t *Inst, std::uint8_t MachineOpcode,
-                    std::string &Error) {
-    const unsigned Class = MachineOpcode & 7U;
-    const bool Is32 = Class == 4;
-    const bool RegisterRhs = (MachineOpcode & 8U) != 0;
-    const unsigned AluOp = MachineOpcode >> 4;
-    const std::int16_t Variant = static_cast<std::int16_t>(read16(Inst + 2));
-    Reg Dst = Reg::ZR;
-    if (!mapRegister(Inst[1] & 0x0fU, Dst, Error))
-      return false;
-
-    if (AluOp == 11) {
-      if (RegisterRhs) {
-        Reg Source = Reg::ZR;
-        if (!mapRegister(Inst[1] >> 4, Source, Error))
-          return false;
-        if (Variant == 8 || Variant == 16 || Variant == 32) {
-          emit({.opcode = Opcode::SEXT,
-                .aux = widthForBytes(Variant / 8),
-                .dst = Dst,
-                .src1 = Source,
-                .format = InstFormat::RRR});
-        } else {
-          emit({.opcode = Is32 ? Opcode::TRUNC : Opcode::MOV,
-                .aux = static_cast<std::uint8_t>(Is32 ? ValueWidth::I32
-                                                      : ValueWidth::I1),
-                .dst = Dst,
-                .src1 = Source,
-                .format = InstFormat::RRR});
-          if (!Is32)
-            Code.back().aux = 0;
-        }
-      } else {
-        const std::int64_t Immediate =
-            static_cast<std::int32_t>(read32(Inst + 4));
-        const std::uint64_t Bits = Is32 ? static_cast<std::uint32_t>(Immediate)
-                                        : static_cast<std::uint64_t>(Immediate);
-        emitConstant(Dst, Bits);
-      }
-      return true;
-    }
-
-    if (AluOp == 8) {
-      emit({.opcode = Opcode::SUB,
-            .aux = static_cast<std::uint8_t>(Is32 ? ValueWidth::I32
-                                                  : ValueWidth::I64),
-            .dst = Dst,
-            .src1 = Reg::ZR,
-            .src2 = Dst,
-            .format = InstFormat::RRR});
-      return true;
-    }
-
-    Opcode Op = Opcode::INVALID;
-    switch (AluOp) {
-    case 0:
-      Op = Opcode::ADD;
-      break;
-    case 1:
-      Op = Opcode::SUB;
-      break;
-    case 2:
-      Op = Opcode::MUL;
-      break;
-    case 3:
-      Op = Variant == 1 ? Opcode::SDIV : Opcode::UDIV;
-      break;
-    case 4:
-      Op = Opcode::OR;
-      break;
-    case 5:
-      Op = Opcode::AND;
-      break;
-    case 6:
-      Op = Opcode::SHL;
-      break;
-    case 7:
-      Op = Opcode::LSHR;
-      break;
-    case 9:
-      Op = Variant == 1 ? Opcode::SREM : Opcode::UREM;
-      break;
-    case 10:
-      Op = Opcode::XOR;
-      break;
-    case 12:
-      Op = Opcode::ASHR;
-      break;
-    default:
-      Error = "VMP Target 产生了不支持的 ALU Opcode";
-      return false;
-    }
-
-    VmInstruction Output{
-        .opcode = Op,
-        .aux =
-            static_cast<std::uint8_t>(Is32 ? ValueWidth::I32 : ValueWidth::I64),
-        .dst = Dst,
-        .src1 = Dst,
-        .format = RegisterRhs ? InstFormat::RRR : InstFormat::RRI};
-    if (RegisterRhs) {
-      if (!mapRegister(Inst[1] >> 4, Output.src2, Error))
-        return false;
-    } else {
-      Output.src2 = Reg::ZR;
-      Output.payload = read32(Inst + 4);
-    }
-    emit(Output);
-    return true;
-  }
-
-  bool translateMachineCode(StringRef Bytes, std::string &Error) {
-    if ((Bytes.size() % kInstructionSize) != 0) {
-      Error = ".vmp.code 不是 64 位指令序列";
-      return false;
-    }
-    if (!scanFrame(Bytes, Error))
-      return false;
-
-    const auto *Data = reinterpret_cast<const std::uint8_t *>(Bytes.data());
-    const std::uint32_t Slots = Bytes.size() / kInstructionSize;
-    SmallVector<std::uint32_t, 128> SlotToPc(
-        Slots + 1, std::numeric_limits<std::uint32_t>::max());
-    for (std::uint32_t Slot = 0; Slot < Slots;) {
-      SlotToPc[Slot] = Code.size();
-      const std::uint8_t *Inst = Data + Slot * kInstructionSize;
-      const std::uint8_t MachineOpcode = Inst[0];
-      if (MachineOpcode == 0x18) {
-        if (Slot + 1 >= Slots) {
-          Error = "截断的 64 位 Target 常量";
-          return false;
-        }
-        Reg Dst = Reg::ZR;
-        if (!mapRegister(Inst[1] & 0x0fU, Dst, Error))
-          return false;
-        const std::uint64_t Value =
-            read32(Inst + 4) |
-            (static_cast<std::uint64_t>(read32(Data + (Slot + 1) * 8 + 4))
-             << 32);
-        emitConstant(Dst, Value);
-        SlotToPc[Slot + 1] = SlotToPc[Slot];
-        Slot += 2;
-        continue;
-      }
-
-      const unsigned Class = MachineOpcode & 7U;
-      bool Ok = false;
-      if (Class == 1 || Class == 2 || Class == 3)
-        Ok = translateMemory(Inst, MachineOpcode, Error);
-      else if (Class == 4 || Class == 7)
-        Ok = translateAlu(Inst, MachineOpcode, Error);
-      else if (Class == 5 || Class == 6)
-        Ok = translateJump(Inst, MachineOpcode, Slot, Error);
-      else
-        Error = "VMP Target 产生了不支持的机器指令类";
-      if (!Ok)
-        return false;
-      ++Slot;
-    }
-    SlotToPc[Slots] = Code.size();
-
-    for (const MachineBranchFixup &Fixup : Fixups) {
-      if (Fixup.TargetSlot >= Slots ||
-          SlotToPc[Fixup.TargetSlot] ==
-              std::numeric_limits<std::uint32_t>::max()) {
-        Error = "Target 分支指向无效的机器指令槽";
-        return false;
-      }
-      const std::int64_t Delta =
-          static_cast<std::int64_t>(SlotToPc[Fixup.TargetSlot]) -
-          static_cast<std::int64_t>(Fixup.InstructionIndex + 1);
-      if (!isInt<32>(Delta)) {
-        Error = "翻译后的 VMP REL32 分支超出范围";
-        return false;
-      }
-      Code[Fixup.InstructionIndex].payload = static_cast<std::uint32_t>(Delta);
-    }
-    return true;
-  }
-
-  bool validateGeneratedCode(std::string &Error) const {
-    for (std::uint32_t Pc = 0; Pc != Code.size(); ++Pc) {
-      const VmpTrap Trap = ::vllvm::vm::validateM3Instruction(
-          Code[Pc], Pc, Code.size(), Constants.size());
-      if (Trap != VmpTrap::None) {
-        Error = "Target 翻译结果未通过 ISA 验证，pc=" + utostr(Pc) +
-                " trap=" + utostr(static_cast<std::uint32_t>(Trap));
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool finalizeOutput(CompiledFunction &Output, std::string &Error) const {
-    const std::uint64_t CodeSize =
-        static_cast<std::uint64_t>(Code.size()) * kInstructionSize;
-    if (CodeSize > std::numeric_limits<std::uint32_t>::max() ||
-        Constants.size() > std::numeric_limits<std::uint32_t>::max()) {
-      Error = "VMP 指令表或常量表超过 32 位 ABI 尺寸上限";
-      return false;
-    }
-    Output.Code.clear();
-    Output.Code.reserve(Code.size());
-    for (const VmInstruction &Inst : Code)
-      Output.Code.push_back(Inst.encode());
-    Output.Constants = Constants;
-    Output.HostCalls.assign(HostCalls.begin(), HostCalls.end());
-    Output.FrameSize = FrameSize;
-    return true;
-  }
-};
 
 void emitMissed(Function &F, StringRef Reason) {
   OptimizationRemarkEmitter ORE(&F);
@@ -1382,8 +642,7 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
   if (!Compiled.HostCalls.empty()) {
     SmallVector<Constant *, 16> Entries;
     Entries.reserve(Compiled.HostCalls.size());
-    for (const CompiledFunction::HostCallTarget &HostCall :
-         Compiled.HostCalls)
+    for (const CompiledFunction::HostCallTarget &HostCall : Compiled.HostCalls)
       Entries.push_back(HostCall.Target);
     ArrayType *FunctionTableType =
         ArrayType::get(PointerType::getUnqual(Context), Entries.size());
@@ -1476,7 +735,7 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
   for (Function *F : Candidates) {
     std::string Reason;
     if (!SupportedTarget)
-      Reason = "M3 仅支持 64 位小端 AArch64 目标";
+      Reason = "仅支持 64 位小端 AArch64";
     std::unique_ptr<Module> PreparedModule;
     Function *PreparedFunction = nullptr;
     std::vector<CompiledFunction::HostCallTarget> HostCalls;
@@ -1494,21 +753,28 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
             Ignorable.push_back(&I);
         for (Instruction *I : Ignorable)
           I->eraseFromParent();
-        // 在临时 Module 内显式形成 branch+PHI，Target 不需要依赖宿主优化
-        // 级别决定 select/switch 的最终形状。
+        // 将 select 指令转换成 branch + PHI
         lowerSelects(*PreparedFunction);
+        // 将 switch 指令转换成 if else
         lowerSwitches(*PreparedFunction);
+        // 判断是否可以进行虚拟化
         Reason = checkEligibility(*PreparedFunction);
         if (Reason.empty() &&
+            // 提取目标函数内所有的函数调用
             !lowerHostCalls(*PreparedFunction, M, HostCalls, Reason))
           Reason = Reason.empty() ? "HOSTCALL lowering 失败" : Reason;
       }
     }
     if (Reason.empty()) {
       CompiledFunction Result;
-      TargetBytecodeCompiler Compiler(*PreparedFunction, HostCalls);
-      if (Compiler.compile(Result, Reason)) {
+      VMPCodegenResult Codegen;
+      FunctionCompiler Compiler(*PreparedFunction);
+      if (Compiler.compile(Codegen, Reason)) {
         Result.Source = F;
+        Result.Code = std::move(Codegen.Code);
+        Result.Constants = std::move(Codegen.ValueTable);
+        Result.HostCalls = std::move(HostCalls);
+        Result.FrameSize = Codegen.FrameSize;
         Compiled.push_back(std::move(Result));
         continue;
       }
@@ -1521,11 +787,9 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
     return RestoredPreparation ? PreservedAnalyses::none()
                                : PreservedAnalyses::all();
 
-  // 优化器可能把仅在当前 Module 内使用的普通 C 函数改成 fastcc。资格检查已
-  // 保证这些目标没有地址逃逸且所有用途都是直接 fastcc 调用；统一改回 C 后，
-  // FunctionTable 才能安全保存其真实地址供通用 AArch64 trampoline 调用。
+  // 对于已经编译好的函数，统一将调用约定为 fasscc 的函数修改为 C 函数调用约定
   normalizeFastHostCallTargets(Compiled);
-
+  // 链入 VMP 运行时
   std::string RuntimeError;
   if (!linkRuntime(M, RuntimeError)) {
     for (CompiledFunction &Result : Compiled) {
@@ -1536,6 +800,7 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
   }
 
   unsigned TableId = 0;
+  // 修改原函数为调用 VMP 函数
   for (CompiledFunction &Result : Compiled) {
     std::string Error;
     if (!installWrapper(M, Result, TableId++, Error)) {

@@ -31,7 +31,8 @@ VMP 将选定函数的原生实现替换为自定义字节码，并在运行时�
 1. 按函数选择性保护，不影响未标记函数的正常原生编译。
 2. 尽可能保持 LLVM IR 的整数、浮点、内存和控制流语义。
 3. 使用寄存器型 VM，降低全内存型 VM 的解释开销。
-4. 使用真实寄存器分配，只在寄存器压力过高时 spill 到 VM 栈。
+4. M3 使用确定性的 SSA 栈槽分配保证任意寄存器压力下的正确性；后续再用活跃
+   区间分配把热点值提升到 `R0-R13`。
 5. 支持多线程并发，不使用进程级可变 VM 全局状态；递归不属于 V1 范围。
 6. 字节码、常量池和调用信息可以按函数独立变换。
 7. 不支持的函数安全回退为原生实现。
@@ -64,8 +65,10 @@ VMP 将选定函数的原生实现替换为自定义字节码，并在运行时�
 | 常量 | 32 位立即数或函数级 64 位常量池 |
 | 指令类型 | 由 Opcode、Aux 和 InstFormat 共同决定 |
 
-因此本设计不会恢复早期方案中的独立浮点寄存器、FLAGS、SP/BP，也不会把所有
-LLVM Value 固定映射到内存槽。`SA` 是唯一暴露给指令的 VM 栈帧地址寄存器。
+因此本设计不会恢复早期方案中的独立浮点寄存器、FLAGS、SP/BP。M3 Direct
+CodeGen 会先为 SSA 值分配确定性栈槽，并使用 `R10-R12` 完成实际指令运算；
+这是编译器实现策略，不改变 VM 的寄存器型 ISA。`SA` 是唯一暴露给指令的 VM
+栈帧地址寄存器。
 
 ## 3. 威胁模型
 
@@ -111,7 +114,7 @@ VMP 分为构建期保护器和运行时解释器两部分。
                               +-- 资格检查
                               +-- IR 合法化
                               +-- VMP 指令选择
-                              +-- 寄存器分配
+                              +-- SSA 栈槽与工作寄存器分配
                               +-- 字节码编码与验证
                               +-- （M5）Opcode 映射/加密
                               +-- 嵌入代码/常量全局表
@@ -136,7 +139,7 @@ VMP 分为构建期保护器和运行时解释器两部分。
 | `VmpEligibility` | 检查函数是否属于当前支持范围 |
 | `VmpIRPreparation` | 降低复杂 IR，规范类型和控制流 |
 | `VMP Target` | 将 LLVM IR 编译为明文 VMP 指令 |
-| `VmpObjectExtractor` | 提取代码、常量和符号引用 |
+| `FunctionCompiler` | 共享的 LLVM Function 到 `VMPCodegenResult` 直接编译核心 |
 | `VmpTableBuilder` | 构造独立代码表、常量表和 HOSTCALL 目标地址表 |
 | `VmpTransformer` | 执行 Opcode 映射、常量编码和指令加密 |
 | `VmpModuleEmbedder` | 嵌入全局表并生成原生包装函数 |
@@ -409,8 +412,8 @@ SA = address(stack)
 ```
 
 这里冻结当前语义：`SA` 保存包装函数所分配 VM 栈区域内的宿主地址，而不是抽象
-FrameIndex 或整数槽编号。编译期间可以使用 FrameIndex，必须在生成最终字节码前
-消除成 `SA + signedPayload`。
+FrameIndex 或整数槽编号。Direct CodeGen 在编译期间直接计算确定性栈槽偏移，
+生成最终字节码前将所有内部栈访问固定为 `SA + signedPayload`。
 
 函数执行 `RET` 时把 `R0` 交给顶层包装函数并结束当前 VMContext。
 
@@ -478,8 +481,9 @@ left  -> merge: x = a
 right -> merge: x = b
 ```
 
-使用 LLVM Machine CodeGen 时由标准 PHI 消除流程处理。critical edge 必要时
-拆分；并行复制形成环时使用临时寄存器或临时 spill slot，不能顺序覆盖源值。
+M3 Direct CodeGen 在每条前驱边上生成复制。它先把该边所有 incoming value
+写入专用 PHI 临时栈槽，再统一写入目标 PHI 栈槽，因此 critical edge 和并行
+复制环都不会顺序覆盖源值。
 
 ### 10.3 分支验证
 
@@ -532,6 +536,9 @@ Payload 同时保存参数数量和表索引：
 +--------------------+--------------------------------+
 ```
 
+`argc` 字段保持 8 位编码以维持指令布局稳定，但当前统一 bridge 只接受
+`0..15`；验证器、解释器和编译期资格检查都拒绝 `16..255`。
+
 编译期扫描所有直接 `call` 并按原目标函数去重。所有目标共用：
 
 ```cpp
@@ -539,9 +546,10 @@ uint64_t bridge(uint64_t *registers, uint64_t *stackArgs,
                 uint32_t argc, void *funcaddr);
 ```
 
-前六个参数位于 `R0-R5`。第七、八个参数暂存在 `stackArgs[0..1]`，bridge 将其
-装入 AArch64 `x6/x7`；第九个及后续参数由 Pass 按最终宿主 ABI 布局到
-`stackArgs + 16`，bridge 复制到宿主 SP。寄存器小整数根据调用点的
+bridge 根据 `argc` 分发 `0..15` 参数调用。前六个参数位于 `R0-R5`。第七、
+八个参数暂存在 `stackArgs[0..1]`，bridge 将其装入 AArch64 `x6/x7`；第九至
+第十五个参数由 Pass 按最终宿主 ABI 布局到 `stackArgs + 16`，bridge 复制到
+宿主 SP。寄存器小整数根据调用点的
 `signext/zeroext` 属性提前扩展；macOS 栈参数则按其原生 1/2/4/8 字节紧凑规则
 预排。专用 outgoing-argument 区位于 VM frame 尾部，按 16 字节对齐，
 并与 alloca/spill 隔离。目标返回的 `x0` 直接作为 `uint64_t` R0；void 调用会忽略
@@ -691,18 +699,19 @@ Trap 编号保持稳定，其中 VM 调用和镜像版本相关编号仅为 ABI 
 
 ```text
 标记函数
-  -> 完整资格检查
   -> 克隆到临时 Module
-  -> IR 规范化/合法化
-  -> VMP 指令选择
-  -> Machine SSA
-  -> PHI 消除
-  -> 活跃区间分析
-  -> LLVM 寄存器分配
-  -> spill/reload 和栈帧布局
-  -> 分支/重定位修正
+  -> 删除可丢弃 intrinsic
+  -> select/switch 规范化
+  -> 完整资格检查
+  -> 直接 call/HOSTCALL lowering
+  -> VMP Direct IR 指令选择
+  -> SSA 值/alloca/PHI 临时区栈槽布局
+  -> R10-R12 工作寄存器指令生成
+  -> PHI 前驱边并行复制
+  -> REL32 分支修正
   -> 明文字节码验证
-  -> 构造独立代码表和常量表
+  -> 返回 VMPCodegenResult
+  -> 构造独立代码表、常量表和函数表
   -> 保护变换
   -> 嵌入原 Module
   -> 替换原函数
@@ -711,14 +720,154 @@ Trap 编号保持稳定，其中 VM 调用和镜像版本相关编号仅为 ABI 
 ### 14.2 MVP 支持的 LLVM IR
 
 - 标量 `i1/i8/i16/i32/i64`；
-- 64 位指针；
+- `addrspace(0)` 的 64 位指针；
 - 整数算术、位运算、移位和比较；
 - `trunc/zext/sext/bitcast`；
 - 静态 `alloca`；
 - 普通 `load/store`；
 - `br`、条件 `br`、PHI、select/switch 降级、循环和 `ret`；
-- 最多 255 个整数/指针参数的直接 `call`，以及整数、指针或 void 返回；
+- 最多 15 个整数/指针参数的直接 `call`，以及整数、指针或 void 返回；
 - 32 位立即数和函数级常量池。
+
+候选顶层函数必须有定义、使用默认 C 调用约定、不是可变参数或 `naked` 函数，
+并且最多有 6 个整数或普通指针参数。返回值只能是 void、受支持整数或普通指针。
+M3 只面向 64 位小端 AArch64。
+
+`select` 和 `switch` 不是最终 VM 指令。Pass 在资格检查前执行：
+
+```text
+select -> br + PHI
+switch -> icmp + br 组成的平衡控制流树
+```
+
+### 14.3 当前不支持的 LLVM IR
+
+资格检查采用白名单。下面的指令或不满足约束的指令会产生
+`OptimizationRemarkMissed`，候选函数保留原生实现。
+
+#### 14.3.1 不支持的类型
+
+- `i2/i4/i24/i48/i128` 等非 `i1/i8/i16/i32/i64` 整数；
+- `half/bfloat/float/double/fp128` 等浮点类型；
+- fixed vector 和 scalable vector；
+- struct、array 等聚合 SSA 值；
+- 非零地址空间指针；
+- 聚合、向量或浮点函数参数和返回值。
+
+#### 14.3.2 不支持的指令 Opcode
+
+| 分类 | 当前不支持 |
+|---|---|
+| 终结指令 | `indirectbr`、`invoke`、`resume`、`cleanupret`、`catchret`、`catchswitch`、`callbr` |
+| 浮点一元/二元 | `fneg`、`fadd`、`fsub`、`fmul`、`fdiv`、`frem` |
+| 内存与原子 | `getelementptr`、`fence`、`cmpxchg`、`atomicrmw` |
+| 浮点转换 | `fptoui`、`fptosi`、`uitofp`、`sitofp`、`fptrunc`、`fpext` |
+| 指针转换 | `ptrtoint`、`inttoptr`、`addrspacecast` |
+| 异常 funclet | `cleanuppad`、`catchpad`、`landingpad` |
+| 浮点比较 | `fcmp` |
+| 可变参数 | `va_arg` |
+| 向量 | `extractelement`、`insertelement`、`shufflevector` |
+| 聚合 | `extractvalue`、`insertvalue` |
+| Poison 固化 | `freeze` |
+| LLVM 内部 | `UserOp1`、`UserOp2` |
+
+`ptrtoint/inttoptr` 不能出现在候选函数的输入 IR 中；Pass 在资格检查完成后为了包装
+参数和 HOSTCALL 返回值而内部生成的转换不受此限制。
+
+#### 14.3.3 条件支持指令
+
+| 指令 | 限制 |
+|---|---|
+| `add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr` | 只能操作 `i1/i8/i16/i32/i64` 标量；不支持浮点、向量和 `i128` |
+| `alloca` | 必须是静态单个标量分配；不能是动态或数组分配；对齐不得超过 16 字节 |
+| `load/store` | 必须非 volatile、非 atomic，访问值必须是受支持标量 |
+| `trunc/zext/sext` | 源和目标都必须是受支持整数类型 |
+| `bitcast` | 源和目标都必须是受支持标量，并满足 LLVM 自身的等宽要求 |
+| `icmp` | 目标能力只覆盖受支持整数/普通指针比较 |
+| `PHI` | 目标能力只覆盖受支持标量；Direct CodeGen 在前驱边使用临时槽消除 |
+| `select` | 先降为 `br + PHI`，不直接进入 VMP Target |
+| `switch` | 先降为 `icmp + br`，不直接进入 VMP Target |
+| `call` | 仅支持满足下一节 ABI 契约的静态直接调用 |
+
+全局符号地址尚未成为正式支持能力；如果此类访问通过前置白名单，仍会在 VMP
+Target 指令选择或纯流验证阶段事务式回退。
+
+#### 14.3.4 不支持的调用形式
+
+HOSTCALL 不支持：
+
+- 间接函数指针调用；
+- inline asm；
+- `invoke/callbr`；
+- `musttail`；
+- operand bundle；
+- 可变参数目标；
+- 参数超过 15 个；
+- 调用点与目标 `FunctionType` 或调用约定不一致；
+- 浮点、聚合、向量或非零地址空间指针参数；
+- 浮点、聚合或向量返回值；
+- `byval/sret/inalloca/inreg/nest/swiftself/swifterror` 特殊 ABI 属性；
+- 无法通过 `stripPointerCasts()` 静态解析为 `Function` 的别名或其他目标。
+
+调用约定只支持 C，以及可安全规范化为 C 的内部 `fastcc`。以下 `fastcc` 目标回退：
+
+- 只有声明或不是当前 Module 的内部定义；
+- 地址已经逃逸；
+- 存在非直接调用用途；
+- 调用点调用约定不一致；
+- 存在 `musttail` 调用。
+
+#### 14.3.5 不支持的 intrinsic
+
+只有以下 intrinsic 会从临时 CodeGen 克隆中删除：
+
+```text
+llvm.dbg.declare
+llvm.dbg.value
+llvm.dbg.assign
+llvm.dbg.label
+llvm.lifetime.start
+llvm.lifetime.end
+llvm.assume
+```
+
+其他 intrinsic 当前全部不支持，包括但不限于：
+
+```text
+llvm.memcpy / llvm.memmove / llvm.memset
+llvm.trap / llvm.expect
+llvm.ctpop / llvm.ctlz / llvm.cttz / llvm.bswap
+llvm.fshl / llvm.fshr
+llvm.*.with.overflow
+llvm.umin / llvm.umax / llvm.smin / llvm.smax
+llvm.objectsize
+llvm.stacksave / llvm.stackrestore
+```
+
+VM ISA 虽然已经定义 `TRAP`，但当前没有把 `llvm.trap` lowering 为 VM `TRAP`，
+因此候选函数中出现 `llvm.trap` 仍然回退。
+
+#### 14.3.6 ICMP/PHI 类型检查
+
+`checkEligibility()` 会显式验证 `ICmpInst` 操作数和 `PHINode` 结果类型。vector、
+聚合或超宽整数不会进入 Direct CodeGen，而会产生明确 Remark 并事务式回退，
+避免把类型错误推迟到指令选择阶段。
+
+#### 14.3.7 字节码层暂不执行的 Opcode
+
+以下 Opcode 数值已经冻结，但 M3 验证器和解释器将其判定为
+`INVALID_OPCODE`：
+
+```text
+INVALID
+VMCALL
+
+SITOFP / UITOFP / FPTOSI / FPTOUI / FPEXT / FPTRUNC
+FADD32 / FSUB32 / FMUL32 / FDIV32 / FNEG32 / FCMP32
+FADD64 / FSUB64 / FMUL64 / FDIV64 / FNEG64 / FCMP64
+```
+
+VMP ISA 当前没有 `FREM32/FREM64`。`VMCALL` 只保留稳定编号，不提供 VM 间调用。
 
 后续增加：
 
@@ -727,17 +876,7 @@ Trap 编号保持稳定，其中 VM 调用和镜像版本相关编号仅为 ABI 
 - 全局符号；
 - 聚合参数和返回值。
 
-暂不支持：
-
-- `invoke/landingpad/resume`；
-- 原子和复杂内存序；
-- vector/scalable vector；
-- 可变参数；
-- inline asm；
-- 动态 `alloca`；
-- 无法描述的间接调用。
-
-### 14.3 安全回退
+### 14.4 安全回退
 
 函数虚拟化必须是事务式操作。在字节码生成、全局表构造和包装函数全部成功之前，
 不得删除或修改原函数体。
@@ -749,82 +888,95 @@ Trap 编号保持稳定，其中 VM 调用和镜像版本相关编号仅为 ABI 
 3. 不留下不完整代码表或常量表；
 4. 继续处理其他函数。
 
-## 15. 真实寄存器分配
+## 15. Direct IR 指令选择与栈槽分配
 
-VMP 字节码生成不能从 LLVM Value 直接映射到 4 位物理寄存器。中间阶段必须使用
-LLVM 虚拟寄存器：
-
-```text
-%3:gpr64 = ADDrr %1:gpr64, %2:gpr64
-```
-
-LLVM 通用寄存器分配器随后将其转换为：
+VMP Target 不再借用其他 Target 的 Machine Opcode。M3 直接遍历合法化后的 LLVM
+IR，并立即选择冻结的 VMP Opcode：
 
 ```text
-ADDrr R7, R2, R5
+LLVM add i64 %a, %b
+  -> LOAD64 R10, [SA + slot(a)]
+  -> LOAD64 R11, [SA + slot(b)]
+  -> ADD R12, R10, R11
+  -> STORE64 [SA + slot(result)], R12
 ```
 
-寄存器不足时自动插入：
+参数、SSA 结果、静态 alloca、PHI 并行复制临时区和 HOSTCALL outgoing 区统一
+参加确定性帧布局。outgoing 区固定在帧尾；所有 `SA` 访问继续经过解释器边界
+检查。该基线会把 SSA 值全部保存在栈槽中，因此不存在“活跃值超过物理寄存器数”
+导致编译失败的问题。
 
-```text
-STORE64 [SA + spillOffset], R7
-LOAD64  R4, [SA + spillOffset]
-```
+后续性能阶段可以在不改变指令流格式的前提下加入活跃区间分析：
 
-VMP Target 需要提供：
+- 将不跨基本块或不跨 HOSTCALL 的热点值提升到 `R0-R13`；
+- 寄存器不足时仍使用当前栈槽作为 spill home；
+- `R0-R5` 在 HOSTCALL 前按 ABI 装载，`R0` 接收返回值；
+- `SA/ZR` 始终保留。
 
-- `GPR64` 寄存器类；
-- `SA/ZR` 保留规则；
-- `copyPhysReg()`；
-- `storeRegToStackSlot()`；
-- `loadRegFromStackSlot()`；
-- `eliminateFrameIndex()`；
-- 调用保存寄存器规则。
+## 16. 独立 VMP Target 与纯 CodeGen 流
 
-## 16. LLVM BPF 后端的作用
-
-BPF 后端只作为 VMP Target 的实现模板，因为它同样具有固定 64 位指令、4 位
-寄存器编号和 32 位立即数字段。
-
-从 `llvm/lib/Target/BPF` 复制并精简出 `llvm/lib/Target/VMP`：
+`llvm/lib/Target/VMP` 是独立的显式 Target，注册名为 `vmp`。它不包含、不编译、
+不链接 LLVM BPF Target 的源码，也不存在 BPF Opcode、BPF 寄存器、BPF ABI
+或 BPF relocation。
 
 ```text
 VMP/
-├── VMP.td
-├── VMPRegisterInfo.td
-├── VMPInstrFormats.td
-├── VMPInstrInfo.td
-├── VMPCallingConv.td
-├── VMPFrameLowering.{h,cpp}
-├── VMPISelLowering.{h,cpp}
-├── VMPISelDAGToDAG.cpp
-├── VMPInstrInfo.{h,cpp}
-├── VMPRegisterInfo.{h,cpp}
-├── VMPSubtarget.{h,cpp}
-├── VMPTargetMachine.{h,cpp}
-├── VMPAsmPrinter.cpp
+├── VMP.h
+├── VMPCodeGenerator.cpp
+├── VMPFunctionCompiler.cpp
+├── VMPInit.cpp
 ├── MCTargetDesc/
+│   └── VMPMCInit.cpp
 └── TargetInfo/
+    ├── VMPTargetInfo.h
+    └── VMPTargetInfo.cpp
 ```
 
-复用：
+`VMPTargetMachine` 直接安装 Module CodeGen Pass。它不创建临时 ELF/Mach-O/COFF，
+不经过 MC code emitter 或 object writer，也没有 `translateMachineCode()`。
+`VmpPass` 直接调用共享 `FunctionCompiler` 取得结构化结果，不再为了内部调用先
+序列化再解析。`llc -march=vmp` 复用同一个 `FunctionCompiler`，然后由
+`VMPCodeEmitterPass` 将结果序列化为以下小端纯流：
 
-- LLVM Target 工程结构；
-- TableGen 接入方式；
-- SelectionDAG 流程；
-- FrameLowering 接口；
-- MC 编码和 Object 输出结构；
-- LLVM 通用寄存器分配基础设施。
+```text
+offset  size  field
+0       4     magic = "VMPC"
+4       2     version = 1
+6       2     headerSize = 32
+8       4     totalSize
+12      4     instructionCount
+16      4     valueCount
+20      4     frameSize
+24      4     entryPc（M3 为 0）
+28      4     flags/reserved（M3 为 0）
+32      ...   instructionCount 个 uint64_t VMP 指令
+...     ...   valueCount 个 uint64_t 常量
+```
 
-替换或删除：
+HOSTCALL 的 function index 和 argc 已经直接编码进 `HOSTCALL` Payload，不使用符号
+relocation。该 VMPC 流只用于 `llc` 独立输出和调试，不是 VmpPass 的内部交换格式，
+也不是运行时连续镜像；VmpPass 直接取得结构化结果并分别嵌入 Code、Value 和
+Function 三张只读全局表。
 
-- BPF Opcode 和编码；
-- BPF 寄存器和 ABI；
-- BPF verifier 约束；
-- BTF、CO-RE、map 和 kernel helper；
-- BPF 专用原子及内核语义。
+核心编译器通过普通头文件公开：
 
-BPF 不参与最终运行，解释器执行的是自定义 VMP 字节码。
+```cpp
+struct VMPCodegenResult {
+  std::vector<uint64_t> Code;
+  std::vector<uint64_t> ValueTable;
+  uint32_t FrameSize;
+};
+
+class FunctionCompiler {
+public:
+  explicit FunctionCompiler(Function &);
+  bool compile(VMPCodegenResult &, std::string &Error);
+};
+```
+
+该接口不暴露 VmpPass 私有的 `CompiledFunction`，也不包含宿主 `Function*` 表。
+`VmpPass` 和 `VMPCodeEmitterPass` 都调用该接口；区别仅是前者直接嵌入结构化
+结果，后者为了 `llc` 独立输出能力额外序列化 VMPC。
 
 ## 17. 字节码保护
 
@@ -880,7 +1032,7 @@ M3 不编码 ValueTable。M5 可以按函数独立编码常量，解码时结合
 优化顺序：
 
 1. 正确性和可验证性；
-2. 真实寄存器分配，减少全栈访问；
+2. 活跃区间寄存器提升，减少 M3 基线的全栈访问；
 3. 常用 RRI 指令，减少 LDC；
 4. Handler 内联和高效分派；
 5. 基本块级批量解密；
@@ -908,10 +1060,10 @@ M3 不编码 ValueTable。M5 可以按函数独立编码常量，解码时结合
 - PHI 和 critical edge；
 - 循环和多出口控制流；
 - 参数、返回值和调用保存规则；
-- 超过 14 个活跃值时的 spill/reload；
-- 栈帧偏移和 FrameIndex 消除；
+- 超过 14 个活跃值时仍能通过确定性栈槽正确执行；
+- 栈帧偏移、PHI 临时区和 HOSTCALL 帧尾 outgoing 区；
 - 分支 fixup 和常量池索引；
-- `-verify-machineinstrs`。
+- VMPC Header、尺寸、端序和直接 Opcode 编码。
 
 ### 20.3 差分测试
 
@@ -951,8 +1103,9 @@ M3 不编码 ValueTable。M5 可以按函数独立编码常量，解码时结合
 
 - 建立 VMP Target；
 - 支持基础整数 IR；
-- LLVM 完成 PHI 和寄存器分配；
-- 高寄存器压力产生正确 spill/reload。
+- Direct CodeGen 完成 PHI 边复制和确定性栈槽分配；
+- `llc -march=vmp` 直接输出 VMPC 纯流；
+- 高寄存器压力正确执行。
 
 ### M3：端到端函数保护
 
@@ -981,8 +1134,8 @@ M3 不编码 ValueTable。M5 可以按函数独立编码常量，解码时结合
 
 1. 手工字节码和 LLVM 生成字节码共用同一套解释器语义；
 2. `if/else`、循环、PHI、整数运算和普通内存访问正确；
-3. LLVM 通用寄存器分配器实际参与分配并能产生 spill/reload；
-4. 高压力函数可以正确 spill/reload；
+3. 不经过 BPF Opcode、临时对象文件或机器码二次翻译；
+4. 高压力函数可以通过 SSA 栈槽正确执行；
 5. 标记函数通过包装函数进入解释器执行；
 6. 普通函数仍由宿主后端原生编译；
 7. 不支持的函数不被破坏，并产生明确诊断；
@@ -1003,6 +1156,4 @@ M3 的栈上限/对齐、六参数限制、回退范围、`ConversionMode` 和 `
 
 - [LLVM Writing an LLVM Backend](https://llvm.org/docs/WritingAnLLVMBackend.html)
 - [LLVM Target-Independent Code Generator](https://llvm.org/docs/CodeGenerator.html)
-- [LLVM 21.1.0 BPF Target](https://github.com/llvm/llvm-project/tree/llvmorg-21.1.0/llvm/lib/Target/BPF)
-- [LLVM Greedy Register Allocator](https://github.com/llvm/llvm-project/blob/llvmorg-21.1.0/llvm/lib/CodeGen/RegAllocGreedy.cpp)
 - [xVMP](https://github.com/GANGE666/xVMP)
