@@ -42,3 +42,314 @@ index 7046f2f4b..11fea9346 100644
  add_subdirectory(CFGuard)
  add_subdirectory(HipStdPar)
 +add_subdirectory(VLLVM)
+diff --git a/llvm/include/llvm/AsmParser/LLToken.h b/llvm/include/llvm/AsmParser/LLToken.h
+index c7e4bdf3f..5a46e6608 100644
+--- a/llvm/include/llvm/AsmParser/LLToken.h
++++ b/llvm/include/llvm/AsmParser/LLToken.h
+@@ -166,6 +166,7 @@ enum Kind {
+   kw_preserve_allcc,
+   kw_preserve_nonecc,
+   kw_ghccc,
++  kw_icallcc,
+   kw_x86_intrcc,
+   kw_hhvmcc,
+   kw_hhvm_ccc,
+diff --git a/llvm/include/llvm/IR/CallingConv.h b/llvm/include/llvm/IR/CallingConv.h
+index d68491eb5..4f2c16c93 100644
+--- a/llvm/include/llvm/IR/CallingConv.h
++++ b/llvm/include/llvm/IR/CallingConv.h
+@@ -284,6 +284,10 @@ namespace CallingConv {
+     RISCV_VLSCall_32768 = 122,
+     RISCV_VLSCall_65536 = 123,
+
++    /// VLLVM indirect-call trampoline convention. Regular arguments use the
++    /// platform AArch64 PCS; one extra nest integer argument is passed in X19.
++    ICall = 124,
++
+     /// The highest possible ID. Must be some 2^k - 1.
+     MaxID = 1023
+   };
+diff --git a/llvm/lib/AsmParser/LLLexer.cpp b/llvm/lib/AsmParser/LLLexer.cpp
+index ce813e1d7..5a1ff19b8 100644
+--- a/llvm/lib/AsmParser/LLLexer.cpp
++++ b/llvm/lib/AsmParser/LLLexer.cpp
+@@ -664,6 +664,7 @@ lltok::Kind LLLexer::LexIdentifier() {
+   KEYWORD(preserve_allcc);
+   KEYWORD(preserve_nonecc);
+   KEYWORD(ghccc);
++  KEYWORD(icallcc);
+   KEYWORD(x86_intrcc);
+   KEYWORD(hhvmcc);
+   KEYWORD(hhvm_ccc);
+diff --git a/llvm/lib/AsmParser/LLParser.cpp b/llvm/lib/AsmParser/LLParser.cpp
+index b7f6950f6..10c1e51a3 100644
+--- a/llvm/lib/AsmParser/LLParser.cpp
++++ b/llvm/lib/AsmParser/LLParser.cpp
+@@ -2247,6 +2247,7 @@ bool LLParser::parseOptionalCallingConv(unsigned &CC) {
+   case lltok::kw_preserve_allcc: CC = CallingConv::PreserveAll; break;
+   case lltok::kw_preserve_nonecc:CC = CallingConv::PreserveNone; break;
+   case lltok::kw_ghccc:          CC = CallingConv::GHC; break;
++  case lltok::kw_icallcc:        CC = CallingConv::ICall; break;
+   case lltok::kw_swiftcc:        CC = CallingConv::Swift; break;
+   case lltok::kw_swifttailcc:    CC = CallingConv::SwiftTail; break;
+   case lltok::kw_x86_intrcc:     CC = CallingConv::X86_INTR; break;
+diff --git a/llvm/lib/IR/AsmWriter.cpp b/llvm/lib/IR/AsmWriter.cpp
+index 145ef10f2..daf2f674a 100644
+--- a/llvm/lib/IR/AsmWriter.cpp
++++ b/llvm/lib/IR/AsmWriter.cpp
+@@ -346,6 +346,7 @@ static void PrintCallingConv(unsigned cc, raw_ostream &Out) {
+   case CallingConv::PreserveNone:  Out << "preserve_nonecc"; break;
+   case CallingConv::CXX_FAST_TLS:  Out << "cxx_fast_tlscc"; break;
+   case CallingConv::GHC:           Out << "ghccc"; break;
++  case CallingConv::ICall:         Out << "icallcc"; break;
+   case CallingConv::Tail:          Out << "tailcc"; break;
+   case CallingConv::GRAAL:         Out << "graalcc"; break;
+   case CallingConv::CFGuard_Check: Out << "cfguard_checkcc"; break;
+diff --git a/llvm/lib/IR/Function.cpp b/llvm/lib/IR/Function.cpp
+index 7a03663e1..9eb017c6b 100644
+--- a/llvm/lib/IR/Function.cpp
++++ b/llvm/lib/IR/Function.cpp
+@@ -1185,6 +1185,7 @@ bool llvm::CallingConv::supportsNonVoidReturnType(CallingConv::ID CC) {
+   case CallingConv::Fast:
+   case CallingConv::Cold:
+   case CallingConv::GHC:
++  case CallingConv::ICall:
+   case CallingConv::HiPE:
+   case CallingConv::AnyReg:
+   case CallingConv::PreserveMost:
+diff --git a/llvm/lib/IR/Verifier.cpp b/llvm/lib/IR/Verifier.cpp
+index 9afbefb8c..d72fb3fa5 100644
+--- a/llvm/lib/IR/Verifier.cpp
++++ b/llvm/lib/IR/Verifier.cpp
+@@ -2931,6 +2931,20 @@ void Verifier::visitFunction(const Function &F) {
+   default:
+   case CallingConv::C:
+     break;
++  case CallingConv::ICall: {
++    unsigned IndexArgs = 0;
++    for (unsigned I = 0; I < NumArgs; ++I) {
++      if (!Attrs.hasParamAttr(I, Attribute::Nest))
++        continue;
++      ++IndexArgs;
++      Check(F.getArg(I)->getType()->isIntegerTy(32),
++            "icallcc index parameter must be i32!", &F);
++    }
++    Check(IndexArgs == 1,
++          "icallcc requires exactly one nest i32 index parameter!", &F);
++    Check(!F.isVarArg(), "icallcc does not support varargs!", &F);
++    break;
++  }
+   case CallingConv::X86_INTR: {
+     Check(F.arg_empty() || Attrs.hasParamAttr(0, Attribute::ByVal),
+           "Calling convention parameter requires byval", &F);
+@@ -3639,6 +3653,20 @@ void Verifier::visitCallBase(CallBase &Call) {
+   Check(verifyAttributeCount(Attrs, Call.arg_size()),
+         "Attribute after last parameter!", Call);
+
++  if (Call.getCallingConv() == CallingConv::ICall) {
++    unsigned IndexArgs = 0;
++    for (unsigned I = 0; I < Call.arg_size(); ++I) {
++      if (!Attrs.hasParamAttr(I, Attribute::Nest))
++        continue;
++      ++IndexArgs;
++      Check(Call.getArgOperand(I)->getType()->isIntegerTy(32),
++            "icallcc index parameter must be i32!", Call);
++    }
++    Check(IndexArgs == 1,
++          "icallcc requires exactly one nest i32 index parameter!", Call);
++    Check(!FTy->isVarArg(), "icallcc does not support varargs!", Call);
++  }
++
+   Function *Callee =
+       dyn_cast<Function>(Call.getCalledOperand()->stripPointerCasts());
+   bool IsIntrinsic = Callee && Callee->isIntrinsic();
+diff --git a/llvm/lib/Target/AArch64/AArch64CallingConvention.h b/llvm/lib/Target/AArch64/AArch64CallingConvention.h
+index 63185a97c..f718da0a1 100644
+--- a/llvm/lib/Target/AArch64/AArch64CallingConvention.h
++++ b/llvm/lib/Target/AArch64/AArch64CallingConvention.h
+@@ -19,6 +19,15 @@ namespace llvm {
+ bool CC_AArch64_AAPCS(unsigned ValNo, MVT ValVT, MVT LocVT,
+                       CCValAssign::LocInfo LocInfo, ISD::ArgFlagsTy ArgFlags,
+                       CCState &State);
++bool CC_AArch64_ICall_AAPCS(unsigned ValNo, MVT ValVT, MVT LocVT,
++                            CCValAssign::LocInfo LocInfo,
++                            ISD::ArgFlagsTy ArgFlags, CCState &State);
++bool CC_AArch64_ICall_DarwinPCS(unsigned ValNo, MVT ValVT, MVT LocVT,
++                                CCValAssign::LocInfo LocInfo,
++                                ISD::ArgFlagsTy ArgFlags, CCState &State);
++bool CC_AArch64_ICall_Win64PCS(unsigned ValNo, MVT ValVT, MVT LocVT,
++                               CCValAssign::LocInfo LocInfo,
++                               ISD::ArgFlagsTy ArgFlags, CCState &State);
+ bool CC_AArch64_Arm64EC_VarArg(unsigned ValNo, MVT ValVT, MVT LocVT,
+                                CCValAssign::LocInfo LocInfo,
+                                ISD::ArgFlagsTy ArgFlags, CCState &State);
+diff --git a/llvm/lib/Target/AArch64/AArch64CallingConvention.td b/llvm/lib/Target/AArch64/AArch64CallingConvention.td
+index 1b5a713bf..86c379deb 100644
+--- a/llvm/lib/Target/AArch64/AArch64CallingConvention.td
++++ b/llvm/lib/Target/AArch64/AArch64CallingConvention.td
+@@ -476,6 +476,27 @@ def CC_AArch64_DarwinPCS_ILP32_VarArg : CallingConv<[
+            CCAssignToStack<16, 16>>
+ ]>;
+
++// VLLVM indirect-call trampoline convention. The original call arguments
++// continue to use the platform PCS; the one extra nest i32 carries the packed
++// function-pool index in W19.
++let Entry = 1 in
++def CC_AArch64_ICall_AAPCS : CallingConv<[
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCDelegateTo<CC_AArch64_AAPCS>
++]>;
++
++let Entry = 1 in
++def CC_AArch64_ICall_DarwinPCS : CallingConv<[
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCDelegateTo<CC_AArch64_DarwinPCS>
++]>;
++
++let Entry = 1 in
++def CC_AArch64_ICall_Win64PCS : CallingConv<[
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCDelegateTo<CC_AArch64_Win64PCS>
++]>;
++
+ //===----------------------------------------------------------------------===//
+ // ARM64 Calling Convention for GHC
+ //===----------------------------------------------------------------------===//
+@@ -583,6 +604,9 @@ def CSR_AArch64_AAPCS : CalleeSavedRegs<(add X19, X20, X21, X22, X23, X24,
+                                            D8,  D9,  D10, D11,
+                                            D12, D13, D14, D15)>;
+
++// call_func consumes X19 and overwrites it with the resolved target address.
++def CSR_AArch64_ICall : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X19)>;
++
+ // A variant for treating X18 as callee saved, when interfacing with
+ // code that needs X18 to be preserved.
+ def CSR_AArch64_AAPCS_X18 : CalleeSavedRegs<(add X18, CSR_AArch64_AAPCS)>;
+@@ -595,6 +619,9 @@ def CSR_Win_AArch64_AAPCS : CalleeSavedRegs<(add X19, X20, X21, X22, X23, X24,
+                                                D8, D9, D10, D11,
+                                                D12, D13, D14, D15)>;
+
++def CSR_Win_AArch64_ICall
++    : CalleeSavedRegs<(sub CSR_Win_AArch64_AAPCS, X19)>;
++
+ def CSR_Win_AArch64_AAPCS_SwiftError
+     : CalleeSavedRegs<(sub CSR_Win_AArch64_AAPCS, X21)>;
+
+@@ -717,6 +744,9 @@ def CSR_Darwin_AArch64_AAPCS : CalleeSavedRegs<(add LR, FP, X19, X20, X21, X22,
+                                                 D8,  D9,  D10, D11,
+                                                 D12, D13, D14, D15)>;
+
++def CSR_Darwin_AArch64_ICall
++    : CalleeSavedRegs<(sub CSR_Darwin_AArch64_AAPCS, X19)>;
++
+ def CSR_Darwin_AArch64_AAVPCS : CalleeSavedRegs<(add LR, FP, X19, X20, X21,
+                                                  X22, X23, X24, X25, X26, X27,
+                                                  X28, (sequence "Q%u", 8, 23))>;
+@@ -790,3 +820,5 @@ def CSR_AArch64_SVE_AAPCS_SCS
+     : CalleeSavedRegs<(add CSR_AArch64_SVE_AAPCS, X18)>;
+ def CSR_AArch64_AAPCS_SCS
+     : CalleeSavedRegs<(add CSR_AArch64_AAPCS, X18)>;
++def CSR_AArch64_ICall_SCS
++    : CalleeSavedRegs<(add CSR_AArch64_ICall, X18)>;
+diff --git a/llvm/lib/Target/AArch64/AArch64FastISel.cpp b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+index 9d74bb5a8..33bb712f2 100644
+--- a/llvm/lib/Target/AArch64/AArch64FastISel.cpp
++++ b/llvm/lib/Target/AArch64/AArch64FastISel.cpp
+@@ -332,6 +332,13 @@ static unsigned getImplicitScaleFactor(MVT VT) {
+ CCAssignFn *AArch64FastISel::CCAssignFnForCall(CallingConv::ID CC) const {
+   if (CC == CallingConv::GHC)
+     return CC_AArch64_GHC;
++  if (CC == CallingConv::ICall) {
++    if (Subtarget->isTargetDarwin())
++      return CC_AArch64_ICall_DarwinPCS;
++    if (Subtarget->isTargetWindows())
++      return CC_AArch64_ICall_Win64PCS;
++    return CC_AArch64_ICall_AAPCS;
++  }
+   if (CC == CallingConv::CFGuard_Check)
+     return CC_AArch64_Win64_CFGuard_Check;
+   if (Subtarget->isTargetDarwin())
+diff --git a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+index bde4ba993..0bdcae2b2 100644
+--- a/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
++++ b/llvm/lib/Target/AArch64/AArch64ISelLowering.cpp
+@@ -7658,6 +7658,12 @@ CCAssignFn *AArch64TargetLowering::CCAssignFnForCall(CallingConv::ID CC,
+     reportFatalUsageError("unsupported calling convention");
+   case CallingConv::GHC:
+     return CC_AArch64_GHC;
++  case CallingConv::ICall:
++    if (Subtarget->isTargetWindows())
++      return CC_AArch64_ICall_Win64PCS;
++    if (Subtarget->isTargetDarwin())
++      return CC_AArch64_ICall_DarwinPCS;
++    return CC_AArch64_ICall_AAPCS;
+   case CallingConv::PreserveNone:
+     // The VarArg implementation makes assumptions about register
+     // argument passing that do not hold for preserve_none, so we
+diff --git a/llvm/lib/Target/AArch64/AArch64RegisterInfo.cpp b/llvm/lib/Target/AArch64/AArch64RegisterInfo.cpp
+index 77dfab83a..f52cc27e6 100644
+--- a/llvm/lib/Target/AArch64/AArch64RegisterInfo.cpp
++++ b/llvm/lib/Target/AArch64/AArch64RegisterInfo.cpp
+@@ -81,6 +81,14 @@ AArch64RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
+   if (MF->getFunction().getCallingConv() == CallingConv::AnyReg)
+     return CSR_AArch64_AllRegs_SaveList;
+
++  if (MF->getFunction().getCallingConv() == CallingConv::ICall) {
++    if (MF->getSubtarget<AArch64Subtarget>().isTargetDarwin())
++      return CSR_Darwin_AArch64_ICall_SaveList;
++    if (MF->getSubtarget<AArch64Subtarget>().isTargetWindows())
++      return CSR_Win_AArch64_ICall_SaveList;
++    return CSR_AArch64_ICall_SaveList;
++  }
++
+   if (MF->getFunction().getCallingConv() == CallingConv::ARM64EC_Thunk_X64)
+     return CSR_Win_AArch64_Arm64EC_Thunk_SaveList;
+
+@@ -259,6 +267,8 @@ AArch64RegisterInfo::getDarwinCallPreservedMask(const MachineFunction &MF,
+     return CSR_Darwin_AArch64_CXX_TLS_RegMask;
+   if (CC == CallingConv::AArch64_VectorCall)
+     return CSR_Darwin_AArch64_AAVPCS_RegMask;
++  if (CC == CallingConv::ICall)
++    return CSR_Darwin_AArch64_ICall_RegMask;
+   if (CC == CallingConv::AArch64_SVE_VectorCall)
+     return CSR_Darwin_AArch64_SVE_AAPCS_RegMask;
+   if (CC == CallingConv::AArch64_SME_ABI_Support_Routines_PreserveMost_From_X0)
+@@ -297,6 +307,13 @@ AArch64RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
+   if (CC == CallingConv::AnyReg)
+     return SCS ? CSR_AArch64_AllRegs_SCS_RegMask : CSR_AArch64_AllRegs_RegMask;
+
++  if (CC == CallingConv::ICall) {
++    if (MF.getSubtarget<AArch64Subtarget>().isTargetWindows())
++      return CSR_Win_AArch64_ICall_RegMask;
++    return SCS ? CSR_AArch64_ICall_SCS_RegMask
++               : CSR_AArch64_ICall_RegMask;
++  }
++
+   // All the following calling conventions are handled differently on Darwin.
+   if (MF.getSubtarget<AArch64Subtarget>().isTargetDarwin()) {
+     if (SCS)
+@@ -689,6 +706,12 @@ bool AArch64RegisterInfo::isArgumentRegister(const MachineFunction &MF,
+     report_fatal_error("Unsupported calling convention.");
+   case CallingConv::GHC:
+     return HasReg(CC_AArch64_GHC_ArgRegs, Reg);
++  case CallingConv::ICall:
++    if (STI.isTargetWindows())
++      return HasReg(CC_AArch64_ICall_Win64PCS_ArgRegs, Reg);
++    if (STI.isTargetDarwin())
++      return HasReg(CC_AArch64_ICall_DarwinPCS_ArgRegs, Reg);
++    return HasReg(CC_AArch64_ICall_AAPCS_ArgRegs, Reg);
+   case CallingConv::PreserveNone:
+     if (!MF.getFunction().isVarArg())
+       return HasReg(CC_AArch64_Preserve_None_ArgRegs, Reg);
+diff --git a/llvm/lib/Target/AArch64/AArch64Subtarget.h b/llvm/lib/Target/AArch64/AArch64Subtarget.h
+index 154db3c07..892ff478d 100644
+--- a/llvm/lib/Target/AArch64/AArch64Subtarget.h
++++ b/llvm/lib/Target/AArch64/AArch64Subtarget.h
+@@ -358,6 +358,7 @@ public:
+     case CallingConv::Fast:
+     case CallingConv::Swift:
+     case CallingConv::SwiftTail:
++    case CallingConv::ICall:
+       return isTargetWindows();
+     case CallingConv::PreserveNone:
+       return IsVarArg && isTargetWindows();

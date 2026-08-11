@@ -43,6 +43,7 @@ copy_vllvm_sources() {
 
   cmake -E make_directory "$dst/include"
   cmake -E make_directory "$public_include"
+  cmake -E rm -f "$dst"/*.cpp "$dst/include"/*.h
   cmake -E remove_directory "$vmp_target"
   cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.inc"
   cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.cpp"

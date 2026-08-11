@@ -4,6 +4,21 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
+
+namespace {
+BranchInst *getSupportedBranchTerminator(BasicBlock &BB) {
+  // 只处理 br / brcond
+  auto *BI = dyn_cast_or_null<BranchInst>(BB.getTerminator());
+  if (!BI)
+    return nullptr;
+  if (BI->isConditional() && BI->getNumSuccessors() == 2)
+    return BI;
+  if (BI->isUnconditional() && BI->getNumSuccessors() == 1)
+    return BI;
+  return nullptr;
+}
+} // namespace
+
 PreservedAnalyses IndirectBranchPass::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] IndirectBranchPass:" << F.getName() << "\n";
@@ -12,12 +27,14 @@ PreservedAnalyses IndirectBranchPass::run(Function &F,
   bool isChanged = makeIndirectBranch(F, makeGloableBBTable(F));
   return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
+// 获取函数中所有的基本块和分支指令
 void IndirectBranchPass::getAllBBs(Function &F) {
   BBTargets.clear();
   BBNums.clear();
   BrInstSites.clear();
   for (BasicBlock &BB : F) {
-    if (auto *BI = dyn_cast<BranchInst>(BB.getTerminator())) {
+    // 只处理 br / brcond
+    if (BranchInst *BI = getSupportedBranchTerminator(BB)) {
       BrInstSites.push_back(BI);
       if (BI->isConditional()) {
         unsigned N = BI->getNumSuccessors();
@@ -37,9 +54,11 @@ void IndirectBranchPass::getAllBBs(Function &F) {
       }
     }
   }
+  // 打乱基本块顺序
   long seed = cryptoUtils->getRandom32();
   std::default_random_engine e(seed);
   std::shuffle(BBTargets.begin(), BBTargets.end(), e);
+  // 生成key映射表
   for (size_t i = 0; i < BBTargets.size(); ++i) {
     BBNums[BBTargets[i]] = static_cast<int>(i);
   }
@@ -73,6 +92,9 @@ bool IndirectBranchPass::makeIndirectBranch(Function &F,
   LLVMContext &Ctx = F.getContext();
   auto *BBTableTy = cast<ArrayType>(BBTableGV->getValueType());
   for (BranchInst *BI : BrInstSites) {
+    if (!BI->getParent() || BI != BI->getParent()->getTerminator())
+      continue;
+
     if (BI->isConditional()) {
       unsigned N = BI->getNumSuccessors();
       IRBuilder<> IRB(BI);

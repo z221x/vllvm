@@ -9,8 +9,8 @@ typedef int (*local_op_t)(int, int);
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:icall")))
 #elif defined(VLLVM_TEST_IBR)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:ibr")))
-#elif defined(VLLVM_TEST_FOP)
-#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:bcf,fop")))
+#elif defined(VLLVM_TEST_VMFLA)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:bcf,vmfla")))
 #else
 #define VLLVM_TEST_OBF
 #endif

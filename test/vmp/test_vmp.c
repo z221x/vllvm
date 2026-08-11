@@ -7,7 +7,7 @@
 #if defined(VLLVM_TEST_VMP)
 #define VMP __attribute__((annotate("vllvm:vmp")))
 #define VMP_COMBINED                                                          \
-  __attribute__((annotate("vllvm:vmp,enstr,fop,fla,icall,ibr,lvars,bcf")))
+  __attribute__((annotate("vllvm:vmp,enstr,vmfla,fla,icall,ibr,lvars,bcf")))
 #else
 #define VMP
 #define VMP_COMBINED

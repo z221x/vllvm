@@ -1,4 +1,4 @@
-#include "FunctionObfuscationPass.h"
+#include "VMFlattenFuncPass.h"
 
 #include "CryptoUtils.h"
 #include "Utils.h"
@@ -62,7 +62,7 @@ struct SharedConstTable {
   void ensureMaterialized() {
     if (GV || Entries.empty())
       return;
-    GV = createGlobal((Twine("vllvm.fop.const.table.tmp.") + F.getName()),
+    GV = createGlobal((Twine("vllvm.vmfla.const.table.tmp.") + F.getName()),
                       Entries);
   }
 
@@ -71,7 +71,7 @@ struct SharedConstTable {
       return;
 
     GlobalVariable *FinalGV = createGlobal(
-        (Twine("vllvm.fop.const.table.") + F.getName()), Entries);
+        (Twine("vllvm.vmfla.const.table.") + F.getName()), Entries);
     if (GV) {
       GV->replaceAllUsesWith(FinalGV);
       GV->eraseFromParent();
@@ -411,7 +411,7 @@ Instruction *getInsertionPointForUse(Use &U) {
   return dyn_cast<Instruction>(TheUser);
 }
 
-// fop 模式下的 BCF 使用随机覆盖率，避免每个块都生成同构 fake 分支。
+// vmfla 模式下的 BCF 使用随机覆盖率，避免每个块都生成同构 fake 分支。
 constexpr unsigned SharedBogusMinProbability = 55;
 constexpr unsigned SharedBogusProbabilityRange = 36;
 constexpr unsigned SharedBogusLoops = 1;
@@ -766,7 +766,7 @@ void shuffleFunctionBlocks(Function &F, CryptoUtils &Crypto) {
 void removeVLLVMAttributes(Function &F) {
   F.removeFnAttr("vllvm.obfuscate");
   F.removeFnAttr("vllvm.enstr");
-  F.removeFnAttr("vllvm.fop");
+  F.removeFnAttr("vllvm.vmfla");
   F.removeFnAttr("vllvm.fla");
   F.removeFnAttr("vllvm.icall");
   F.removeFnAttr("vllvm.ibr");
@@ -1233,7 +1233,7 @@ LocalVarPlan planLocalVars(Function &F, SharedConstTable &ConstTable) {
       return LocalVarPlan();
 
   std::unique_ptr<RandomNumberGenerator> RNG =
-      M->createRNG((Twine("vllvm.fop.localvars.") + F.getName()).str());
+      M->createRNG((Twine("vllvm.vmfla.localvars.") + F.getName()).str());
   for (unsigned SlotNo = 0; SlotNo < Plan.Slots.size(); ++SlotNo) {
     LocalSlot &Slot = Plan.Slots[SlotNo];
     uint32_t OffsetKey = makeNonZeroKey(*RNG, SlotNo);
@@ -1349,14 +1349,14 @@ bool applyLocalVars(Function &F, const LocalVarPlan &Plan,
 }
 } // namespace
 
-PreservedAnalyses FunctionObfuscationPass::run(Function &F,
-                                               FunctionAnalysisManager &FAM) {
-  bool Changed = runFOP(F, FAM);
+PreservedAnalyses VMFlattenFuncPass::run(Function &F,
+                                         FunctionAnalysisManager &FAM) {
+  bool Changed = runVMFlattenFunc(F, FAM);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-bool FunctionObfuscationPass::runFOP(Function &F,
-                                     FunctionAnalysisManager &FAM) {
+bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
+                                         FunctionAnalysisManager &FAM) {
   if (F.empty() || F.isDeclaration() || F.getFunctionType()->isVarArg())
     return false;
 
@@ -1374,7 +1374,7 @@ bool FunctionObfuscationPass::runFOP(Function &F,
     }
   }
 
-  errs() << "[vllvm] FOPPass:" << F.getName() << "\n";
+  errs() << "[vllvm] VMFlattenFuncPass:" << F.getName() << "\n";
 
   FlattenPlan FPlan = planFlatten(F, FAM, Crypto, ConstTable);
   IndirectCallPlan IPlan = planIndirectCalls(F, Crypto, ConstTable);

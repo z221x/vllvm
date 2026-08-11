@@ -3,16 +3,15 @@
 #include "llvm/IR/PassManager.h"
 
 using namespace llvm;
-class FunctionObfuscationPass
-    : public PassInfoMixin<FunctionObfuscationPass> {
+class VMFlattenFuncPass : public PassInfoMixin<VMFlattenFuncPass> {
 public:
-  explicit FunctionObfuscationPass(bool RunBogusControlFlow = false)
+  explicit VMFlattenFuncPass(bool RunBogusControlFlow = false)
       : RunBogusControlFlow(RunBogusControlFlow) {}
 
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }
 
 private:
-  bool runFOP(Function &F, FunctionAnalysisManager &FAM);
+  bool runVMFlattenFunc(Function &F, FunctionAnalysisManager &FAM);
   bool RunBogusControlFlow = false;
 };

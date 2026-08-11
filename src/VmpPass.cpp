@@ -595,8 +595,9 @@ void removeConflictingAttributes(Function &F) {
   F.removeFnAttr(Attribute::OptimizeNone);
   F.removeFnAttr(Attribute::Memory);
   F.addFnAttr(Attribute::NoInline);
-  for (StringRef Attr : {"vllvm.fop", "vllvm.fla", "vllvm.icall", "vllvm.ibr",
-                         "vllvm.lvars", "vllvm.bcf", "vllvm.vmp"})
+  for (StringRef Attr : {"vllvm.vmfla", "vllvm.fla", "vllvm.icall",
+                         "vllvm.ibr", "vllvm.lvars", "vllvm.bcf",
+                         "vllvm.vmp"})
     F.removeFnAttr(Attr);
   F.removeFnAttr(VmpInjectedNoInlineAttr);
   F.removeFnAttr(VmpHadAlwaysInlineAttr);

@@ -1,7 +1,14 @@
 #include "stdio.h"
+
+#if defined(VLLVM_TEST_IBR)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:ibr")))
+#else
+#define VLLVM_TEST_OBF
+#endif
+
 int funcE() { return 1; };
 void funcF() { printf("This is funcF\n"); }
-int main() {
+VLLVM_TEST_OBF int main() {
   printf("BB1\n");
   goto BB2;
 BB2:

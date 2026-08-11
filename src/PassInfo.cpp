@@ -13,7 +13,7 @@ constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
 
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
-  return Options.FunctionObfuscation || Options.FlattenFunc ||
+  return Options.VMFlattenFunc || Options.FlattenFunc ||
          Options.IndirectCall || Options.IndirectBranch ||
          Options.LocalVarStruct || Options.BogusControlFlow;
 }
@@ -78,8 +78,8 @@ public:
     PreservedAnalyses PA = PreservedAnalyses::all();
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };
 
-    if (FunctionOptions.FunctionObfuscation) {
-      RunPass(FunctionObfuscationPass(FunctionOptions.BogusControlFlow));
+    if (FunctionOptions.VMFlattenFunc) {
+      RunPass(VMFlattenFuncPass(FunctionOptions.BogusControlFlow));
       FunctionOptions.BogusControlFlow = false;
     }
 
@@ -92,8 +92,6 @@ public:
       FunctionOptions.BogusControlFlow = false;
     }
 
-    if (FunctionOptions.IndirectCall)
-      RunPass(IndirectCallPass());
     if (FunctionOptions.LocalVarStruct)
       RunPass(LocalVarStructPass());
     if (FunctionOptions.FlattenFunc)
@@ -110,6 +108,8 @@ public:
 void addVLLVMPasses(ModulePassManager &MPM) {
   MPM.addPass(VLLVMAnnotationPass());
   MPM.addPass(VLLVMEncryptoStrDispatchPass());
+  // icall 需要先看完整 Module，统一去重、随机注册所有内部调用目标。
+  MPM.addPass(IndirectCallPass());
   FunctionPassManager FPM;
   FPM.addPass(VLLVMFunctionDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));

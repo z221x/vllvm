@@ -64,7 +64,7 @@ for opt in 0 2; do
     echo "O$opt VMP+enstr left a plaintext string" >&2
     exit 1
   fi
-  if grep -Eq 'vllvm\.(fop|localvars|fla)\.|indirectbr' \
+  if grep -Eq 'vllvm\.(vmfla|localvars|fla)\.|indirectbr' \
       "$OUT_DIR/vmp_O$opt.ll"; then
     echo "O$opt VMP candidate unexpectedly ran a conflicting function pass" >&2
     exit 1

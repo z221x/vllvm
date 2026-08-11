@@ -84,41 +84,36 @@ run_case() {
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     ;;
   icall)
-    grep -q "func_table" "$ll"
-    grep -q "func_index_table.* global " "$ll"
-    if grep -q "func_index_table.* constant " "$ll"; then
-      echo "icall encrypted index table must be writable data" >&2
+    grep -q "register_func" "$ll"
+    grep -q "call icallcc" "$ll"
+    grep -Eq "i32 nest [0-9]+" "$ll"
+    if grep -q "vllvm.icall.index_array" "$ll"; then
+      echo "icall packed indexes must be call-site constants" >&2
       exit 1
     fi
-    if grep -q "@func_table.*getelementptr" "$ll"; then
-      echo "icall function table must store plain function addresses" >&2
-      exit 1
-    fi
-    grep -q "load volatile i32" "$ll"
-    grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$ll"
     ;;
   ibr)
     grep -q "indirectbr" "$ll"
     ;;
-  fop)
-    grep -q "vllvm.fop.const.table.* global " "$ll"
+  vmfla)
+    grep -q "vllvm.vmfla.const.table.* global " "$ll"
     grep -q "define private .*vllvm.impl.*ptr %" "$ll"
-    grep -q "call .*vllvm.impl.*ptr @vllvm.fop.const.table" "$ll"
+    grep -q "call .*vllvm.impl.*ptr @vllvm.vmfla.const.table" "$ll"
     grep -q "getelementptr i32, ptr %" "$ll"
     grep -q "func_table" "$ll"
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     grep -q "store volatile i32 .*ptr %.*" "$ll"
     grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
     if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
-      echo "fop bcf constants must use the fop integer constant table" >&2
+      echo "vmfla bcf constants must use the vmfla integer constant table" >&2
       exit 1
     fi
-    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.fop\\.const\\.table" "$ll"; then
-      echo "fop bcf table loads must use the impl table parameter" >&2
+    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.vmfla\\.const\\.table" "$ll"; then
+      echo "vmfla bcf table loads must use the impl table parameter" >&2
       exit 1
     fi
     if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" "$ll"; then
-      echo "fop must use one fop integer constant table" >&2
+      echo "vmfla must use one vmfla integer constant table" >&2
       exit 1
     fi
     ;;
@@ -129,4 +124,4 @@ run_case() {
 # run_case fla
 # run_case icall
 # run_case ibr
-run_case fop
+run_case vmfla
