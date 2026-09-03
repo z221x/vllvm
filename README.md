@@ -9,7 +9,7 @@ VLLVM 将 OLLVM 风格和实验性 VMP 混淆 Pass 集成进 LLVM/Clang 源码�
 | `enstr` | EncryptoStrPass | 字符串加密，Module Pass。 |
 | `fla` | FlattenFuncPass | 控制流平坦化。 |
 | `icall` | IndirectCallPass | AArch64 模块级调用表随机注册，通过 `icallcc`/`x19` 查表跳转。 |
-| `ibr` | IndirectBranchPass | 间接跳转混淆 |
+| `ibr` | IndirectBranchPass | 通过可写 `volatile` 索引动态访问完整块地址常量表，并为每个 `br` 随机加入 1-2 个函数内假目标。 |
 | `lvars` | LocalVarStructPass | 局部变量结构体化和偏移加密。 |
 | `bcf` | BogusControlFlowPass | 插入基于可写全局状态和 `volatile` load 的虚假控制流。 |
 | `vmfla` | VMFlattenFuncPass | 独立的 VM 风格函数平坦化，共享一张整数常量表。 |

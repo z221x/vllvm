@@ -2,7 +2,7 @@ diff --git a/clang/lib/CodeGen/BackendUtil.cpp b/clang/lib/CodeGen/BackendUtil.c
 index ba71ae473..6b86b006a 100644
 --- a/clang/lib/CodeGen/BackendUtil.cpp
 +++ b/clang/lib/CodeGen/BackendUtil.cpp
-@@ -998,3 +998,7 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
+@@ -998,5 +998,9 @@ void EmitAssemblyHelper::RunOptimizationPipeline(
  #define HANDLE_EXTENSION(Ext)                                                  \
    get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);
  #include "llvm/Support/Extension.def"
@@ -10,3 +10,6 @@ index ba71ae473..6b86b006a 100644
 +      [](ModulePassManager &MPM, OptimizationLevel, ThinOrFullLTOPhase) {
 +        llvm::vllvm::addVLLVMLatePasses(MPM);
 +      });
+-
++
+   // Register the target library analysis directly and give it a customized

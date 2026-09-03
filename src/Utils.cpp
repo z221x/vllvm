@@ -69,6 +69,36 @@ void splitInvokeNormalEdgesForPHI(Function &F) {
 }
 } // namespace
 
+RandomizedIntegerCodec::RandomizedIntegerCodec(CryptoUtils &Crypto)
+    : SelectedAlgorithm(
+          static_cast<Algorithm>(Crypto.getRandom32() % 3U)) {}
+
+Value *RandomizedIntegerCodec::encode(IRBuilder<> &IRB, Value *Input,
+                                      Value *Key, const Twine &Name) const {
+  switch (SelectedAlgorithm) {
+  case Algorithm::Xor:
+    return IRB.CreateXor(Input, Key, Name);
+  case Algorithm::Add:
+    return IRB.CreateAdd(Input, Key, Name);
+  case Algorithm::Sub:
+    return IRB.CreateSub(Input, Key, Name);
+  }
+  llvm_unreachable("unknown reversible integer encoding algorithm");
+}
+
+Value *RandomizedIntegerCodec::decode(IRBuilder<> &IRB, Value *Input,
+                                      Value *Key, const Twine &Name) const {
+  switch (SelectedAlgorithm) {
+  case Algorithm::Xor:
+    return IRB.CreateXor(Input, Key, Name);
+  case Algorithm::Add:
+    return IRB.CreateSub(Input, Key, Name);
+  case Algorithm::Sub:
+    return IRB.CreateAdd(Input, Key, Name);
+  }
+  llvm_unreachable("unknown reversible integer encoding algorithm");
+}
+
 // Shamefully borrowed from ../Scalar/RegToMem.cpp :(
 bool valueEscapes(Instruction *Inst) {
   BasicBlock *BB = Inst->getParent();
