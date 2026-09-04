@@ -13,7 +13,7 @@ else
   VLLVM_CLANG="$ROOT_DIR/build/llvm-linux/bin/clang"
 fi
 
-EXTRA_ARGS=()
+EXTRA_ARGS=(-Xclang -llvm-verify-each)
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   SDK_PATH=$(xcrun --show-sdk-path)
   EXTRA_ARGS+=(-isysroot "$SDK_PATH")

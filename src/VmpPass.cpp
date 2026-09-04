@@ -556,6 +556,17 @@ bool linkRuntime(Module &M, std::string &Error) {
   std::unique_ptr<Module> Runtime = std::move(*Parsed);
   Runtime->setTargetTriple(M.getTargetTriple());
   Runtime->setDataLayout(M.getDataLayout());
+  // 嵌入 bitcode 的宿主 SDK 版本不属于目标模块；保留其余 ABI/代码生成标志。
+  // 否则 SDK 更新会触发 Clang 后端不支持的嵌套 linker diagnostic。
+  if (NamedMDNode *Flags = Runtime->getModuleFlagsMetadata()) {
+    SmallVector<MDNode *, 8> KeptFlags;
+    for (MDNode *Flag : Flags->operands())
+      if (cast<MDString>(Flag->getOperand(1))->getString() != "SDK Version")
+        KeptFlags.push_back(Flag);
+    Flags->clearOperands();
+    for (MDNode *Flag : KeptFlags)
+      Flags->addOperand(Flag);
+  }
   for (Function &F : *Runtime) {
     F.removeFnAttr("target-cpu");
     F.removeFnAttr("target-features");
