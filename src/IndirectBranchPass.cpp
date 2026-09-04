@@ -5,6 +5,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/Utils/LowerSwitch.h"
 
 #include <algorithm>
 #include <random>
@@ -26,36 +27,34 @@ BranchInst *getSupportedBranchTerminator(BasicBlock &BB) {
 PreservedAnalyses IndirectBranchPass::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
   errs() << "[vllvm] IndirectBranchPass:" << F.getName() << "\n";
-  // 任意增加 CFG 前驱会破坏 funclet 的结构约束，暂时保留 EH 函数
-  // 原始实现。
+  // indirectbr 会改变 funclet 的结构约束，暂时保留 EH 函数原始实现。
   if (F.hasPersonalityFn()) {
     errs() << "[vllvm] IndirectBranchPass skipped EH function:"
            << F.getName() << "\n";
     return PreservedAnalyses::all();
   }
 
+  LowerSwitchPass LowerSwitch;
+  PreservedAnalyses PA = LowerSwitch.run(F, FAM);
+
   cryptoUtils = std::make_unique<CryptoUtils>(F.getParent());
   if (!getAllBBs(F))
-    return PreservedAnalyses::all();
+    return PA;
 
-  // 假目标会成为真实 CFG 前驱；先移除 PHI 和跨块 SSA，保证新增边后
-  // IR 合法。再次收集以覆盖 Demote 可能新建的块和边。
-  fixStackForFlatten(&F);
-  if (!getAllBBs(F))
-    return PreservedAnalyses::none();
   bool isChanged = makeIndirectBranch(F, makeGloableBBTable(F));
-  return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
+  return isChanged ? PreservedAnalyses::none() : PA;
 }
 // 获取函数中所有的基本块和分支指令
 bool IndirectBranchPass::getAllBBs(Function &F) {
   BBTargets.clear();
   BBNums.clear();
   BrInstSites.clear();
-  FakeBBTargets.clear();
 
   SmallVector<BasicBlock *, 32> FunctionBlocks;
   for (BasicBlock &BB : F) {
-    FunctionBlocks.push_back(&BB);
+    // LLVM 不允许对入口块取 blockaddress；入口块的 BR 仍参与改写。
+    if (&BB != &F.getEntryBlock())
+      FunctionBlocks.push_back(&BB);
     // 只处理 br / brcond
     if (BranchInst *BI = getSupportedBranchTerminator(BB))
       BrInstSites.push_back(BI);
@@ -64,51 +63,10 @@ bool IndirectBranchPass::getAllBBs(Function &F) {
   if (BrInstSites.empty())
     return false;
 
-  // 常量表保存当前函数的全部块地址；即使某个块本轮没有被选作假目标，
-  // 动态索引仍与完整函数 CFG 使用同一编号空间。
+  // 常量表保存全部可寻址块（入口块除外），使用统一的动态索引编号。
   BBTargets.assign(FunctionBlocks.begin(), FunctionBlocks.end());
   for (BasicBlock *BB : BBTargets)
     BBNums[BB] = 0;
-
-  // 每个原始 br 独立选择一到两个已有块作为假目标。入口块、当前块和
-  // 真实 successor 不能作为假目标，否则会形成非法入口前驱或重复目的地。
-  for (BranchInst *BI : BrInstSites) {
-    SmallVector<BasicBlock *, 32> Candidates;
-    for (BasicBlock *Candidate : FunctionBlocks) {
-      if (Candidate == &F.getEntryBlock() || Candidate == BI->getParent() ||
-          Candidate->isEHPad())
-        continue;
-
-      bool IsRealSuccessor = false;
-      for (unsigned I = 0; I != BI->getNumSuccessors(); ++I)
-        IsRealSuccessor |= Candidate == BI->getSuccessor(I);
-      if (!IsRealSuccessor)
-        Candidates.push_back(Candidate);
-    }
-
-    // 极小 CFG 没有额外目的块时整函数不做转换，避免产生单目标
-    // indirectbr。
-    if (Candidates.empty()) {
-      errs() << "[vllvm] IndirectBranchPass has no fake target:"
-             << F.getName() << "\n";
-      BBTargets.clear();
-      BBNums.clear();
-      BrInstSites.clear();
-      FakeBBTargets.clear();
-      return false;
-    }
-
-    std::default_random_engine CandidateEngine(cryptoUtils->getRandom32());
-    std::shuffle(Candidates.begin(), Candidates.end(), CandidateEngine);
-    const unsigned RequestedCount = 1U + (cryptoUtils->getRandom32() & 1U);
-    const unsigned FakeCount = std::min<unsigned>(
-        RequestedCount, static_cast<unsigned>(Candidates.size()));
-    auto &Targets = FakeBBTargets[BI];
-    for (unsigned I = 0; I != FakeCount; ++I) {
-      BasicBlock *Target = Candidates[I];
-      Targets.push_back(Target);
-    }
-  }
 
   // 打乱基本块顺序
   long seed = cryptoUtils->getRandom32();
@@ -166,8 +124,6 @@ bool IndirectBranchPass::makeIndirectBranch(Function &F,
     };
     for (unsigned I = 0; I != BI->getNumSuccessors(); ++I)
       AddUniqueDestination(BI->getSuccessor(I));
-    for (BasicBlock *FakeTarget : FakeBBTargets[BI])
-      AddUniqueDestination(FakeTarget);
     std::default_random_engine DestinationEngine(cryptoUtils->getRandom32());
     std::shuffle(Destinations.begin(), Destinations.end(), DestinationEngine);
 
@@ -188,35 +144,16 @@ bool IndirectBranchPass::makeIndirectBranch(Function &F,
     LoadInst *OldState =
         IRB.CreateLoad(I32Ty, IndexSlot, "vllvm.ibr.index.old");
     OldState->setVolatile(true);
-    Value *SelectedIndex = RealIndex;
-    Value *IndexMask = OldState;
-    // 连续整数乘积最低位恒为 0；volatile 状态让假索引保留为显式候选，
-    // 但运行时仍只会选择真实 successor。
-    for (BasicBlock *FakeTarget : FakeBBTargets[BI]) {
-      Constant *FakeIndex = ConstantInt::get(I32Ty, BBNums[FakeTarget]);
-      Constant *FakeMask = ConstantInt::get(I32Ty, BBNums[FakeTarget] + 1);
-      Value *OpaqueInput = IRB.CreateXor(OldState, FakeMask);
-      Value *Adjacent =
-          IRB.CreateAdd(OpaqueInput, ConstantInt::get(I32Ty, 1));
-      Value *EvenProduct = IRB.CreateMul(OpaqueInput, Adjacent);
-      Value *LowBit =
-          IRB.CreateAnd(EvenProduct, ConstantInt::get(I32Ty, 1));
-      Value *ChooseFake = IRB.CreateICmpNE(
-          LowBit, ConstantInt::get(I32Ty, 0));
-      SelectedIndex = IRB.CreateSelect(ChooseFake, FakeIndex, SelectedIndex);
-      IndexMask = IRB.CreateXor(
-          IndexMask, FakeMask, "vllvm.ibr.index.fake");
-    }
     RandomizedIntegerCodec IndexCodec(*cryptoUtils);
     Value *EncodedIndex = IndexCodec.encode(
-        IRB, SelectedIndex, IndexMask, "vllvm.ibr.index.encoded");
+        IRB, RealIndex, OldState, "vllvm.ibr.index.encoded");
     StoreInst *IndexStore = IRB.CreateStore(EncodedIndex, IndexSlot);
     IndexStore->setVolatile(true);
     LoadInst *StoredIndex =
         IRB.CreateLoad(I32Ty, IndexSlot, "vllvm.ibr.index.stored");
     StoredIndex->setVolatile(true);
     Value *Index = IndexCodec.decode(
-        IRB, StoredIndex, IndexMask, "vllvm.ibr.index.decoded");
+        IRB, StoredIndex, OldState, "vllvm.ibr.index.decoded");
 
     // 只通过动态索引读取目标地址，避免额外的 key 加载和地址运算。
     Value *BBPtr = IRB.CreateInBoundsGEP(

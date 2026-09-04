@@ -24,6 +24,7 @@ if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   fi
 fi
 
+EXTRA_ARGS+=(-Xclang -llvm-verify-each)
 mkdir -p "$OUT_DIR"
 
 check_indirect_destinations() {
@@ -32,13 +33,13 @@ check_indirect_destinations() {
     /^[[:space:]]*indirectbr ptr / {
       line = $0
       destinations = gsub(/label %/, "", line)
-      if (destinations < 2 || destinations > 4)
+      if (destinations < 1 || destinations > 2)
         invalid = 1
       ++seen
     }
     END { exit seen == 0 || invalid }
   ' "$ll"; then
-    echo "every indirectbr must have between two and four destinations" >&2
+    echo "every indirectbr must contain only its one or two real successors" >&2
     exit 1
   fi
 }
@@ -72,9 +73,9 @@ check_dynamic_index() {
       ++function_blocks
       saw_first_block = 1
     }
-    END { exit table_blocks == 0 || table_blocks != function_blocks }
+    END { exit table_blocks == 0 || table_blocks != function_blocks - 1 }
   ' "$ll"; then
-    echo "block table must contain every block in the protected function" >&2
+    echo "block table must contain every non-entry block in the protected function" >&2
     exit 1
   fi
 
@@ -110,14 +111,6 @@ check_dynamic_index() {
     exit 1
   fi
 
-  if ! awk '
-    /^[[:space:]]*indirectbr ptr / { ++branches }
-    /^[[:space:]]*%.* = select i1 / { ++selections }
-    END { exit branches == 0 || selections < branches }
-  ' "$ll"; then
-    echo "every indirect branch must include a fake index candidate" >&2
-    exit 1
-  fi
 }
 
 for opt in 0 2; do
@@ -142,13 +135,16 @@ for opt in 0 2; do
 
   check_indirect_destinations "$ll"
   check_dynamic_index "$ll" main
-  if grep -q "vllvm.ibr.fake" "$ll"; then
-    echo "IndirectBranchPass must reuse existing blocks as fake targets" >&2
+  if grep -Eq "vllvm\.ibr\.(fake|index\.fake)" "$ll"; then
+    echo "IndirectBranchPass must not generate fake blocks or indexes" >&2
+    exit 1
+  fi
+  if grep -q "^  switch " "$ll"; then
+    echo "IndirectBranchPass must lower switch before branch obfuscation" >&2
     exit 1
   fi
   if [ "$opt" -eq 0 ]; then
-    # O2 may fold the deliberately untouched switch into a new direct branch
-    # after this pass. O0 preserves the input CFG and checks every original br.
+    # O0 preserves the lowered CFG and checks every original or generated br.
     if awk '
       /^define .*@main\(/ { in_main = 1 }
       in_main && /^}/ { in_main = 0 }
@@ -158,22 +154,22 @@ for opt in 0 2; do
       echo "all original br terminators must be indirect" >&2
       exit 1
     fi
-
-    if ! grep -q "^  switch " "$ll"; then
-      echo "IndirectBranchPass must not rewrite switch terminators" >&2
-      exit 1
-    fi
   fi
 done
 
 PHI_LL="$OUT_DIR/test_indirectbr_phi.ll"
-"$VLLVM_CLANG" -Wno-override-module -O0 -x ir -S -emit-llvm "$PHI_SRC" \
+"$VLLVM_CLANG" -Wno-override-module -Xclang -llvm-verify-each -O0 -x ir -S -emit-llvm "$PHI_SRC" \
   -o "$PHI_LL"
-"$VLLVM_CLANG" -Wno-override-module -O0 -x ir -c "$PHI_SRC" \
+"$VLLVM_CLANG" -Wno-override-module -Xclang -llvm-verify-each -O0 -x ir -c "$PHI_SRC" \
   -o "$OUT_DIR/test_indirectbr_phi.o"
 check_indirect_destinations "$PHI_LL"
 check_dynamic_index "$PHI_LL" ibr_phi
-if grep -q " phi " "$PHI_LL"; then
-  echo "IndirectBranchPass must remove PHI nodes before adding fake edges" >&2
+if ! grep -q " phi " "$PHI_LL"; then
+  echo "IndirectBranchPass must preserve PHI nodes without fake CFG edges" >&2
+  exit 1
+fi
+if grep -q "vllvm.ibr.index.encoded.key.mul" "$PHI_LL" &&
+    ! grep -q "vllvm.ibr.index.encoded.key.xor" "$PHI_LL"; then
+  echo "mixed index codecs must complete the runtime key mixing chain" >&2
   exit 1
 fi

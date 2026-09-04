@@ -15,7 +15,6 @@ public:
   std::vector<BasicBlock *> BBTargets;
   std::map<BasicBlock *, int> BBNums;
   std::vector<BranchInst *> BrInstSites;
-  std::map<BranchInst *, std::vector<BasicBlock *>> FakeBBTargets;
   std::unique_ptr<CryptoUtils> cryptoUtils;
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }
