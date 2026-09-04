@@ -6,3 +6,4 @@ out
 .clangd
 
 .DS_Store
+*app/
