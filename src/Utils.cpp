@@ -1,5 +1,6 @@
 #include "Utils.h"
 
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/IRBuilder.h"
@@ -70,31 +71,60 @@ void splitInvokeNormalEdgesForPHI(Function &F) {
 } // namespace
 
 RandomizedIntegerCodec::RandomizedIntegerCodec(CryptoUtils &Crypto)
-    : SelectedAlgorithm(
-          static_cast<Algorithm>(Crypto.getRandom32() % 3U)) {}
+    : SelectedMode(static_cast<Mode>(Crypto.getRandom32() % 5U)),
+      SelectedAlgorithm(
+          static_cast<Algorithm>(Crypto.getRandom32() % 3U)),
+      KeyMultiplier(Crypto.getRandom64() | 1ULL),
+      KeyXor(Crypto.getRandom64()) {
+  if (SelectedMode == Mode::Add)
+    SelectedAlgorithm = Algorithm::Add;
+  else if (SelectedMode == Mode::Xor)
+    SelectedAlgorithm = Algorithm::Xor;
+  else if (SelectedMode == Mode::Sub)
+    SelectedAlgorithm = Algorithm::Sub;
+}
+
+Value *RandomizedIntegerCodec::mixKey(IRBuilder<> &IRB, Value *Key,
+                                      const Twine &Name) const {
+  auto *KeyTy = cast<IntegerType>(Key->getType());
+  Value *Mixed = IRB.CreateMul(
+      Key, ConstantInt::get(KeyTy, KeyMultiplier), Name + ".mul");
+  return IRB.CreateXor(Mixed, ConstantInt::get(KeyTy, KeyXor),
+                       Name + ".xor");
+}
 
 Value *RandomizedIntegerCodec::encode(IRBuilder<> &IRB, Value *Input,
                                       Value *Key, const Twine &Name) const {
+  if (SelectedMode == Mode::None)
+    return Input;
+  Value *EffectiveKey = SelectedMode == Mode::Mixed
+                            ? mixKey(IRB, Key, Name + ".key")
+                            : Key;
   switch (SelectedAlgorithm) {
   case Algorithm::Xor:
-    return IRB.CreateXor(Input, Key, Name);
+    return IRB.CreateXor(Input, EffectiveKey, Name);
   case Algorithm::Add:
-    return IRB.CreateAdd(Input, Key, Name);
+    return IRB.CreateAdd(Input, EffectiveKey, Name);
   case Algorithm::Sub:
-    return IRB.CreateSub(Input, Key, Name);
+    return IRB.CreateSub(Input, EffectiveKey, Name);
   }
   llvm_unreachable("unknown reversible integer encoding algorithm");
 }
 
 Value *RandomizedIntegerCodec::decode(IRBuilder<> &IRB, Value *Input,
                                       Value *Key, const Twine &Name) const {
+  if (SelectedMode == Mode::None)
+    return Input;
+  Value *EffectiveKey = SelectedMode == Mode::Mixed
+                            ? mixKey(IRB, Key, Name + ".key")
+                            : Key;
   switch (SelectedAlgorithm) {
   case Algorithm::Xor:
-    return IRB.CreateXor(Input, Key, Name);
+    return IRB.CreateXor(Input, EffectiveKey, Name);
   case Algorithm::Add:
-    return IRB.CreateSub(Input, Key, Name);
+    return IRB.CreateSub(Input, EffectiveKey, Name);
   case Algorithm::Sub:
-    return IRB.CreateAdd(Input, Key, Name);
+    return IRB.CreateAdd(Input, EffectiveKey, Name);
   }
   llvm_unreachable("unknown reversible integer encoding algorithm");
 }
@@ -112,42 +142,71 @@ bool valueEscapes(Instruction *Inst) {
   return false;
 }
 
-void fixStack(Function *f) {
-  // Try to remove phi node and demote reg to stack
-  std::vector<PHINode *> tmpPhi;
-  std::vector<Instruction *> tmpReg;
-  BasicBlock *bbEntry = &*f->begin();
-
-  do {
-    tmpPhi.clear();
-    tmpReg.clear();
-
-    for (Function::iterator i = f->begin(); i != f->end(); ++i) {
-      for (BasicBlock::iterator j = i->begin(); j != i->end(); ++j) {
-        if (isa<PHINode>(j)) {
-          PHINode *phi = cast<PHINode>(j);
-          tmpPhi.push_back(phi);
-          continue;
-        }
-        if (!(isa<AllocaInst>(j) && j->getParent() == bbEntry) &&
-            (valueEscapes(&*j) || j->isUsedOutsideOfBlock(&*i))) {
-          tmpReg.push_back(&*j);
-          continue;
-        }
+PHILoweringResult lowerPHINodes(Function &F) {
+  SmallVector<PHINode *, 16> Phis;
+  for (BasicBlock &BB : F) {
+    for (PHINode &PN : BB.phis()) {
+      // catchswitch 没有普通指令插入点；callbr 结果不能在其定义前 store。
+      bool Supported = PN.getType()->isSized() &&
+                       !isa<CatchSwitchInst>(BB.getTerminator());
+      for (unsigned I = 0; I < PN.getNumIncomingValues(); ++I) {
+        BasicBlock *Pred = PN.getIncomingBlock(I);
+        auto *CallBr = dyn_cast<CallBrInst>(PN.getIncomingValue(I));
+        Supported &= !isa<CatchSwitchInst>(Pred->getTerminator()) &&
+                     !(CallBr && CallBr->getParent() == Pred);
       }
+      if (!Supported) {
+        errs() << "[vllvm] PHI lowering skipped unsupported edge/type in:"
+               << F.getName() << "\n";
+        return PHILoweringResult::Unsupported;
+      }
+      Phis.push_back(&PN);
     }
-    for (unsigned int i = 0; i != tmpReg.size(); ++i) {
-      DemoteRegToStack(*tmpReg.at(i));
-    }
+  }
+  if (Phis.empty())
+    return PHILoweringResult::Unchanged;
 
-    for (unsigned int i = 0; i != tmpPhi.size(); ++i) {
-      DemotePHIToStack(tmpPhi.at(i));
-    }
+  // 先完整检查再修改；invoke 返回值必须在 normal 边的跳板中写入栈槽。
+  splitInvokeNormalEdgesForPHI(F);
+  for (PHINode *PN : Phis) {
+    DebugLoc Loc = PN->getDebugLoc();
+    if (!Loc && F.getSubprogram())
+      Loc = DILocation::get(F.getContext(), 0, 0, F.getSubprogram());
+    AllocaInst *Slot = DemotePHIToStack(PN);
+    if (!Slot)
+      continue;
+    // 后续 enstr 会在 store 前插入调用，必须保留合法的调试位置。
+    Slot->setDebugLoc(Loc);
+    for (User *U : Slot->users())
+      if (auto *I = dyn_cast<Instruction>(U))
+        I->setDebugLoc(Loc);
+  }
+  return PHILoweringResult::Lowered;
+}
 
-  } while (tmpReg.size() != 0 || tmpPhi.size() != 0);
+void fixStack(Function *F) {
+  if (F->empty())
+    return;
+  BasicBlock *Entry = &F->getEntryBlock();
+  while (true) {
+    if (lowerPHINodes(*F) == PHILoweringResult::Unsupported)
+      return;
+    SmallVector<Instruction *, 16> Regs;
+    for (Instruction &I : instructions(F)) {
+      if (!(isa<AllocaInst>(I) && I.getParent() == Entry) &&
+          (valueEscapes(&I) || I.isUsedOutsideOfBlock(I.getParent())))
+        Regs.push_back(&I);
+    }
+    if (Regs.empty())
+      return;
+    for (Instruction *I : Regs)
+      DemoteRegToStack(*I);
+  }
 }
 
 void fixStackForFlatten(Function *F) {
+  if (lowerPHINodes(*F) == PHILoweringResult::Unsupported)
+    return;
   if (!hasEH(*F)) {
     fixStack(F);
     return;
@@ -155,19 +214,11 @@ void fixStackForFlatten(Function *F) {
 
   // C++ EH 中 invoke/landingpad 有特殊定义域，不能套用全函数反复
   // Demote 的旧 fixStack；这里只处理 flatten 必需的 SSA 跨块值。
-  splitInvokeNormalEdgesForPHI(*F);
-
   SmallVector<Instruction *, 32> Regs;
-  SmallVector<PHINode *, 16> Phis;
   BasicBlock *EntryBB = &F->getEntryBlock();
 
   for (BasicBlock &BB : *F) {
     for (Instruction &I : BB) {
-      if (auto *PN = dyn_cast<PHINode>(&I)) {
-        Phis.push_back(PN);
-        continue;
-      }
-
       if (I.getType()->isVoidTy() || shouldSkipEHValue(I))
         continue;
       if (isa<AllocaInst>(&I) && I.getParent() == EntryBB)
@@ -183,9 +234,7 @@ void fixStackForFlatten(Function *F) {
     if (I->getParent())
       DemoteRegToStack(*I);
 
-  for (PHINode *PN : Phis)
-    if (PN->getParent())
-      DemotePHIToStack(PN);
+  lowerPHINodes(*F);
 }
 
 CallBase *fixEH(CallBase *CB) {

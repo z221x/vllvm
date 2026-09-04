@@ -801,7 +801,11 @@ Function *moveBodyToTableParamImpl(Function &F, SharedConstTable &ConstTable) {
                        F.getAddressSpace(), F.getName() + ".vllvm.impl", M);
 
   Impl->copyAttributesFrom(&F);
+  // copyAttributesFrom 会带入外部符号的 preemptable 状态，private 实现必须本地绑定。
+  Impl->setDSOLocal(true);
   Impl->copyMetadata(&F, 0);
+  // 调试信息随原函数体移到 Impl；生成的包装器不能共享同一个 DISubprogram。
+  F.setSubprogram(nullptr);
   Impl->setComdat(nullptr);
 
   SmallVector<AttributeSet, 16> ParamAttrs;
@@ -1360,9 +1364,13 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
   if (F.empty() || F.isDeclaration() || F.getFunctionType()->isVarArg())
     return false;
 
+  // 与 enstr/fla 共用 PHI 降级，必须早于 BCF 和 flatten 的 CFG 改写。
+  PHILoweringResult PHIs = lowerPHINodes(F);
+  if (PHIs == PHILoweringResult::Unsupported)
+    return false;
   SharedConstTable ConstTable(F);
   CryptoUtils Crypto(F.getParent());
-  bool Changed = false;
+  bool Changed = PHIs == PHILoweringResult::Lowered;
 
   if (RunBogusControlFlow) {
     errs() << "[vllvm] BogusControlFlowPass:" << F.getName() << "\n";

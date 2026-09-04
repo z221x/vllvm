@@ -1,9 +1,12 @@
 #include "EncryptoStrPass.h"
+#include "Utils.h"
 #include "VLLVMAttribute.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/RandomNumberGenerator.h"
 
 #include <array>
@@ -61,7 +64,6 @@ public:
       : strID(id), strVar(strvar), decFunc(nullptr), M(m), isDouble(isdouble) {
     // 生成key
     getRandomKey();
-    makeDecryptoFunc();
   }
 
   void encryptoStr() {
@@ -95,6 +97,17 @@ public:
 
     LLVMContext &Ctx = M.getContext();
     IRBuilder<> IRB(Ctx);
+    const DataLayout &DL = M.getDataLayout();
+    IntegerType *SizeTy = DL.getIntPtrType(Ctx);
+    Align PtrAlign = DL.getABITypeAlign(IRB.getPtrTy());
+    Constant *Null = ConstantPointerNull::get(IRB.getPtrTy());
+    // 每个字符串共享一个缓存；1 表示初始化中，不会作为字符串地址使用。
+    Constant *Busy = ConstantExpr::getIntToPtr(
+        ConstantInt::get(SizeTy, 1), IRB.getPtrTy());
+    auto *Cache = new GlobalVariable(
+        M, IRB.getPtrTy(), false, GlobalValue::PrivateLinkage, Null,
+        "vllvm.enstr.cache." + std::to_string(strID));
+    Cache->setAlignment(PtrAlign);
     FunctionType *decryptoFuncType =
         FunctionType::get(IRB.getPtrTy(), {IRB.getPtrTy()}, false);
     decFunc = Function::Create(decryptoFuncType, Function::PrivateLinkage,
@@ -102,6 +115,13 @@ public:
 
     // 创建函数体
     BasicBlock *entryBB = BasicBlock::Create(Ctx, "entry", decFunc);
+    BasicBlock *checkBB = BasicBlock::Create(Ctx, "cache.check", decFunc);
+    BasicBlock *readyBB = BasicBlock::Create(Ctx, "cache.ready", decFunc);
+    BasicBlock *cachedBB = BasicBlock::Create(Ctx, "cache.return", decFunc);
+    BasicBlock *claimBB = BasicBlock::Create(Ctx, "cache.claim", decFunc);
+    BasicBlock *allocBB = BasicBlock::Create(Ctx, "allocate", decFunc);
+    BasicBlock *failedBB = BasicBlock::Create(Ctx, "alloc.failed", decFunc);
+    BasicBlock *decryptBB = BasicBlock::Create(Ctx, "decrypt", decFunc);
     BasicBlock *loopBB = BasicBlock::Create(Ctx, "loop", decFunc);
     BasicBlock *loopbrBB = BasicBlock::Create(Ctx, "loopbr", decFunc);
     BasicBlock *exitBB = BasicBlock::Create(Ctx, "exit", decFunc);
@@ -112,15 +132,40 @@ public:
     strArg->setName("strArg");
 
     IRB.SetInsertPoint(entryBB);
+    IRB.CreateBr(checkBB);
+    IRB.SetInsertPoint(checkBB);
+    LoadInst *Cached = IRB.CreateAlignedLoad(
+        IRB.getPtrTy(), Cache, PtrAlign, "cached");
+    Cached->setAtomic(AtomicOrdering::Acquire);
+    IRB.CreateCondBr(IRB.CreateICmpEQ(Cached, Null), claimBB, readyBB);
+    IRB.SetInsertPoint(readyBB);
+    IRB.CreateCondBr(IRB.CreateICmpEQ(Cached, Busy), checkBB, cachedBB);
+    IRB.SetInsertPoint(cachedBB);
+    IRB.CreateRet(Cached);
+
+    IRB.SetInsertPoint(claimBB);
+    // 先争取初始化权，再 malloc；并发首次调用也不会重复分配。
+    AtomicCmpXchgInst *Claim = IRB.CreateAtomicCmpXchg(
+        Cache, Null, Busy, PtrAlign, AtomicOrdering::AcquireRelease,
+        AtomicOrdering::Acquire);
+    IRB.CreateCondBr(IRB.CreateExtractValue(Claim, 1), allocBB, checkBB);
+
+    IRB.SetInsertPoint(allocBB);
     auto *arrayTy = cast<ArrayType>(strVar->getValueType());
     uint64_t strSize = arrayTy->getNumElements();
     // 创建result
     FunctionType *mallocType =
-        FunctionType::get(IRB.getPtrTy(), {IRB.getInt64Ty()}, false);
+        FunctionType::get(IRB.getPtrTy(), {SizeTy}, false);
     FunctionCallee mallocFunc = M.getOrInsertFunction("malloc", mallocType);
-    Value *result = IRB.CreateCall(mallocFunc, {IRB.getInt64(strSize)});
+    Value *result = IRB.CreateCall(mallocFunc, {ConstantInt::get(SizeTy, strSize)});
+    IRB.CreateCondBr(IRB.CreateICmpEQ(result, Null), failedBB, decryptBB);
+    IRB.SetInsertPoint(failedBB);
+    // 分配失败不能发布空指针，也不能让其他线程永久等待初始化。
+    IRB.CreateCall(Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap));
+    IRB.CreateUnreachable();
 
     // 创建变量key
+    IRB.SetInsertPoint(decryptBB);
     ArrayType *keyArrayType = ArrayType::get(IRB.getInt8Ty(), KeySize);
     Value *keyVar = IRB.CreateAlloca(keyArrayType, nullptr, "key");
     for (size_t i = 0; i < encKey.size(); ++i) {
@@ -166,6 +211,9 @@ public:
     IRB.CreateBr(loopBB);
 
     IRB.SetInsertPoint(exitBB);
+    // 解密完成后才发布地址；明文与缓存保持进程生命周期，不自动 free。
+    StoreInst *Publish = IRB.CreateAlignedStore(result, Cache, PtrAlign);
+    Publish->setAtomic(AtomicOrdering::Release);
     IRB.CreateRet(result);
   }
 
@@ -183,30 +231,25 @@ public:
     if (!decFunc)
       return false;
 
-    if (isDouble) {
-      for (User *user : callUser) {
-        auto *instr = dyn_cast<Instruction>(user);
-        if (!instr)
-          return false;
-
-        IRBuilder<> IRB(instr);
-        // char ** tmp = dec(*ptr)
-        Value *tmpVar = IRB.CreateAlloca(IRB.getPtrTy(), nullptr);
-        Value *arg = IRB.CreateLoad(IRB.getPtrTy(), strVar);
-        IRB.CreateStore(IRB.CreateCall(decFunc, {arg}), tmpVar);
-        instr->replaceUsesOfWith(strVar, tmpVar);
-      }
-      return true;
-    }
+    auto createDecryptedValue = [&](Instruction *Before) -> Value * {
+      IRBuilder<> IRB(Before);
+      Value *Arg = strVar;
+      if (isDouble)
+        Arg = IRB.CreateLoad(IRB.getPtrTy(), strVar);
+      Value *Plain = fixEH(IRB.CreateCall(decFunc, {Arg}));
+      if (!isDouble)
+        return Plain;
+      Value *Slot = IRB.CreateAlloca(IRB.getPtrTy(), nullptr);
+      IRB.CreateStore(Plain, Slot);
+      return Slot;
+    };
 
     for (User *user : callUser) {
       auto *instr = dyn_cast<Instruction>(user);
       if (!instr)
         return false;
 
-      IRBuilder<> IRB(instr);
-      Value *strPtr = IRB.CreateBitCast(strVar, IRB.getPtrTy());
-      instr->replaceUsesOfWith(strVar, IRB.CreateCall(decFunc, {strPtr}));
+      instr->replaceUsesOfWith(strVar, createDecryptedValue(instr));
     }
     return true;
   }
@@ -215,10 +258,12 @@ public:
 PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
   errs() << "[vllvm] EncryptoStrPass:" << M.getName() << "\n";
   bool isChanged = false;
+  // 必须先降级再收集字符串 users，避免保存随后被删除的 PHI 指针。
+  for (Function &F : M)
+    isChanged |= lowerPHINodes(F) == PHILoweringResult::Lowered;
   std::vector<EncryptoStr *> encryptoStrPool = makeEncryptoStrPool(M);
   for (EncryptoStr *encryptoStr : encryptoStrPool) {
     if (!encryptoStr->insertDecryptoCall()) {
-      isChanged = false;
       break;
     }
     isChanged = true;
@@ -258,6 +303,11 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
       if (isGlobalAnnotationUser(userFirst))
         continue;
 
+      // 公共工具回退的 PHI 保持原样，对相关字符串也回退，不能在 PHI 前插调用。
+      if (isa<PHINode>(userFirst)) {
+        supported = false;
+        break;
+      }
       if (isa<Instruction>(userFirst)) {
         encryptoStr->callUser.push_back(userFirst);
         continue;
@@ -275,6 +325,10 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
         if (isGlobalAnnotationUser(userSecond))
           continue;
 
+        if (isa<PHINode>(userSecond)) {
+          supported = false;
+          break;
+        }
         if (isa<Instruction>(userSecond)) {
           encryptoStrDouble->callUser.push_back(userSecond);
           continue;
@@ -299,7 +353,10 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
       continue;
     }
 
-    // 加密字符串
+    // 确认可处理后才生成解密函数/缓存，避免回退字符串留下无用的运行时代码。
+    encryptoStr->makeDecryptoFunc();
+    for (EncryptoStr *pending : pendingDoubleStrings)
+      pending->makeDecryptoFunc();
     encryptoStr->encryptoStr();
     encStringPool.insert(encStringPool.end(), pendingDoubleStrings.begin(),
                          pendingDoubleStrings.end());

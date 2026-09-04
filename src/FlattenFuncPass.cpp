@@ -168,9 +168,14 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   if (F.empty() || F.isDeclaration())
     return false;
 
+  // 在改变前驱关系前统一消除 PHI；收尾只需继续处理普通跨块 SSA 值。
+  PHILoweringResult PHIs = lowerPHINodes(F);
+  if (PHIs == PHILoweringResult::Unsupported)
+    return false;
+  bool Changed = PHIs == PHILoweringResult::Lowered;
   std::vector<BasicBlock *> flattenBBs;
   LowerSwitchPass lowerSwitchPass;
-  lowerSwitchPass.run(F, FAM);
+  Changed |= !lowerSwitchPass.run(F, FAM).areAllPreserved();
   LLVMContext &Ctx = F.getContext();
   Type *Int32Ty = Type::getInt32Ty(Ctx);
   BasicBlock *switchLoopEntry;
@@ -217,7 +222,7 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   }
 
   if (flattenBBs.empty()) {
-    return false;
+    return Changed;
   }
 
   BasicBlock *initialStateBB = flattenBBs.front();
@@ -233,7 +238,7 @@ bool FlattenFuncPass::doFlatten(Function &F, FunctionAnalysisManager &FAM) {
   std::optional<unsigned> initialStateIndex =
       findStateIndexForBB(flattenBBs, initialStateBB);
   if (!initialStateIndex) {
-    return false;
+    return Changed;
   }
 
   IRBuilder<> IRB(entryBB);

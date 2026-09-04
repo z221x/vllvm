@@ -15,7 +15,7 @@ else
   VLLVM_CLANG="clang"
 fi
 
-EXTRA_ARGS=()
+EXTRA_ARGS=(-Xclang -llvm-verify-each)
 if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   SDK_PATH=$(xcrun --show-sdk-path 2>/dev/null || true)
   if [ -n "$SDK_PATH" ]; then
@@ -44,7 +44,9 @@ if grep -Eq "vllvm\\.(vmfla|combined)\\.const\\.table" \
 fi
 grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
 grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
-grep -q "func_index_table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+# icall now uses the custom calling convention and module registration pool.
+grep -q "call icallcc" "$OUT_DIR/test_lvars_legacy_combo.ll"
+grep -q "__vllvm_icall.*register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
   -DVLLVM_TEST_VMFLA=1 "$SRC" \
@@ -80,6 +82,17 @@ if grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"; then
 fi
 grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
 grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
+
+# Verify intermediate IR with debug info: the generated wrapper must not share
+# the moved body's DISubprogram or contain an inlinable call without a location.
+for opt in 0 2; do
+  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g -O"$opt" -S -emit-llvm \
+    -DVLLVM_TEST_VMFLA=1 "$SRC" -o "$OUT_DIR/test_lvars_debug_O$opt.ll"
+  grep -q '!DISubprogram' "$OUT_DIR/test_lvars_debug_O$opt.ll"
+  if [ "$opt" = 0 ]; then
+    grep -Eq 'define.*vllvm.impl.*!dbg' "$OUT_DIR/test_lvars_debug_O$opt.ll"
+  fi
+done
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
