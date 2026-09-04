@@ -121,6 +121,22 @@ diff --git a/llvm/lib/IR/Verifier.cpp b/llvm/lib/IR/Verifier.cpp
 index 9afbefb8c..d72fb3fa5 100644
 --- a/llvm/lib/IR/Verifier.cpp
 +++ b/llvm/lib/IR/Verifier.cpp
+@@ -2081,6 +2081,15 @@ void Verifier::verifyParameterAttrs(AttributeSet Attrs, Type *Ty,
+   AttributeMask IncompatibleAttrs = AttributeFuncs::typeIncompatible(Ty, Attrs);
+   for (Attribute Attr : Attrs) {
++    // icallcc uses a nest i32 packed index, not the usual static-chain pointer.
++    // Its arity and exact type are checked on both functions and call sites.
++    if (Attr.hasAttribute(Attribute::Nest) && Ty->isIntegerTy(32)) {
++      const auto *F = dyn_cast<Function>(V);
++      const auto *Call = dyn_cast<CallBase>(V);
++      if ((F && F->getCallingConv() == CallingConv::ICall) ||
++          (Call && Call->getCallingConv() == CallingConv::ICall))
++        continue;
++    }
+     if (!Attr.isStringAttribute() &&
+         IncompatibleAttrs.contains(Attr.getKindAsEnum())) {
+       CheckFailed("Attribute '" + Attr.getAsString() +
+                   "' applied to incompatible type!", V);
 @@ -2931,6 +2931,20 @@ void Verifier::visitFunction(const Function &F) {
    default:
    case CallingConv::C:

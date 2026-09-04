@@ -17,12 +17,12 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-TARGET_ARGS=(-target aarch64-unknown-linux-gnu)
-LINK_ARGS=()
+TARGET_ARGS=(-target aarch64-unknown-linux-gnu -Xclang -llvm-verify-each)
+LINK_ARGS=(-Xclang -llvm-verify-each)
 if [ "$(uname -s)" = Darwin ]; then
   SDK_PATH=$(xcrun --show-sdk-path)
-  TARGET_ARGS=(-target arm64-apple-macos -isysroot "$SDK_PATH")
-  LINK_ARGS=(-isysroot "$SDK_PATH")
+  TARGET_ARGS=(-target arm64-apple-macos -isysroot "$SDK_PATH" -Xclang -llvm-verify-each)
+  LINK_ARGS=(-isysroot "$SDK_PATH" -Xclang -llvm-verify-each)
 fi
 
 "$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm \
