@@ -26,8 +26,10 @@ StringRef normalizeKind(StringRef Kind) {
     return "icall";
   if (Kind == "indirect-branch")
     return "ibr";
-  if (Kind == "local-var-struct" || Kind == "localvars")
-    return "lvars";
+  // 参数（局部变量）结构化只能捆绑到 vmfla：lvars 标注别名到 vmfla，
+  // 不再提供独立的结构化 pass。
+  if (Kind == "lvars" || Kind == "local-var-struct" || Kind == "localvars")
+    return "vmfla";
   if (Kind == "vm-flatten" || Kind == "vm_flatten" ||
       Kind == "vm-flatten-func" || Kind == "vm_flatten_func" ||
       Kind == "vm-flatten-function" || Kind == "vm_flatten_function")
@@ -58,8 +60,6 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.IndirectCall = true;
   else if (Kind == "ibr")
     Options.IndirectBranch = true;
-  else if (Kind == "lvars")
-    Options.LocalVarStruct = true;
   else if (Kind == "bcf")
     Options.BogusControlFlow = true;
   else if (Kind == "vmp")
@@ -157,7 +157,6 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   AddAttr("fla", Options.FlattenFunc);
   AddAttr("icall", Options.IndirectCall);
   AddAttr("ibr", Options.IndirectBranch);
-  AddAttr("lvars", Options.LocalVarStruct);
   AddAttr("bcf", Options.BogusControlFlow);
   AddAttr("vmp", Options.Vmp);
   AddAttr("bb2func", Options.BB2Func);
@@ -238,8 +237,6 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
     return Options.IndirectCall;
   if (Kind == "ibr")
     return Options.IndirectBranch;
-  if (Kind == "lvars")
-    return Options.LocalVarStruct;
   if (Kind == "bcf")
     return Options.BogusControlFlow;
   if (Kind == "vmp")
@@ -258,7 +255,6 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   Options.FlattenFunc |= hasVLLVMAttribute(F, "fla");
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");
-  Options.LocalVarStruct |= hasVLLVMAttribute(F, "lvars");
   Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
   Options.Vmp |= hasVLLVMAttribute(F, "vmp");
   Options.BB2Func |= hasVLLVMAttribute(F, "bb2func");

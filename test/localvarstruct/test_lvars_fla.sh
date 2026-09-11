@@ -37,16 +37,21 @@ mkdir -p "$OUT_DIR"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
   -DVLLVM_TEST_LEGACY_COMBO=1 "$SRC" \
   -o "$OUT_DIR/test_lvars_legacy_combo.ll"
-if grep -Eq "vllvm\\.(vmfla|combined)\\.const\\.table" \
-  "$OUT_DIR/test_lvars_legacy_combo.ll"; then
-  echo "fla,icall,lvars must not trigger vmfla" >&2
+# lvars 现在别名到 vmfla：fla,icall,lvars 组合会捆绑执行 vmfla，
+# 不再有独立的 localvars 偏移表。
+grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+grep -q "vllvm.vmfla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+if grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
+  echo "legacy combo must not emit a standalone localvars table" >&2
   exit 1
 fi
-grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
-grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
-# icall now uses the custom calling convention and module registration pool.
-grep -q "call icallcc" "$OUT_DIR/test_lvars_legacy_combo.ll"
-grep -q "__vllvm_icall.*register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"
+# icall 与 vmfla 在同一函数上互斥（既有设计）：vmfla 用自己的
+# func_table 承接间接调用，独立 icall 注册池不再出现。
+grep -q "func_table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+if grep -q "register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
+  echo "vmfla bundle must not emit standalone icall pools" >&2
+  exit 1
+fi
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
   -DVLLVM_TEST_VMFLA=1 "$SRC" \

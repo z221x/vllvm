@@ -34,57 +34,51 @@ strip_binary() {
 
 mkdir -p "$OUT_DIR"
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -DVLLVM_TEST_LVARS=1 "$SRC" \
+# lvars 标注现在别名到 vmfla：参数（局部变量）结构化只能捆绑在 vmfla 中
+# 执行，不再提供独立的结构化 pass。本脚本验证别名语义与捆绑产物。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
+  -emit-llvm -DVLLVM_TEST_LVARS=1 "$SRC" \
   -o "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.localvars" "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.localvars.table.* global " "$OUT_DIR/test_lvars.ll"
-grep -Eq "vllvm\\.localvars\\.table.*global \\[[0-9]+ x i32\\]" \
-  "$OUT_DIR/test_lvars.ll"
-if grep -q "vllvm.localvars.table.* constant " "$OUT_DIR/test_lvars.ll"; then
-  echo "local variable table must be writable data, not constant data" >&2
-  exit 1
-fi
-if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" \
-  "$OUT_DIR/test_lvars.ll"; then
-  echo "unexpected global key or FieldIndex decrypt sequence" >&2
-  exit 1
-fi
-grep -q "load volatile" "$OUT_DIR/test_lvars.ll"
-VOLATILE_LOADS=$(grep -Ec "load volatile i32" "$OUT_DIR/test_lvars.ll")
-if [ "$VOLATILE_LOADS" -lt 1 ]; then
-  echo "expected volatile loads for encrypted offsets" >&2
-  exit 1
-fi
-grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"
-UNIQUE_OFFSET_KEYS_IN_CODE=$(
-  grep -oE "xor i32 %[0-9]+, [-0-9]+" \
-    "$OUT_DIR/test_lvars.ll" |
-    sed -E "s/.*xor i32 %[0-9]+, ([-0-9]+).*/\\1/" |
-    sort -u |
-    wc -l |
-    tr -d " "
-)
-if [ "$UNIQUE_OFFSET_KEYS_IN_CODE" -lt 2 ]; then
-  echo "expected per-slot random offset xor keys in local code" >&2
-  exit 1
-fi
-grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
-grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
-if grep -q "alloca" "$OUT_DIR/test_lvars.ll"; then
-  echo "unexpected alloca left in transformed IR" >&2
+
+# 结构化由 vmfla 内部计划承担：只允许一张 vmfla 常量表，独立
+# localvars 偏移表不再存在。
+grep -q "vllvm.vmfla.const.table.* global " "$OUT_DIR/test_lvars.ll"
+if grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars.ll"; then
+  echo "lvars alias must not emit a standalone localvars table" >&2
   exit 1
 fi
 
-# 常量表改为参数传递：函数体搬进带表参数的私有 impl，原函数只剩传表
-# 包装调用；表全局不允许再被解密序列（数组 GEP / volatile load）直接
-# 引用。防传播伪调用点的 i8 偏移 GEP 不算直引。
-if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm\.localvars\.table' \
-  "$OUT_DIR/test_lvars.ll"; then
-  echo "local variable table must be passed as a parameter, not GEP-referenced" >&2
+# 局部变量偏移经共享表解密：volatile 读取 + 表内 key 异或，无明文 key。
+grep -q "load volatile" "$OUT_DIR/test_lvars.ll"
+grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$OUT_DIR/test_lvars.ll"
+if grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"; then
+  echo "offset keys must be loaded from the shared table" >&2
   exit 1
 fi
-grep -Eq 'call[^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*@vllvm\.localvars\.table' \
+
+# 结构化结构体来自堆分配，退出路径释放。flatten 阶段自身会创建合法的
+# reg2mem 栈槽，因此这里不做模块级"无 alloca"断言。
+grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
+grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
+# 结构化结构体类型名是结构化生效的直接证据。
+grep -q "vllvm.localvars\." "$OUT_DIR/test_lvars.ll"
+
+# 常量表改为参数传递：impl 带表参数，wrapper 经守卫伪调用点传表；
+# 表全局不允许再被解密访问模式直接引用。
+grep -Eq 'define private [^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*ptr %' \
+  "$OUT_DIR/test_lvars.ll"
+grep -Eq 'call[^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*@vllvm\.vmfla\.const\.table' \
+  "$OUT_DIR/test_lvars.ll"
+if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm\.vmfla\.const\.table' \
+  "$OUT_DIR/test_lvars.ll"; then
+  echo "vmfla constant table must be passed as a parameter, not GEP-referenced" >&2
+  exit 1
+fi
+
+# 防传播伪调用点：volatile 守卫全局 + 偏移表指针的第二调用点必须存在
+# （伪调用点块名不保留在输出 IR 中，用偏移 GEP 特征断言）。
+grep -q "vllvm.tablesink" "$OUT_DIR/test_lvars.ll"
+grep -Eq 'getelementptr .i8, ptr @vllvm\.[A-Za-z0-9_.]+, i64' \
   "$OUT_DIR/test_lvars.ll"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
@@ -106,3 +100,5 @@ if [ "$BASE_STATUS" -ne "$LVARS_STATUS" ]; then
   echo "exit status mismatch: base=$BASE_STATUS lvars=$LVARS_STATUS" >&2
   exit 1
 fi
+
+echo "test_lvars passed"

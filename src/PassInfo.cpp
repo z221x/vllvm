@@ -1,7 +1,6 @@
 #include "PassInfo.h"
 #include "BB2FuncPass.h"
 #include "MergePass.h"
-#include "Utils.h"
 #include "VLLVM.h"
 #include "VLLVMAttribute.h"
 #include "VmpPass.h"
@@ -21,8 +20,7 @@ constexpr StringLiteral VmFlattenPendingBcfAttr = "vllvm.vmfla.pending.bcf";
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
   return Options.VMFlattenFunc || Options.FlattenFunc ||
          Options.IndirectCall || Options.IndirectBranch ||
-         Options.LocalVarStruct || Options.BogusControlFlow ||
-         Options.BB2Func;
+         Options.BogusControlFlow || Options.BB2Func;
 }
 
 void protectFromLaterOptimization(Function &F) {
@@ -110,8 +108,6 @@ public:
       FunctionOptions.BogusControlFlow = false;
     }
 
-    if (FunctionOptions.LocalVarStruct)
-      RunPass(LocalVarStructPass());
     if (FunctionOptions.FlattenFunc)
       RunPass(FlattenFuncPass());
 

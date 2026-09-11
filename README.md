@@ -8,10 +8,10 @@ VLLVM 将 OLLVM 风格和实验性 VMP 混淆 Pass 集成进 LLVM/Clang 源码�
 | --- | --- | --- |
 | `enstr` | EncryptoStrPass | 字符串加密，Module Pass；每个字符串首次解密后缓存地址，后续复用。 |
 | `fla` | FlattenFuncPass | 控制流平坦化。 |
-| `lvars`（表参数化） | moveTablesToImplParams | 函数级处理后把 fla/lvars 的每函数常量表改为参数传递：函数体搬进带表参数的私有 `vllvm.impl`，原函数退化为传表包装器，并以 volatile 守卫的伪调用点阻断 -O2 过程间常量传播把参数折叠回全局。indirectbr/musttail 等场景整体回退。 |
+| `lvars`（表参数化） | moveTablesToImplParams | 函数级混淆完成后把 fla 等每函数常量表改为参数传递：函数体搬进带表参数的私有 `vllvm.impl`，原函数退化为传表包装器，并以 volatile 守卫的伪调用点阻断 -O2 过程间常量传播把参数折叠回全局。indirectbr/musttail 等场景整体回退。 |
 | `icall` | IndirectCallPass | AArch64 模块级调用表随机注册，通过 `icallcc`/`x19` 查表跳转。 |
 | `ibr` | IndirectBranchPass | 先将 `switch` 降为 if/else 分支，再随机使用混合、ADD、XOR、SUB 或明文模式处理下标，动态查全部非入口块的地址表（LLVM 禁止对入口块取地址）。 |
-| `lvars` | LocalVarStructPass | 局部变量结构体化和偏移加密；字段布局在入口 alloca 顺序基础上随机打乱，偏移不再对应源码声明顺序。 |
+| `lvars` | （vmfla 捆绑） | 局部变量结构体化不再是独立 pass：`lvars` 标注别名到 `vmfla`，结构化只能随 vmfla 捆绑执行；字段布局随机打乱，偏移经 vmfla 共享常量表加密，不再对应源码声明顺序。 |
 | `bcf` | BogusControlFlowPass | 插入基于可写全局状态和 `volatile` load 的虚假控制流。 |
 | `vmfla` | VMFlattenFuncPass | VM 风格函数平坦化，共享一张整数常量表；链路为 `bb2func + merge + vmfla`，见下文。 |
 | `bb2func` | BB2FuncPass | CFG 区域随机重组（线性链先合并再随机切分）后用 CodeExtractor 提取为 `noinline` 内部 helper（`vllvm.bb2f.<函数名>.<n>`），打散源码级块边界。 |
