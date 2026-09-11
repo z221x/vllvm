@@ -118,6 +118,32 @@ public:
     if (FunctionOptions.IndirectBranch)
       RunPass(IndirectBranchPass());
 
+    // fla/lvars 的常量表改为参数传递：函数体搬到带表参数的私有 impl，
+    // 原函数退化为传表包装器；没有表引用或不支持时保持原样。
+    if (needsOptimizerProtection(FunctionOptions) &&
+        moveTablesToImplParams(F))
+      PA.intersect(PreservedAnalyses::none());
+
+    return PA;
+  }
+};
+
+// 第二段函数级处理：执行被链路延迟的 vmfla（bb2func + merge 之后）。
+class VLLVMVMFlattenLateDispatchPass
+    : public PassInfoMixin<VLLVMVMFlattenLateDispatchPass> {
+public:
+  static bool isRequired() { return true; }
+
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    if (!F.hasFnAttribute(VmFlattenPendingAttr))
+      return PreservedAnalyses::all();
+    F.removeFnAttr(VmFlattenPendingAttr);
+    bool RunBCF = F.hasFnAttribute(VmFlattenPendingBcfAttr);
+    if (RunBCF)
+      F.removeFnAttr(VmFlattenPendingBcfAttr);
+
+    PreservedAnalyses PA = PreservedAnalyses::all();
+    PA.intersect(VMFlattenFuncPass(RunBCF).run(F, FAM));
     return PA;
   }
 };

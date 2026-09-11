@@ -139,6 +139,12 @@ bool LocalVarStructPass::moveAllocasToStruct(Function &F) {
   uint64_t CurrentOffset = 0;
   Align MaxAlign(1);
 
+  // 布局前把 alloca 顺序随机打乱：字段偏移不再与源码声明顺序对应，
+  // 反编译时无法按偏移相邻关系推断变量的原始顺序。
+  std::unique_ptr<RandomNumberGenerator> ShuffleRNG =
+      M->createRNG((Twine("vllvm.localvars.shuffle.") + F.getName()).str());
+  std::shuffle(Allocas.begin(), Allocas.end(), *ShuffleRNG);
+
   // 手工构造结构体布局；必要时插入 i8 padding 字段，保证每个旧 alloca
   // 至少保留原来的对齐要求。
   for (AllocaInst *AI : Allocas) {

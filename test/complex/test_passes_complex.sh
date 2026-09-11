@@ -82,6 +82,13 @@ run_case() {
     fi
     grep -q "vllvm.fla.const.table" "$ll"
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
+    # 常量表改为参数传递：不允许解密访问模式（数组 GEP / volatile load）
+    # 直接引用表全局；防传播伪调用点的 i8 偏移 GEP 不算直引。
+    if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm\.fla\.const\.table' "$ll"; then
+      echo "fla constant table must be passed as a parameter" >&2
+      exit 1
+    fi
+    grep -Eq 'call[^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*@vllvm\.fla\.const\.table' "$ll"
     ;;
   icall)
     grep -q "register_func" "$ll"

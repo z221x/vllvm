@@ -827,24 +827,15 @@ Function *moveBodyToTableParamImpl(Function &F, SharedConstTable &ConstTable) {
   ConstTable.setTableBase(&*ImplArg);
   ConstTable.rebaseUsesInFunction(*Impl);
 
-  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &F);
-  IRBuilder<> IRB(Entry);
   SmallVector<Value *, 16> Args;
   Args.reserve(F.arg_size() + 1);
   for (Argument &Arg : F.args())
     Args.push_back(&Arg);
   Args.push_back(ConstTable.getGlobal());
 
-  CallInst *Call = IRB.CreateCall(Impl, Args);
-  Call->setCallingConv(Impl->getCallingConv());
-  Call->setAttributes(AttributeList::get(Ctx, AttributeSet(),
-                                         F.getAttributes().getRetAttrs(),
-                                         ParamAttrs));
-
-  if (OldTy->getReturnType()->isVoidTy())
-    IRB.CreateRetVoid();
-  else
-    IRB.CreateRet(Call);
+  // 带 volatile 守卫的伪调用点：阻止 -O2 过程间常量传播把表参数折叠
+  // 回全局引用。
+  buildGuardedImplCall(F, *Impl, Args, ConstTable.getGlobal());
 
   removeVLLVMAttributes(F);
 

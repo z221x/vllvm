@@ -44,4 +44,12 @@ CallBase *fixEH(CallBase *CB);
 void insertFreeOnFunctionExits(Function &F, Value *Ptr);
 void LowerConstantExpr(Function &F);
 bool expandConstantExpr(Function &F);
+// 把函数体 GEP 引用的 fla/lvars 每函数常量表改为参数传递：函数体搬到带
+// 表参数的私有 vllvm.impl，原函数变成传表包装器；不支持场景整体回退。
+bool moveTablesToImplParams(Function &F);
+// 为带表参数的 impl 构造带 volatile 守卫的 wrapper 调用（含防传播伪调
+// 用点）；wrapper 的 F 必须是空函数体。
+void buildGuardedImplCall(Function &F, Function &Impl,
+                          ArrayRef<Value *> Args,
+                          ArrayRef<GlobalVariable *> Tables);
 #endif

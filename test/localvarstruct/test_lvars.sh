@@ -76,6 +76,17 @@ if grep -q "alloca" "$OUT_DIR/test_lvars.ll"; then
   exit 1
 fi
 
+# 常量表改为参数传递：函数体搬进带表参数的私有 impl，原函数只剩传表
+# 包装调用；表全局不允许再被解密序列（数组 GEP / volatile load）直接
+# 引用。防传播伪调用点的 i8 偏移 GEP 不算直引。
+if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm\.localvars\.table' \
+  "$OUT_DIR/test_lvars.ll"; then
+  echo "local variable table must be passed as a parameter, not GEP-referenced" >&2
+  exit 1
+fi
+grep -Eq 'call[^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*@vllvm\.localvars\.table' \
+  "$OUT_DIR/test_lvars.ll"
+
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
