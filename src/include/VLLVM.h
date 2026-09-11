@@ -12,10 +12,13 @@ struct VLLVMOptions {
   bool LocalVarStruct = false;
   bool BogusControlFlow = false;
   bool Vmp = false;
+  bool BB2Func = false;
+  bool Merge = false;
 
   bool any() const {
     return EncryptoStr || VMFlattenFunc || FlattenFunc || IndirectCall ||
-           IndirectBranch || LocalVarStruct || BogusControlFlow || Vmp;
+           IndirectBranch || LocalVarStruct || BogusControlFlow || Vmp ||
+           BB2Func || Merge;
   }
 };
 

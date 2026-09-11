@@ -7,7 +7,11 @@ NDK="${ANDROID_NDK_ROOT:-$SDK/ndk/27.0.12077973}"
 NDK_BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
 mkdir -p "$OUT_DIR/core"
 failed=0
-for mode in baseline ibr enstr fla icall lvars bcf vmfla vmp combined; do
+modes=("$@")
+if [[ ${#modes[@]} == 0 ]]; then
+  modes=(baseline ibr enstr fla icall lvars bcf vmfla vmp combined bb2func merge)
+fi
+for mode in "${modes[@]}"; do
   objects="$OUT_DIR/$mode/build/CMakeFiles/game.dir"
   if ! "$NDK_BIN/aarch64-linux-android23-clang++" -O2 -std=c++17 \
     -I"$OUT_DIR/source" -I"$NDK/sources/android/native_app_glue" \

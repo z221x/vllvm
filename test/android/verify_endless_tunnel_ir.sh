@@ -7,10 +7,19 @@ OUT_DIR="${OUT_DIR:-$ROOT/test/android/out}"
 LLVM_AS="${LLVM_AS:-$ROOT/build/llvm-macos/bin/llvm-as}"
 [[ -x "$LLVM_AS" ]] || { echo 'Build the llvm-as target first' >&2; exit 1; }
 failed=0
-for mode in baseline ibr enstr fla icall lvars bcf vmfla vmp combined; do
+modes=("$@")
+if [[ ${#modes[@]} == 0 ]]; then
+  modes=(baseline ibr enstr fla icall lvars bcf vmfla vmp combined bb2func merge)
+fi
+for mode in "${modes[@]}"; do
   passed=0
   rejected=0
   ir_dir="$OUT_DIR/$mode/build/CMakeFiles/game.dir"
+  if [[ ! -d "$ir_dir" ]]; then
+    echo "$mode: missing build directory $ir_dir"
+    failed=1
+    continue
+  fi
   mkdir -p "$OUT_DIR/$mode/verify"
   for ir in "$ir_dir"/*.ll; do
     [[ -f "$ir" ]] || continue

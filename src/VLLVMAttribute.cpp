@@ -39,6 +39,10 @@ StringRef normalizeKind(StringRef Kind) {
     return "enstr";
   if (Kind == "virtual-machine-protection" || Kind == "virtualize")
     return "vmp";
+  if (Kind == "bb2func" || Kind == "bb2f" || Kind == "bb-to-func")
+    return "bb2func";
+  if (Kind == "funcmerge" || Kind == "func-merge")
+    return "merge";
   return Kind;
 }
 
@@ -60,6 +64,10 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
     Options.BogusControlFlow = true;
   else if (Kind == "vmp")
     Options.Vmp = true;
+  else if (Kind == "bb2func")
+    Options.BB2Func = true;
+  else if (Kind == "merge")
+    Options.Merge = true;
 }
 
 bool isOptionSeparator(char C) {
@@ -152,6 +160,8 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   AddAttr("lvars", Options.LocalVarStruct);
   AddAttr("bcf", Options.BogusControlFlow);
   AddAttr("vmp", Options.Vmp);
+  AddAttr("bb2func", Options.BB2Func);
+  AddAttr("merge", Options.Merge);
   return Changed;
 }
 
@@ -234,6 +244,10 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
     return Options.BogusControlFlow;
   if (Kind == "vmp")
     return Options.Vmp;
+  if (Kind == "bb2func")
+    return Options.BB2Func;
+  if (Kind == "merge")
+    return Options.Merge;
   return false;
 }
 
@@ -247,6 +261,8 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   Options.LocalVarStruct |= hasVLLVMAttribute(F, "lvars");
   Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
   Options.Vmp |= hasVLLVMAttribute(F, "vmp");
+  Options.BB2Func |= hasVLLVMAttribute(F, "bb2func");
+  Options.Merge |= hasVLLVMAttribute(F, "merge");
   return Options;
 }
 

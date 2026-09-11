@@ -11,6 +11,8 @@ add_llvm_component_library(LLVMVLLVM
   IndirectCallPass.cpp
   IndirectBranchPass.cpp
   LocalVarStructPass.cpp
+  BB2FuncPass.cpp
+  MergePass.cpp
   PassInfo.cpp
   CryptoUtils.cpp
   VmpPass.cpp

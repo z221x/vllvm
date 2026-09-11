@@ -6,7 +6,11 @@ OUT_DIR="${OUT_DIR:-$ROOT/test/android/out}"
 REMOTE=/data/local/tmp/vllvm-endless-tunnel-988d73b
 adb -s "$ANDROID_SERIAL" shell mkdir -p "$REMOTE"
 failed=0
-for mode in baseline ibr enstr fla icall lvars bcf vmfla vmp combined; do
+modes=("$@")
+if [[ ${#modes[@]} == 0 ]]; then
+  modes=(baseline ibr enstr fla icall lvars bcf vmfla vmp combined bb2func merge)
+fi
+for mode in "${modes[@]}"; do
   if [[ ! -x "$OUT_DIR/core/$mode" ]]; then
     echo "FAIL $mode: build the core executable first"
     failed=1

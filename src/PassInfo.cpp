@@ -1,4 +1,7 @@
 #include "PassInfo.h"
+#include "BB2FuncPass.h"
+#include "MergePass.h"
+#include "Utils.h"
 #include "VLLVM.h"
 #include "VLLVMAttribute.h"
 #include "VmpPass.h"
@@ -11,11 +14,15 @@ namespace llvm::vllvm {
 namespace {
 constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
+// vmfla 链路标记：bb2func+merge 完成后，vmfla 在第二段函数级处理里执行。
+constexpr StringLiteral VmFlattenPendingAttr = "vllvm.vmfla.pending";
+constexpr StringLiteral VmFlattenPendingBcfAttr = "vllvm.vmfla.pending.bcf";
 
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
   return Options.VMFlattenFunc || Options.FlattenFunc ||
          Options.IndirectCall || Options.IndirectBranch ||
-         Options.LocalVarStruct || Options.BogusControlFlow;
+         Options.LocalVarStruct || Options.BogusControlFlow ||
+         Options.BB2Func;
 }
 
 void protectFromLaterOptimization(Function &F) {
@@ -48,7 +55,6 @@ class VLLVMFunctionDispatchPass
     : public PassInfoMixin<VLLVMFunctionDispatchPass> {
 public:
   static bool isRequired() { return true; }
-
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
     VLLVMOptions FunctionOptions = getFunctionVLLVMOptions(F);
     FunctionOptions.EncryptoStr = false;
@@ -79,8 +85,20 @@ public:
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };
 
     if (FunctionOptions.VMFlattenFunc) {
-      RunPass(VMFlattenFuncPass(FunctionOptions.BogusControlFlow));
-      FunctionOptions.BogusControlFlow = false;
+      // vmfla 链路改为 bb2func + merge + vmfla：这里先切出 helper 并打
+      // merge 标记，vmfla 延迟到模块级 MergePass 之后执行。
+      RunPass(BB2FuncPass(/*ChainToMerge=*/true));
+      F.addFnAttr(VmFlattenPendingAttr);
+      if (FunctionOptions.BogusControlFlow) {
+        F.addFnAttr(VmFlattenPendingBcfAttr);
+        FunctionOptions.BogusControlFlow = false;
+      }
+      FunctionOptions.VMFlattenFunc = false;
+    }
+
+    if (FunctionOptions.BB2Func) {
+      RunPass(BB2FuncPass());
+      FunctionOptions.BB2Func = false;
     }
 
     if (FunctionOptions.BogusControlFlow) {
@@ -113,6 +131,12 @@ void addVLLVMPasses(ModulePassManager &MPM) {
   FunctionPassManager FPM;
   FPM.addPass(VLLVMFunctionDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
+  // merge 需要 Module 视角：把 vllvm.merge 标记函数（含 vmfla 链路里
+  // bb2func 提取的 helper）按组融进 keyed dispatcher。
+  MPM.addPass(MergePass());
+  FunctionPassManager LateFPM;
+  LateFPM.addPass(VLLVMVMFlattenLateDispatchPass());
+  MPM.addPass(createModuleToFunctionPassAdaptor(std::move(LateFPM)));
 }
 
 void addVLLVMLatePasses(ModulePassManager &MPM) { MPM.addPass(VmpPass()); }

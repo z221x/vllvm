@@ -37,7 +37,7 @@ for mode in "${modes[@]}"; do
   case "$mode" in
     baseline) export VLLVM_TEST_ANNOTATION="" ;;
     combined) export VLLVM_TEST_ANNOTATION="enstr,bcf,lvars,fla,icall,ibr" ;;
-    ibr|enstr|fla|icall|lvars|bcf|vmfla|vmp) export VLLVM_TEST_ANNOTATION="$mode" ;;
+    ibr|enstr|fla|icall|lvars|bcf|vmfla|vmp|bb2func|merge) export VLLVM_TEST_ANNOTATION="$mode" ;;
     *) echo "unknown mode: $mode" >&2; exit 1 ;;
   esac
   mode_dir="$OUT_DIR/$mode"

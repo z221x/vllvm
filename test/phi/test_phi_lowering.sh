@@ -39,10 +39,19 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
       show && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
         > "$OUT_DIR/$mode.after-lowering.log"
       # The enstr dispatch is a no-op for fla/vmfla-only input.
-      if [[ $mode == fla || $mode == vmfla ]]; then
+      if [[ $mode == fla ]]; then
         awk '/^; \*\*\* IR Dump After/ { show = /VLLVMFunctionDispatchPass/ }
           show && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
           > "$OUT_DIR/$mode.after-lowering.log"
+      elif [[ $mode == vmfla ]]; then
+        # vmfla 链路 = bb2func + merge + vmfla：vmfla 移到链路末端的
+        # VLLVMVMFlattenLateDispatchPass 执行；merge dispatcher 和 bb2func
+        # helper 是链路的结构性产物（内联可能引入合法 PHI），检查 PHI
+        # 合约时排除。
+        awk '/^; \*\*\* IR Dump After/ { show = /VLLVMVMFlattenLateDispatchPass/ }
+          /^define / { skip = ($0 ~ /@vllvm\.(merge|bb2f)\./) }
+          show && !skip && !/^\[vllvm\]/ { print }' \
+          "$OUT_DIR/${mode}_O$opt.log" > "$OUT_DIR/$mode.after-lowering.log"
       fi
       grep -q '^define ' "$OUT_DIR/$mode.after-lowering.log"
       if grep -Eq ' = phi ' "$OUT_DIR/$mode.after-lowering.log"; then
