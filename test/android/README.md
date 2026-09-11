@@ -51,6 +51,92 @@ ANDROID_SERIAL=<测试设备序列号> bash test/android/test_endless_tunnel_cor
 `enstr,bcf,lvars,fla,icall,ibr`。VMP 有优先级，VMFlatten 是另一条组合实现路径，
 所以不能将 8 个标记同时开启就宣称 8 种变换都叠加生效。
 
+## 常量表参数化与 lvars 偏移乱序验证（2026-09-07，out-tables）
+
+fla/lvars 的每函数常量表改为参数传递：函数体搬进带表参数的私有
+`<函数名>.vllvm.impl`，原函数退化为传表包装器；wrapper 中以 volatile
+守卫构造动态不可达的伪调用点（传入偏移表指针），阻断 -O2 过程间常量
+传播把参数折叠回全局引用——修复前 vmfla 的表参数在 -O2 下同样会被
+打回（本轮同时给 vmfla wrapper 接入该防传播机制）。lvars 的结构体
+字段布局在入口 alloca 顺序基础上随机打乱，偏移不再对应源码声明顺序。
+indirectbr（blockaddress 无法跨函数搬移）和 musttail 场景整体回退，
+因此 combined 模式的表仍是全局直接引用；fla/lvars/不含 ibr 的组合
+完整生效。
+
+本轮重建 `baseline/fla/lvars/combined` 四种模式：96 个编译单元全部
+通过逐 Pass 校验及 `llvm-as` 独立校验；fla 模式 168 个 impl、lvars
+模式 207 个 impl，全部经 wrapper 传表调用，impl 体内解密直引为 0，
+每个 impl 均带防传播伪调用点；真机核心算法输出与普通版一致
+（`cases=57600 checksum=94e0da6c09ada8d5`，与历史轮次相同）。本地
+20 个回归全部通过，`test/lvars` 与 `test/complex` fla 用例新增
+"表只允许作为 wrapper 实参出现"的 IR 断言。
+
+```bash
+OUT_DIR="$PWD/test/android/out-tables" \
+  bash test/android/build_endless_tunnel.sh baseline fla lvars combined
+OUT_DIR="$PWD/test/android/out-tables" \
+  bash test/android/verify_endless_tunnel_ir.sh baseline fla lvars combined
+ANDROID_SERIAL=<测试设备序列号> OUT_DIR="$PWD/test/android/out-tables" \
+  bash test/android/test_endless_tunnel_core.sh baseline fla lvars combined
+```
+
+## bb2func/merge 与 vmfla 链路验证（2026-09-07，out-chain）
+
+`vmfla` 的链路改为 `bb2func + merge + vmfla`：第一段函数级处理里 bb2func
+先提取 helper 并打 merge 标记，模块级 MergePass 把 helper 融进 keyed
+dispatcher（`Hi^(Hi^编号)` 的 64 位 key 隐藏函数编号），vmfla 在链路末端
+对包含 dispatcher 调用的函数做最终平坦化。新增 `bb2func`、`merge` 两种
+单测模式；`build_endless_tunnel.sh`、`verify_endless_tunnel_ir.sh`、
+`build_endless_tunnel_core.sh`、`test_endless_tunnel_core.sh` 支持可选
+模式参数，未指定时保持原有默认列表并追加两个新模式。
+
+本轮构建 `baseline/vmfla/bb2func/merge` 四种模式，均通过签名校验，
+96 个游戏编译单元全部通过逐 Pass 校验及 `llvm-as` 独立校验，真机核心
+算法输出与普通版一致（校验和与历史轮次相同）：
+
+| 模式 | APK / KiB | IR 有效 / 24 单元 | bb2f helper 定义 | merge dispatcher | 真机原生算法回归 |
+| --- | ---: | --- | ---: | ---: | --- |
+| baseline | 328.4 | 24 | 0 | 0 | 通过 |
+| vmfla | 496.4 | 24 | 80 | 97 | 通过 |
+| bb2func | 360.4 | 24 | 421 | 0 | 通过 |
+| merge | 300.4 | 24 | 0 | 61 | 通过 |
+
+说明：
+- vmfla 模式残留的 80 个 bb2f helper 是预期回退：参数含 float/结构体等
+  不可打包类型的 helper 不满足 merge 的 int/ptr 槽位资格，保持原函数体
+  由原函数直接调用；97 个 dispatcher 里的调用点已进入 vmfla 的
+  `func_table` 间接化，所以 IR 中没有直接的 dispatcher 调用语句。
+- merge 模式下游戏函数多为虚函数（地址进 vtable），合并后保留转发
+  wrapper；单元内直接调用点有 444 处改写为携带 key 常量的 dispatcher
+  调用。
+- 真机型号 Xiaomi 2201123G，每种模式 32 随机种子 × 18 档难度 × 100 次
+  共 57,600 次障碍生成，输出 `cases=57600 checksum=94e0da6c09ada8d5`
+  与 baseline 逐字节一致。本轮只运行无界面原生算法回归，未操作手机前台。
+
+本轮 app 测试发现并修复 MergePass 两个缺陷（同步补充本地回归）：
+
+1. 调用点与 wrapper 转发调用按组内最大槽位数补零：成员参数数不一致时
+   原实现产生参数不足的调用，verifier 报 `Incorrect number of arguments`。
+2. 剪除 annotation 项时不再对原全局直接 `setInitializer`（全局类型必须
+   与初始化器一致），改为重建同名的 appending 全局再删除旧变量，并对
+   孤儿化的聚合常量显式 `destroyConstant`，否则残留常量引用会阻断
+   成员函数的 `use_empty` 删除判定。
+
+```bash
+OUT_DIR="$PWD/test/android/out-chain" \
+  bash test/android/build_endless_tunnel.sh baseline vmfla bb2func merge
+OUT_DIR="$PWD/test/android/out-chain" \
+  bash test/android/verify_endless_tunnel_ir.sh baseline vmfla bb2func merge
+OUT_DIR="$PWD/test/android/out-chain" \
+  bash test/android/build_endless_tunnel_core.sh baseline vmfla bb2func merge
+ANDROID_SERIAL=<测试设备序列号> OUT_DIR="$PWD/test/android/out-chain" \
+  bash test/android/test_endless_tunnel_core.sh baseline vmfla bb2func merge
+```
+
+本地 20 个回归（含新增 bb2func/merge/vmfla 链路）全部通过；`test/phi`
+的 vmfla PHI 合约改为在链路末端 `VLLVMVMFlattenLateDispatchPass` 之后
+检查，并排除 merge dispatcher/bb2f helper 这两类结构性产物。
+
 ## 共享 PHI 降级验证（2026-09-04，out-phi）
 
 `enstr/fla/vmfla` 现统一使用 `Utils.h` 中声明的 `lowerPHINodes`。

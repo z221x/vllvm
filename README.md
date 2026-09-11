@@ -8,12 +8,31 @@ VLLVM 将 OLLVM 风格和实验性 VMP 混淆 Pass 集成进 LLVM/Clang 源码�
 | --- | --- | --- |
 | `enstr` | EncryptoStrPass | 字符串加密，Module Pass；每个字符串首次解密后缓存地址，后续复用。 |
 | `fla` | FlattenFuncPass | 控制流平坦化。 |
+| `lvars`（表参数化） | moveTablesToImplParams | 函数级处理后把 fla/lvars 的每函数常量表改为参数传递：函数体搬进带表参数的私有 `vllvm.impl`，原函数退化为传表包装器，并以 volatile 守卫的伪调用点阻断 -O2 过程间常量传播把参数折叠回全局。indirectbr/musttail 等场景整体回退。 |
 | `icall` | IndirectCallPass | AArch64 模块级调用表随机注册，通过 `icallcc`/`x19` 查表跳转。 |
 | `ibr` | IndirectBranchPass | 先将 `switch` 降为 if/else 分支，再随机使用混合、ADD、XOR、SUB 或明文模式处理下标，动态查全部非入口块的地址表（LLVM 禁止对入口块取地址）。 |
-| `lvars` | LocalVarStructPass | 局部变量结构体化和偏移加密。 |
+| `lvars` | LocalVarStructPass | 局部变量结构体化和偏移加密；字段布局在入口 alloca 顺序基础上随机打乱，偏移不再对应源码声明顺序。 |
 | `bcf` | BogusControlFlowPass | 插入基于可写全局状态和 `volatile` load 的虚假控制流。 |
-| `vmfla` | VMFlattenFuncPass | 独立的 VM 风格函数平坦化，共享一张整数常量表。 |
+| `vmfla` | VMFlattenFuncPass | VM 风格函数平坦化，共享一张整数常量表；链路为 `bb2func + merge + vmfla`，见下文。 |
+| `bb2func` | BB2FuncPass | CFG 区域随机重组（线性链先合并再随机切分）后用 CodeExtractor 提取为 `noinline` 内部 helper（`vllvm.bb2f.<函数名>.<n>`），打散源码级块边界。 |
+| `merge` | MergePass | 把带标记的函数按组融进 keyed dispatcher（`vllvm.merge.<组名>.<n>`）：`Hi^(Hi^编号)` 的 64 位 key 隐藏函数编号，成员体内联进 case 块后原函数退化为转发 wrapper 或被删除。 |
 | `vmp` | VmpPass | 实验性 Virtual Machine Protection。 |
+
+## vmfla 链路
+
+`vllvm:vmfla` 不再单独执行平坦化，而是按固定顺序运行三段：
+
+```text
+bb2func（切出 helper 并打 merge 标记） -> merge（helper 融进 keyed dispatcher） -> vmfla（平坦化）
+```
+
+前两段在第一段函数级处理里把原函数打散成若干 helper 并融合进分发器，
+原函数的调用点变为携带 key 常量的 dispatcher 调用；vmfla 在模块级
+MergePass 之后的第二段函数级处理里执行，对包含 dispatcher 调用的函数做
+最终平坦化（dispatcher 调用进入 vmfla 的 `func_table` 间接化）。单独标注
+`vllvm:bb2func` 只执行提取，单独标注 `vllvm:merge` 只把该函数并入共享
+dispatcher 组。bb2func/merge 遇到 EH、动态栈状态、musttail、自定义调用
+约定等不支持场景时保持原函数不变。
 
 ## 构建依赖
 
@@ -84,6 +103,14 @@ VMP 相关测试：
 ./test/vmp/test_runtime_sdk.sh
 ./test/vmp/test_fallback.sh
 ./test/vmp/test_cross_targets.sh
+```
+
+bb2func/merge 与 vmfla 链路测试：
+
+```bash
+./test/bb2func/test_bb2func.sh
+./test/merge/test_merge.sh
+./test/vmfla/test_vmfla_chain.sh
 ```
 
 测试脚本会优先使用 `build/llvm-macos/bin/clang` 或 `build/llvm-linux/bin/clang`，也可通过 `CLANG=/path/to/clang` 指定编译器。
