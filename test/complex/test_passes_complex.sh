@@ -16,7 +16,7 @@ else
 fi
 
 EXTRA_ARGS=()
-if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
+if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   SDK_PATH=$(xcrun --show-sdk-path 2>/dev/null || true)
   if [ -n "$SDK_PATH" ]; then
     EXTRA_ARGS+=(-isysroot "$SDK_PATH")
@@ -107,7 +107,6 @@ run_case() {
     grep -q "define private .*vllvm.impl.*ptr %" "$ll"
     grep -q "call .*vllvm.impl.*ptr @vllvm.vmfla.const.table" "$ll"
     grep -q "getelementptr i32, ptr %" "$ll"
-    grep -q "func_table" "$ll"
     grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
     grep -q "store volatile i32 .*ptr %.*" "$ll"
     grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
@@ -115,12 +114,17 @@ run_case() {
       echo "vmfla bcf constants must use the vmfla integer constant table" >&2
       exit 1
     fi
-    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.vmfla\\.const\\.table" "$ll"; then
+    if grep -Eq 'load volatile i32, ptr getelementptr \(i32, ptr @vllvm\\.vmfla\\.const\.table' "$ll"; then
       echo "vmfla bcf table loads must use the impl table parameter" >&2
       exit 1
     fi
     if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" "$ll"; then
       echo "vmfla must use one vmfla integer constant table" >&2
+      exit 1
+    fi
+    # vmfla 不再内嵌间接调用：不允许出现 func_table 调用表。
+    if grep -q "func_table" "$ll"; then
+      echo "vmfla must not emit a func_table" >&2
       exit 1
     fi
     ;;

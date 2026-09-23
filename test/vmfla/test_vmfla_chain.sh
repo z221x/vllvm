@@ -46,11 +46,14 @@ LL="$OUT_DIR/test_vmfla_chain.ll"
 grep -Eq 'define internal[^@]*@vllvm\.bb2f\.' "$LL"
 grep -Eq '^attributes #[0-9]+ = \{[^}]*noinline' "$LL"
 
-# 断言第二段：merge dispatcher 存在；其调用点已被 vmfla 的 func_table
-# 间接化，所以断言 dispatcher 地址进入函数表。
+# 断言第二段：merge dispatcher 存在；vmfla 不再内嵌间接调用，
+# 调用点保持对 dispatcher 的直接调用。
 grep -Eq 'define internal[^@]*@vllvm\.merge\.' "$LL"
-grep -q '@vllvm\.merge\.' "$LL"
-grep -q 'func_table' "$LL"
+grep -Eq 'call [^@]*@vllvm\.merge\.' "$LL"
+if grep -q 'func_table' "$LL"; then
+  echo "vmfla chain must not emit a func_table" >&2
+  exit 1
+fi
 
 # 断言第三段：vmfla 常量表和 impl 拆分仍在，说明 vmfla 在链路末尾执行。
 grep -q 'vllvm\.vmfla\.const\.table' "$LL"

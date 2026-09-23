@@ -8,7 +8,9 @@ struct func_group {
   }
 };
 static std::vector<func_group> func_pool;
+// 注册函数
 void register_func(int func_group_id, int func_index, void *func_ptr);
+// 调用函数
 void call_func(int index);
 
 void create_func_pool(int group_count, int group_length);

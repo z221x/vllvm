@@ -29,7 +29,7 @@ bb2func（切出 helper 并打 merge 标记） -> merge（helper 融进 keyed di
 前两段在第一段函数级处理里把原函数打散成若干 helper 并融合进分发器，
 原函数的调用点变为携带 key 常量的 dispatcher 调用；vmfla 在模块级
 MergePass 之后的第二段函数级处理里执行，对包含 dispatcher 调用的函数做
-最终平坦化（dispatcher 调用进入 vmfla 的 `func_table` 间接化）。单独标注
+最终平坦化（调用点保持直接调用，不做间接化）。单独标注
 `vllvm:bb2func` 只执行提取，单独标注 `vllvm:merge` 只把该函数并入共享
 dispatcher 组。bb2func/merge 遇到 EH、动态栈状态、musttail、自定义调用
 约定等不支持场景时保持原函数不变。

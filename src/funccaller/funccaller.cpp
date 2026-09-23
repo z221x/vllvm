@@ -18,6 +18,7 @@ __attribute__((constructor)) void init_func_caller() {
 }
 // vllvm 去完成
 __attribute__((constructor)) void register_funcs() {}
+// 初始化 func_pool
 void create_func_pool(int group_count, int group_length) {
   func_pool.reserve(group_count);
   for (int i = 0; i < group_count; ++i) {
@@ -25,10 +26,25 @@ void create_func_pool(int group_count, int group_length) {
   }
   vllvm_func_pool_data = func_pool.data();
 }
+// 注册函数
 void register_func(int func_group_id, int func_index, void *func_ptr) {
-  func_pool[func_group_id].func_ptr_array[func_index] = func_ptr;
+  if (func_group_id < 0 || (size_t)func_group_id >= func_pool.size()) {
+    exit(1);
+    return;
+  }
+  if (func_index < 0 || func_index >= func_pool[func_group_id].group_length) {
+    exit(1);
+    return;
+  }
+  if (func_pool[func_group_id].func_ptr_array[func_index] == nullptr) {
+    func_pool[func_group_id].func_ptr_array[func_index] = func_ptr;
+  }
   return;
 }
+// 调用函数
+// index 调用的函数索引
+// index = (func_group_id << 8) + func_index
+// 使用 x19 传参
 #if defined(__aarch64__)
 __attribute__((naked)) void call_func(int index) {
 #if defined(__APPLE__)

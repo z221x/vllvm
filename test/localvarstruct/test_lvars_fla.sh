@@ -45,9 +45,12 @@ if grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
   echo "legacy combo must not emit a standalone localvars table" >&2
   exit 1
 fi
-# icall 与 vmfla 在同一函数上互斥（既有设计）：vmfla 用自己的
-# func_table 承接间接调用，独立 icall 注册池不再出现。
-grep -q "func_table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+# icall 与 vmfla 在同一函数上互斥（既有设计）：vmfla 不再内嵌
+# func_table 间接化，独立 icall 注册池也不会出现。
+if grep -q "func_table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
+  echo "vmfla bundle must not emit a func_table" >&2
+  exit 1
+fi
 if grep -q "register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
   echo "vmfla bundle must not emit standalone icall pools" >&2
   exit 1

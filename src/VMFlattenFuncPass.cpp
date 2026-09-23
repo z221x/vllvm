@@ -2,7 +2,6 @@
 
 #include "CryptoUtils.h"
 #include "Utils.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -141,15 +140,6 @@ struct FlattenPlan {
   Value *RuntimeIndexPtr = nullptr;
 };
 
-struct IndirectCallPlan {
-  bool Enabled = false;
-  std::vector<Function *> Callees;
-  DenseMap<Function *, unsigned> CalleeNums;
-  std::vector<CallInst *> CallSites;
-  DenseMap<CallInst *, unsigned> CallSiteConstIndexes;
-  DenseMap<CallInst *, unsigned> CallSiteKeyConstIndexes;
-};
-
 struct LocalSlot {
   AllocaInst *Alloca = nullptr;
   unsigned FieldIndex = 0;
@@ -163,18 +153,6 @@ struct LocalVarPlan {
   Align MaxAlign = Align(1);
   SmallVector<LocalSlot, 16> Slots;
 };
-
-uint32_t makeNonZeroKey(CryptoUtils &Crypto, size_t Index) {
-  uint32_t Key = Crypto.getRandom32();
-  if (Key != 0)
-    return Key;
-
-  Key = Crypto.getRandom32();
-  if (Key != 0)
-    return Key;
-
-  return 0xA5A5A5A5U ^ static_cast<uint32_t>(Index + 1);
-}
 
 uint32_t makeNonZeroKey(RandomNumberGenerator &RNG, unsigned Index) {
   uint32_t Key = static_cast<uint32_t>(RNG());
@@ -240,7 +218,7 @@ Value *moveFromCurrentTableIndex(IRBuilder<> &IRB, Value *CurrentIndex,
       ConstantInt::get(Int32Ty, CurrentConstIndex - TargetConstIndex), Name);
 }
 
-// icall/lvars 的常量项不直接用固定下标取；优先从当前 flatten case
+// lvars 的常量项不直接用固定下标取；优先从当前 flatten case
 // 的表下标加减偏移得到目标下标，让运行时只围绕这一个 index 变化。
 Value *loadConstViaFlattenIndex(IRBuilder<> &IRB, SharedConstTable &ConstTable,
                                 const FlattenPlan *Plan,
@@ -1126,106 +1104,6 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
   return true;
 }
 
-IndirectCallPlan planIndirectCalls(Function &F, CryptoUtils &Crypto,
-                                   SharedConstTable &ConstTable) {
-  IndirectCallPlan Plan;
-  if (F.empty() || F.isDeclaration())
-    return Plan;
-
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      auto *Call = dyn_cast<CallInst>(&I);
-      if (!Call)
-        continue;
-
-      Function *Callee = Call->getCalledFunction();
-      if (!Callee || Callee->isIntrinsic() || Callee->isDeclaration() ||
-          Call->isMustTailCall())
-        continue;
-
-      Plan.CallSites.push_back(Call);
-      if (std::find(Plan.Callees.begin(), Plan.Callees.end(), Callee) ==
-          Plan.Callees.end()) {
-        Plan.Callees.push_back(Callee);
-      }
-    }
-  }
-
-  if (Plan.CallSites.empty() || Plan.Callees.empty())
-    return Plan;
-
-  std::default_random_engine ShuffleEngine(Crypto.getRandom32());
-  std::shuffle(Plan.Callees.begin(), Plan.Callees.end(), ShuffleEngine);
-  for (unsigned I = 0; I < Plan.Callees.size(); ++I)
-    Plan.CalleeNums[Plan.Callees[I]] = I;
-
-  for (unsigned I = 0; I < Plan.CallSites.size(); ++I) {
-    CallInst *CallSite = Plan.CallSites[I];
-    Function *Callee = CallSite->getCalledFunction();
-    uint32_t Key = makeNonZeroKey(Crypto, I);
-    uint32_t EncryptedIndex =
-        static_cast<uint32_t>(Plan.CalleeNums[Callee]) ^ Key;
-    Plan.CallSiteConstIndexes[CallSite] = ConstTable.add(EncryptedIndex);
-    Plan.CallSiteKeyConstIndexes[CallSite] = ConstTable.add(Key);
-  }
-
-  Plan.Enabled = true;
-  return Plan;
-}
-
-GlobalVariable *createFuncTable(Function &F, const IndirectCallPlan &Plan) {
-  if (!Plan.Enabled)
-    return nullptr;
-
-  Module *M = F.getParent();
-  LLVMContext &Ctx = M->getContext();
-  Type *VoidPtrTy = PointerType::getUnqual(Ctx);
-  ArrayType *FuncTableTy = ArrayType::get(VoidPtrTy, Plan.Callees.size());
-  std::vector<Constant *> FuncPtrs;
-  FuncPtrs.reserve(Plan.Callees.size());
-
-  for (Function *Callee : Plan.Callees)
-    FuncPtrs.push_back(ConstantExpr::getBitCast(Callee, VoidPtrTy));
-
-  return new GlobalVariable(*M, FuncTableTy, true, GlobalValue::PrivateLinkage,
-                            ConstantArray::get(FuncTableTy, FuncPtrs),
-                            (Twine("func_table") + F.getName()).str());
-}
-
-bool applyIndirectCalls(Function &F, const IndirectCallPlan &Plan,
-                        SharedConstTable &ConstTable,
-                        const FlattenPlan *FPlan) {
-  if (!Plan.Enabled)
-    return false;
-
-  GlobalVariable *FuncTableGV = createFuncTable(F, Plan);
-  if (!FuncTableGV)
-    return false;
-
-  LLVMContext &Ctx = F.getContext();
-  auto *FuncTableTy = cast<ArrayType>(FuncTableGV->getValueType());
-
-  for (CallInst *Call : Plan.CallSites) {
-    IRBuilder<> IRB(Call);
-    Value *EncryptedIndex = loadConstViaFlattenIndex(
-        IRB, ConstTable, FPlan, Plan.CallSiteConstIndexes.lookup(Call),
-        "vllvm.icall.enc_index");
-    Value *IndexKey = loadConstViaFlattenIndex(
-        IRB, ConstTable, FPlan, Plan.CallSiteKeyConstIndexes.lookup(Call),
-        "vllvm.icall.index_key");
-    Value *Index =
-        IRB.CreateXor(EncryptedIndex, IndexKey, "vllvm.icall.index");
-    Value *FuncPtr = IRB.CreateInBoundsGEP(
-        FuncTableTy, FuncTableGV,
-        {ConstantInt::get(Type::getInt32Ty(Ctx), 0), Index});
-    Value *FuncAddr =
-        IRB.CreateLoad(IRB.getPtrTy(), FuncPtr, "vllvm.icall.func");
-    Call->setCalledOperand(FuncAddr);
-  }
-
-  return true;
-}
-
 LocalVarPlan planLocalVars(Function &F, SharedConstTable &ConstTable) {
   LocalVarPlan Plan;
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked) ||
@@ -1591,9 +1469,8 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
   errs() << "[vllvm] VMFlattenFuncPass:" << F.getName() << "\n";
 
   FlattenPlan FPlan = planFlatten(F, FAM, Crypto, ConstTable);
-  IndirectCallPlan IPlan = planIndirectCalls(F, Crypto, ConstTable);
 
-  if (!FPlan.Enabled && !IPlan.Enabled) {
+  if (!FPlan.Enabled) {
     LocalVarPlan LPlan = planLocalVars(F, ConstTable);
     if (!LPlan.Enabled && ConstTable.empty())
       return Changed;
@@ -1628,10 +1505,6 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
   if (FPlan.Enabled)
     ensureFlattenRuntimeIndex(*Impl, FPlan,
                               Type::getInt32Ty(Impl->getContext()));
-
-  if (IPlan.Enabled)
-    Changed |= applyIndirectCalls(*Impl, IPlan, ConstTable,
-                                  FPlan.Enabled ? &FPlan : nullptr);
 
   LocalVarPlan LPlan = planLocalVars(*Impl, ConstTable);
   if (LPlan.Enabled)
