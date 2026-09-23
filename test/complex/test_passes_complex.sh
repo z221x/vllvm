@@ -16,7 +16,7 @@ else
 fi
 
 EXTRA_ARGS=()
-if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
+if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   SDK_PATH=$(xcrun --show-sdk-path 2>/dev/null || true)
   if [ -n "$SDK_PATH" ]; then
     EXTRA_ARGS+=(-isysroot "$SDK_PATH")
@@ -98,6 +98,13 @@ run_case() {
       echo "icall packed indexes must be call-site constants" >&2
       exit 1
     fi
+    # 被调方语义：icall 目标不允许再被直接调用。
+    if grep -Eq "call [^@]*@(op_add|op_sub|op_mix|score_string|recursive_flow)\(" "$ll"; then
+      echo "direct calls to icall targets must be rewritten" >&2
+      exit 1
+    fi
+    # 地址被取用的 op_* 不加密，纯直调目标（如 recursive_flow）加密。
+    grep -q "vllvm.icall.crypt" "$ll"
     ;;
   ibr)
     grep -q "indirectbr" "$ll"
@@ -114,7 +121,7 @@ run_case() {
       echo "vmfla bcf constants must use the vmfla integer constant table" >&2
       exit 1
     fi
-    if grep -Eq 'load volatile i32, ptr getelementptr \(i32, ptr @vllvm\\.vmfla\\.const\.table' "$ll"; then
+    if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.vmfla\\.const\\.table" "$ll"; then
       echo "vmfla bcf table loads must use the impl table parameter" >&2
       exit 1
     fi
@@ -133,6 +140,6 @@ run_case() {
 
 # run_case enstr
 # run_case fla
-# run_case icall
 # run_case ibr
+run_case icall
 run_case vmfla

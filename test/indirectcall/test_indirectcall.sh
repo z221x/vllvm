@@ -42,7 +42,18 @@ grep -Eq "i32 0, ptr @__vllvm_icall\..*\.register_funcs" "$OUT_DIR/icall.ll"
 grep -Eq "ubfx[[:space:]]+w16, w19, #16, #8" "$OUT_DIR/icall.s"
 grep -Eq "mov[[:space:]]+w19," "$OUT_DIR/icall.s"
 
-# 全模块只有 add_bias、mix_double、sum_nine 三个去重后的注册目标。
+# 参数加密：icall 目标全部走随机可逆运算链（调用点正向、入口逆向；
+# 值名字会被后续优化剥掉，用函数属性断言加密生效）。
+grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"
+
+# 被调方语义：注册目标不允许再被直接调用（函数地址仅作为
+# register_func 参数出现）。
+if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine)\(" "$OUT_DIR/icall.ll"; then
+  echo "direct calls to icall targets must be rewritten" >&2
+  exit 1
+fi
+
+# 全模块只有 add_bias、mix_double、sum_nine 三个 icall 注册目标。
 REGISTER_CALLS=$(grep -Ec "call void @.*register_func" "$OUT_DIR/icall.ll")
 if [ "$REGISTER_CALLS" -ne 3 ]; then
   echo "expected 3 deduplicated register_func calls, got $REGISTER_CALLS" >&2
