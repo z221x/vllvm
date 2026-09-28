@@ -1,4 +1,4 @@
-#include "../../src/vminterpreter/interpreter.h"
+#include "../../src/c_func/vminterpreter/interpreter.h"
 
 #include <cassert>
 #include <cstdint>

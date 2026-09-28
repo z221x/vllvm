@@ -2,7 +2,7 @@
 
 ## 项目结构与模块组织
 
-`src/` 是 VLLVM 的主源码目录。Pass 头文件在 `src/include/`，VM 解释器和运行时 bitcode 生成逻辑在 `src/vminterpreter/`，实验性 VMP target 在 `src/vmtarget/VMP/`。`test/` 按 pass 分组存放 shell 回归测试，例如 `test/complex/`、`test/localvarstruct/`、`test/vmp/`。`docs/` 保存设计说明，`patches/` 保存接入 LLVM 21.1 的补丁。
+`src/` 是 VLLVM 的主源码目录。Pass 头文件在 `src/include/`，VM 解释器和运行时 bitcode 生成逻辑在 `src/c_func/vminterpreter/`，间接调用运行时辅助在 `src/c_func/funccaller/`，实验性 VMP target 在 `src/VMP/`。`test/` 按 pass 分组存放 shell 回归测试，例如 `test/complex/`、`test/localvarstruct/`、`test/vmp/`。`docs/` 保存设计说明，`patches/` 保存接入 LLVM 21.1 的补丁。
 
 优先修改 `src/` 和 `patches/`。`llvm-project-21.1.0/` 是构建用 LLVM 源码树，构建脚本会把 VLLVM 文件同步进去，不应把其中的 VLLVM 拷贝当作主源码编辑。
 

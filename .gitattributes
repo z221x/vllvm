@@ -1,0 +1,5 @@
+# git apply 需要 LF 补丁；shell 脚本需要 LF 才能在 Git Bash/WSL 下执行
+*.patch -text
+*.sh text eol=lf
+*.py text eol=lf
+*.ps1 text eol=crlf

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../include/VmpCommon.h"
+#include "../../include/VmpCommon.h"
 
 #include <cstdint>
 

@@ -2,7 +2,7 @@
 
 namespace llvm::vllvm {
 namespace {
-#include "vminterpreter/VmpRuntimeBitcode.inc"
+#include "c_func/vminterpreter/VmpRuntimeBitcode.inc"
 } // namespace
 
 ArrayRef<std::uint8_t> getVmpRuntimeBitcode() {

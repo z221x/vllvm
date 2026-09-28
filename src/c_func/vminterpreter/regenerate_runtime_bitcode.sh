@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-ROOT_DIR=$(cd -- "$SCRIPT_DIR/../.." && pwd)
+ROOT_DIR=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 CLANGXX=${CLANGXX:-"$ROOT_DIR/build/llvm-macos/bin/clang++"}
 OUTPUT="$SCRIPT_DIR/VmpRuntimeBitcode.inc"
 MODE=${1:-generate}
@@ -19,7 +19,7 @@ fi
   "$CLANGXX" -std=c++17 -O2 -fno-exceptions -fno-rtti \
     -fno-threadsafe-statics -frandom-seed=vllvm-vmp-runtime -emit-llvm -c \
     -DVLLVM_VMP_AARCH64_RUNTIME=1 \
-    src/vminterpreter/interpreter.cpp -Isrc/include \
+    src/c_func/vminterpreter/interpreter.cpp -Isrc/include \
     "${EXTRA_ARGS[@]}" -o "$TEMP_DIR/VmpRuntime.bc"
 )
 python3 "$SCRIPT_DIR/embed_bitcode.py" "$TEMP_DIR/VmpRuntime.bc" \

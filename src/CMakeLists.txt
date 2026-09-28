@@ -16,7 +16,7 @@ add_llvm_component_library(LLVMVLLVM
   CryptoUtils.cpp
   VmpPass.cpp
   VmpRuntimeEmbed.cpp
-  vminterpreter/VmpRuntimeBitcode.inc
+  c_func/vminterpreter/VmpRuntimeBitcode.inc
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/VLLVM

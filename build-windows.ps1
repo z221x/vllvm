@@ -60,7 +60,7 @@ function Copy-VllvmSources {
   cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.inc")
   cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.cpp")
   cmake -E rm -f (Join-Path $DstInclude "VmpTargetBytecodeCompiler.h")
-  cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "vmtarget") "VMP") $VmpTarget
+  cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "VMP") $VmpTarget
 
   cmake -E copy_if_different (Join-Path (Join-Path $RepoRoot "src") "CMakeLists.txt") (Join-Path $Dst "CMakeLists.txt")
   Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src") -Filter *.cpp | ForEach-Object {
@@ -69,7 +69,8 @@ function Copy-VllvmSources {
   Get-ChildItem -LiteralPath (Join-Path (Join-Path $RepoRoot "src") "include") -Filter *.h | ForEach-Object {
     cmake -E copy_if_different $_.FullName (Join-Path $DstInclude $_.Name)
   }
-  cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "vminterpreter") (Join-Path $Dst "vminterpreter")
+  cmake -E remove_directory (Join-Path $Dst "vminterpreter")
+  cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "c_func\vminterpreter") (Join-Path $Dst "c_func\vminterpreter")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VLLVM.h") `
   (Join-Path $PublicInclude "VLLVM.h")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VmpCommon.h") `

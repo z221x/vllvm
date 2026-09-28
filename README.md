@@ -145,13 +145,14 @@ PHI 所在块/前驱是 `catchswitch`，或 incoming 是该前驱 `callbr` 的�
 ## 项目结构
 
 ```text
-src/                 VLLVM Pass 主源码
-src/include/         Pass 和公共头文件
-src/vminterpreter/   VMP 解释器与 runtime bitcode 生成
-src/vmtarget/VMP/    实验性 LLVM VMP target
-patches/             LLVM/Clang 集成补丁
-test/                按 pass 分组的回归测试
-docs/                设计文档
+src/                     VLLVM Pass 主源码
+src/include/             Pass 和公共头文件
+src/c_func/vminterpreter/ VMP 解释器与 runtime bitcode 生成
+src/c_func/funccaller/   间接调用运行时辅助
+src/VMP/                 实验性 LLVM VMP target
+patches/                 LLVM/Clang 集成补丁
+test/                    按 pass 分组的回归测试
+docs/                    设计文档
 ```
 
 开发时优先修改 `src/` 和 `patches/`。`llvm-project-21.1.0/` 是构建工作树，VLLVM 文件由脚本同步生成，不应作为主源码维护。

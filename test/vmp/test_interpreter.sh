@@ -7,7 +7,7 @@ CXX=${CXX:-clang++}
 
 mkdir -p "$OUT_DIR"
 "$CXX" -std=c++20 -Wall -Wextra -Werror -DVLLVM_VMP_TESTING=1 \
-  "$ROOT_DIR/src/vminterpreter/interpreter.cpp" \
+  "$ROOT_DIR/src/c_func/vminterpreter/interpreter.cpp" \
   "$ROOT_DIR/test/vmp/interpreter_test.cpp" \
   -o "$OUT_DIR/interpreter_test"
 "$OUT_DIR/interpreter_test"
