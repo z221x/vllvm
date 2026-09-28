@@ -1,6 +1,7 @@
 #include "IndirectCallPass.h"
 
 #include "VLLVMAttribute.h"
+#include "config/VLLVMConfig.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -519,6 +520,10 @@ void rewriteCall(const ICallRuntime &Runtime, uint32_t PackedIndex,
 PreservedAnalyses IndirectCallPass::run(Module &M,
                                         ModuleAnalysisManager &MAM) {
   (void)MAM;
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("icall", 1, 3);
+  if (!Config.isEnabled("icall"))
+    return PreservedAnalyses::all();
   Triple TT(M.getTargetTriple());
   if (TT.getArch() != Triple::aarch64 && TT.getArch() != Triple::aarch64_be)
     return PreservedAnalyses::all();

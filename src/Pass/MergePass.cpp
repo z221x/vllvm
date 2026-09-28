@@ -1,6 +1,7 @@
 #include "MergePass.h"
 
 #include "CryptoUtils.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -382,6 +383,10 @@ bool emitMergeGroup(Module &M, CryptoUtils &Crypto,
 } // namespace
 
 PreservedAnalyses MergePass::run(Module &M, ModuleAnalysisManager &) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("merge", 1, 3);
+  if (!Config.isEnabled("merge"))
+    return PreservedAnalyses::all();
   CryptoUtils Crypto(&M);
 
   // 按标记值分组：bb2func 链路写入源函数名（该函数的 helper 融合为组），

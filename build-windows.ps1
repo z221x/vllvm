@@ -56,21 +56,35 @@ function Copy-VllvmSources {
 
   cmake -E make_directory $DstInclude
   cmake -E make_directory $PublicInclude
-  cmake -E remove_directory $VmpTarget
   cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.inc")
   cmake -E rm -f (Join-Path $Dst "VmpTargetBytecodeCompiler.cpp")
   cmake -E rm -f (Join-Path $DstInclude "VmpTargetBytecodeCompiler.h")
+  Get-ChildItem -LiteralPath $Dst -Filter *.cpp -ErrorAction SilentlyContinue | ForEach-Object {
+    cmake -E rm -f $_.FullName
+  }
+  cmake -E remove_directory (Join-Path $Dst "vminterpreter")
+
+  # 分层子目录原样镜像进 LLVM 树。
+  foreach ($Dir in @("Pass", "attribute", "common", "config")) {
+    $SrcDir = Join-Path (Join-Path $RepoRoot "src") $Dir
+    if (-not (Test-Path $SrcDir)) { continue }
+    cmake -E remove_directory (Join-Path $Dst $Dir)
+    cmake -E copy_directory $SrcDir (Join-Path $Dst $Dir)
+  }
+
+  # VMP target；VmpRuntimeEmbed.cpp 属于 Transforms 库，单独放回 Dst 根。
+  cmake -E remove_directory $VmpTarget
   cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "VMP") $VmpTarget
+  cmake -E rm -f (Join-Path $VmpTarget "VmpRuntimeEmbed.cpp")
+  cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "VMP") "VmpRuntimeEmbed.cpp") (Join-Path $Dst "VmpRuntimeEmbed.cpp")
+
+  cmake -E remove_directory (Join-Path $Dst "c_func")
+  cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "c_func") "vminterpreter") (Join-Path $Dst "c_func\vminterpreter")
 
   cmake -E copy_if_different (Join-Path (Join-Path $RepoRoot "src") "CMakeLists.txt") (Join-Path $Dst "CMakeLists.txt")
-  Get-ChildItem -LiteralPath (Join-Path $RepoRoot "src") -Filter *.cpp | ForEach-Object {
-    cmake -E copy_if_different $_.FullName (Join-Path $Dst $_.Name)
-  }
   Get-ChildItem -LiteralPath (Join-Path (Join-Path $RepoRoot "src") "include") -Filter *.h | ForEach-Object {
     cmake -E copy_if_different $_.FullName (Join-Path $DstInclude $_.Name)
   }
-  cmake -E remove_directory (Join-Path $Dst "vminterpreter")
-  cmake -E copy_directory (Join-Path (Join-Path $RepoRoot "src") "c_func\vminterpreter") (Join-Path $Dst "c_func\vminterpreter")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VLLVM.h") `
   (Join-Path $PublicInclude "VLLVM.h")
   cmake -E copy_if_different (Join-Path (Join-Path (Join-Path $RepoRoot "src") "include") "VmpCommon.h") `
@@ -141,7 +155,13 @@ function Configure-AndBuild {
   )
 
   cmake @Args
+  if ($LASTEXITCODE -ne 0) {
+    throw "cmake configure failed"
+  }
   cmake --build $LLVMBuild --target clang clangd lld llc --parallel $Jobs
+  if ($LASTEXITCODE -ne 0) {
+    throw "cmake build failed"
+  }
 }
 
 Require-Command cmake

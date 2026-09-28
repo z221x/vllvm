@@ -1,6 +1,7 @@
 #include "BB2FuncPass.h"
 
 #include "CryptoUtils.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -752,6 +753,10 @@ bool runBB2FuncOnFunction(Function &F, bool ChainToMerge) {
 } // namespace
 
 PreservedAnalyses BB2FuncPass::run(Function &F, FunctionAnalysisManager &) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("bb2func", 1, 3);
+  if (!Config.isEnabled("bb2func"))
+    return PreservedAnalyses::all();
   bool Changed = runBB2FuncOnFunction(F, ChainToMerge);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

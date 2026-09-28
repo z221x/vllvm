@@ -3,6 +3,7 @@
 #include "VLLVMAttribute.h"
 #include "VmpCommon.h"
 #include "VmpFunctionCompiler.h"
+#include "config/VLLVMConfig.h"
 #include "VmpRuntimeEmbed.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -729,6 +730,10 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
 } // namespace
 
 PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("vmp", 1, 3);
+  if (!Config.isEnabled("vmp"))
+    return PreservedAnalyses::all();
   bool RestoredPreparation = false;
   SmallVector<Function *, 8> Candidates;
   for (Function &F : M) {

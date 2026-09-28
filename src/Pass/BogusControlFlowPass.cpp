@@ -1,6 +1,8 @@
 #include "BogusControlFlowPass.h"
 #include "Utils.h"
 
+#include "config/VLLVMConfig.h"
+
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
@@ -8,6 +10,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 
@@ -17,7 +20,6 @@ namespace {
 // 独立 BCF 也使用随机覆盖率，避免每个函数都生成同构 fake 分支。
 constexpr unsigned BogusMinProbability = 55;
 constexpr unsigned BogusProbabilityRange = 36;
-constexpr unsigned BogusLoops = 1;
 
 bool isGeneratedBlock(BasicBlock &BB) {
   return BB.hasName() && BB.getName().starts_with("vllvm.bcf.");
@@ -71,12 +73,20 @@ LoadInst *createVolatileI32Load(IRBuilder<> &IRB, GlobalVariable *GV,
 
 PreservedAnalyses BogusControlFlowPass::run(Function &F,
                                             FunctionAnalysisManager &FAM) {
+  // bcf 混淆等级（Pass 自定语义）：1=单轮随机覆盖；2=双轮；
+  // 3=三轮且全量覆盖候选块；0=关闭。
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("bcf", 1, 3);
+  unsigned Level = Config.getLevel("bcf");
+
   errs() << "[vllvm] BogusControlFlowPass:" << F.getName() << "\n";
-  bool IsChanged = runBogusControlFlow(F);
+  if (Level == 0)
+    return PreservedAnalyses::all();
+  bool IsChanged = runBogusControlFlow(F, Level);
   return IsChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
-bool BogusControlFlowPass::runBogusControlFlow(Function &F) {
+bool BogusControlFlowPass::runBogusControlFlow(Function &F, unsigned Level) {
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
     return false;
 
@@ -86,12 +96,16 @@ bool BogusControlFlowPass::runBogusControlFlow(Function &F) {
   GlobalVariable *X = createPredicateGlobal(F, "x", XSeed);
   GlobalVariable *Y = createPredicateGlobal(F, "y", YSeed);
 
+  unsigned Loops = std::min(Level, 3u);
   bool Changed = false;
-  for (unsigned Loop = 0; Loop < BogusLoops; ++Loop) {
+  for (unsigned Loop = 0; Loop < Loops; ++Loop) {
     SmallVector<BasicBlock *, 32> Candidates;
     SmallVector<BasicBlock *, 32> Targets;
+    // 3 级全量覆盖候选块；低等级维持随机覆盖率。
     unsigned Probability =
-        BogusMinProbability + (Crypto.getRandom32() % BogusProbabilityRange);
+        Level >= 3 ? 100
+                   : BogusMinProbability +
+                         (Crypto.getRandom32() % BogusProbabilityRange);
     // 随机选择一部分可拆块，减少 CFG 中整齐重复的菱形结构。
     for (BasicBlock &BB : F) {
       if (!canSplitForBogusFlow(BB))

@@ -16,7 +16,7 @@ public:
   static bool isRequired() { return true; }
 
 private:
-  bool runBogusControlFlow(Function &F);
+  bool runBogusControlFlow(Function &F, unsigned Level);
   bool addBogusFlow(BasicBlock &BB, GlobalVariable *X, GlobalVariable *Y,
                     uint32_t XSeed, uint32_t YSeed, CryptoUtils &Crypto);
   Value *createOpaquePredicate(IRBuilder<> &IRB, GlobalVariable *X,

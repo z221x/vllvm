@@ -2,6 +2,7 @@
 
 #include "CryptoUtils.h"
 #include "Utils.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Twine.h"
@@ -1439,6 +1440,10 @@ bool moveTablesToImplParams(Function &F) {
 
 PreservedAnalyses VMFlattenFuncPass::run(Function &F,
                                          FunctionAnalysisManager &FAM) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("vmfla", 1, 3);
+  if (!Config.isEnabled("vmfla"))
+    return PreservedAnalyses::all();
   bool Changed = runVMFlattenFunc(F, FAM);
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

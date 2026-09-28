@@ -44,21 +44,32 @@ copy_vllvm_sources() {
   cmake -E make_directory "$dst/include"
   cmake -E make_directory "$public_include"
   cmake -E rm -f "$dst"/*.cpp "$dst/include"/*.h
-  cmake -E remove_directory "$vmp_target"
   cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.inc"
   cmake -E rm -f "$dst/VmpTargetBytecodeCompiler.cpp"
   cmake -E rm -f "$dst/include/VmpTargetBytecodeCompiler.h"
+  cmake -E remove_directory "$dst/vminterpreter"
+
+  # 分层子目录原样镜像进 LLVM 树。
+  for dir in Pass attribute common config; do
+    [ -d "$ROOT_DIR/src/$dir" ] || continue
+    cmake -E remove_directory "$dst/$dir"
+    cmake -E copy_directory "$ROOT_DIR/src/$dir" "$dst/$dir"
+  done
+
+  # VMP target；VmpRuntimeEmbed.cpp 属于 Transforms 库，单独放回 dst 根。
+  cmake -E remove_directory "$vmp_target"
   cmake -E copy_directory "$ROOT_DIR/src/VMP" "$vmp_target"
+  cmake -E rm -f "$vmp_target/VmpRuntimeEmbed.cpp"
+  cmake -E copy_if_different "$ROOT_DIR/src/VMP/VmpRuntimeEmbed.cpp" \
+    "$dst/VmpRuntimeEmbed.cpp"
+
+  cmake -E remove_directory "$dst/c_func"
+  cmake -E copy_directory "$ROOT_DIR/src/c_func/vminterpreter" "$dst/c_func/vminterpreter"
 
   cmake -E copy_if_different "$ROOT_DIR/src/CMakeLists.txt" "$dst/CMakeLists.txt"
-  for file in "$ROOT_DIR"/src/*.cpp; do
-    cmake -E copy_if_different "$file" "$dst/$(basename "$file")"
-  done
   for file in "$ROOT_DIR"/src/include/*.h; do
     cmake -E copy_if_different "$file" "$dst/include/$(basename "$file")"
   done
-  cmake -E remove_directory "$dst/vminterpreter"
-  cmake -E copy_directory "$ROOT_DIR/src/c_func/vminterpreter" "$dst/c_func/vminterpreter"
   cmake -E copy_if_different "$ROOT_DIR/src/include/VLLVM.h" \
     "$public_include/VLLVM.h"
   cmake -E copy_if_different "$ROOT_DIR/src/include/VmpCommon.h" \

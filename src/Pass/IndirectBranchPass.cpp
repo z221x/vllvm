@@ -1,5 +1,6 @@
 #include "IndirectBranchPass.h"
 #include "Utils.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
@@ -26,7 +27,11 @@ BranchInst *getSupportedBranchTerminator(BasicBlock &BB) {
 
 PreservedAnalyses IndirectBranchPass::run(Function &F,
                                           FunctionAnalysisManager &FAM) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("ibr", 1, 3);
   errs() << "[vllvm] IndirectBranchPass:" << F.getName() << "\n";
+  if (!Config.isEnabled("ibr"))
+    return PreservedAnalyses::all();
   // indirectbr 会改变 funclet 的结构约束，暂时保留 EH 函数原始实现。
   if (F.hasPersonalityFn()) {
     errs() << "[vllvm] IndirectBranchPass skipped EH function:"

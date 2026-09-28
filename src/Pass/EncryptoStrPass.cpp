@@ -1,6 +1,7 @@
 #include "EncryptoStrPass.h"
 #include "Utils.h"
 #include "VLLVMAttribute.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
@@ -256,7 +257,11 @@ public:
 };
 
 PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("enstr", 1, 3);
   errs() << "[vllvm] EncryptoStrPass:" << M.getName() << "\n";
+  if (!Config.isEnabled("enstr"))
+    return PreservedAnalyses::all();
   bool isChanged = false;
   // 必须先降级再收集字符串 users，避免保存随后被删除的 PHI 指针。
   for (Function &F : M)

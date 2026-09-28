@@ -1,6 +1,7 @@
 #include "FlattenFuncPass.h"
 #include "CryptoUtils.h"
 #include "Utils.h"
+#include "config/VLLVMConfig.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -159,7 +160,11 @@ BasicBlock *createFlattenStateBlock(Function &F, BasicBlock *InsertBefore,
 
 PreservedAnalyses FlattenFuncPass::run(Function &F,
                                        FunctionAnalysisManager &FAM) {
+  llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
+  Config.registerPassLevels("fla", 1, 3);
   errs() << "[vllvm] FlattenFuncPass:" << F.getName() << "\n";
+  if (!Config.isEnabled("fla"))
+    return PreservedAnalyses::all();
   bool isChanged = false;
   isChanged = doFlatten(F, FAM);
   return isChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
