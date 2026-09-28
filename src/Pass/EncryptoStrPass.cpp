@@ -1,14 +1,17 @@
 #include "EncryptoStrPass.h"
+#include "EnstrPoolRuntimeEmbed.h"
 #include "Utils.h"
 #include "VLLVMAttribute.h"
 #include "config/VLLVMConfig.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/Linker/Linker.h"
 #include "llvm/Support/RandomNumberGenerator.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -139,243 +142,108 @@ public:
 
 namespace {
 
-// 匿名内存申请按目标二进制格式选择：MachO/ELF 用 mmap，COFF 用
-// VirtualAlloc；失败哨兵分别是 MAP_FAILED(-1) 与 NULL。
-std::pair<CallInst *, Constant *>
-emitAnonymousAlloc(IRBuilder<> &B, Module &M, Value *Size) {
-  LLVMContext &Ctx = M.getContext();
-  const DataLayout &DL = M.getDataLayout();
-  IntegerType *SizeTy = DL.getIntPtrType(Ctx);
-  PointerType *PtrTy = B.getPtrTy();
-  Triple TT(M.getTargetTriple());
-
-  if (TT.isOSBinFormatCOFF()) {
-    FunctionType *Ty = FunctionType::get(
-        PtrTy, {PtrTy, SizeTy, B.getInt32Ty(), B.getInt32Ty()}, false);
-    FunctionCallee F = M.getOrInsertFunction("VirtualAlloc", Ty);
-    // MEM_COMMIT|MEM_RESERVE=0x3000，PAGE_READWRITE=4。
-    CallInst *Call =
-        B.CreateCall(F, {ConstantPointerNull::get(PtrTy), Size,
-                         B.getInt32(0x3000), B.getInt32(4)});
-    return {Call, ConstantPointerNull::get(PtrTy)};
-  }
-
-  FunctionType *Ty = FunctionType::get(
-      PtrTy, {PtrTy, SizeTy, B.getInt32Ty(), B.getInt32Ty(), B.getInt32Ty(),
-              SizeTy},
-      false);
-  FunctionCallee F = M.getOrInsertFunction("mmap", Ty);
-  // MAP_PRIVATE=0x2；MAP_ANON：Darwin 0x1000，Linux/ELF 0x20。
-  uint32_t Flags = TT.isOSDarwin() ? 0x1002 : 0x22;
-  CallInst *Call = B.CreateCall(
-      F, {ConstantPointerNull::get(PtrTy), Size, B.getInt32(3),
-          B.getInt32(Flags), B.getInt32(-1), ConstantInt::get(SizeTy, 0)});
-  Constant *MapFailed =
-      ConstantExpr::getIntToPtr(ConstantInt::get(SizeTy, -1ULL), PtrTy);
-  return {Call, MapFailed};
-}
-
 // 字符串池：模块内全部密文解密到一块匿名内存，统一按下标访问。
 // 明文只存在于匿名页（不在堆、不在可静态反汇编的数据段），初始化用
-// 原子 CAS 抢锁，并发首次访问也只分配一次。
+// 原子 CAS 抢锁，并发首次访问也只分配一次。池逻辑（mmap/CAS/解密/
+// 下标访问）由 src/c_func/enstrpool/enstrpool.c 以位码链入，Android/ELF
+// 优先；这里只负责链接运行时并生成描述表。
+
 struct PoolMember {
   GlobalVariable *GV = nullptr;
   const std::array<uint8_t, KeySize> *Key = nullptr;
   uint64_t Offset = 0;
 };
 
-class StringPool {
-public:
-  StringPool(Module &M) : M(M), DL(M.getDataLayout()) {}
+// 链接 enstr 池运行时位码，返回 __vllvm_enstr_get 访问器；失败返回
+// nullptr（此时回退为不改写字符串）。
+Function *linkEnstrPoolRuntime(Module &M) {
+  ArrayRef<std::uint8_t> Bytes = llvm::vllvm::getEnstrPoolRuntimeBitcode();
+  MemoryBufferRef Buffer(
+      StringRef(reinterpret_cast<const char *>(Bytes.data()), Bytes.size()),
+      "enstr-pool.bc");
+  Expected<std::unique_ptr<Module>> Parsed =
+      parseBitcodeFile(Buffer, M.getContext());
+  if (!Parsed)
+    return nullptr;
+  std::unique_ptr<Module> Runtime = std::move(*Parsed);
+  Runtime->setTargetTriple(M.getTargetTriple());
+  Runtime->setDataLayout(M.getDataLayout());
+  // 嵌入位码的宿主目标属性不属于目标模块，统一剥掉。
+  for (Function &F : *Runtime) {
+    F.removeFnAttr("target-cpu");
+    F.removeFnAttr("target-features");
+    F.removeFnAttr("tune-cpu");
+  }
+  if (Linker(M).linkInModule(std::move(Runtime)))
+    return nullptr;
+  Function *Get = M.getFunction("__vllvm_enstr_get");
+  if (!Get || Get->isDeclaration())
+    return nullptr;
+  Get->setLinkage(GlobalValue::InternalLinkage);
+  return Get;
+}
 
-  uint64_t addString(uint64_t Size) {
-    uint64_t Offset = TotalSize;
-    TotalSize += (Size + PoolSlotAlign - 1) & ~(PoolSlotAlign - 1);
-    return Offset;
+// 生成描述表并填充运行时声明的链接期常量。全部保持 internal：
+// 多 TU 各自持池互不冲突，也不给分析侧留符号入口。
+bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
+                          uint64_t TotalSize) {
+  LLVMContext &Ctx = M.getContext();
+  IntegerType *I64Ty = Type::getInt64Ty(Ctx);
+  StructType *DescTy =
+      StructType::getTypeByName(Ctx, "struct.vllvm_enstr_desc");
+  if (!DescTy)
+    return false;
+
+  SmallVector<Constant *, 16> Elems;
+  for (const PoolMember &Member : Members) {
+    auto *ArrayTy = cast<ArrayType>(Member.GV->getValueType());
+    uint64_t Size = ArrayTy->getNumElements();
+    // 16 字节密钥按小端打包进 key0/key1，与运行时的展开方式一致。
+    uint64_t Key0, Key1;
+    memcpy(&Key0, Member.Key->data(), 8);
+    memcpy(&Key1, Member.Key->data() + 8, 8);
+    Elems.push_back(ConstantStruct::get(
+        DescTy, {Member.GV, ConstantInt::get(I64Ty, Member.Offset),
+                 ConstantInt::get(I64Ty, Size), ConstantInt::get(I64Ty, Key0),
+                 ConstantInt::get(I64Ty, Key1)}));
   }
 
-  void finalize(ArrayRef<PoolMember> Members) {
-    assert(!Members.empty() && "string pool needs at least one member");
+  ArrayType *TableTy = ArrayType::get(DescTy, Elems.size());
+  auto *Table = new GlobalVariable(
+      M, TableTy, true, GlobalValue::PrivateLinkage,
+      ConstantArray::get(TableTy, Elems), "vllvm.enstr.desc.table");
+  Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
 
-    LLVMContext &Ctx = M.getContext();
-    IRBuilder<> IRB(Ctx);
-    IntegerType *I64Ty = Type::getInt64Ty(Ctx);
-    PointerType *PtrTy = IRB.getPtrTy();
-    IntegerType *I8Ty = IRB.getInt8Ty();
-    Align PtrAlign = DL.getABITypeAlign(PtrTy);
-    Constant *Null = ConstantPointerNull::get(PtrTy);
-    // 1 表示初始化中，不会作为字符串地址发布。
-    Constant *Busy =
-        ConstantExpr::getIntToPtr(ConstantInt::get(I64Ty, 1), PtrTy);
+  // 运行时里的 extern 声明在此补上定义（getOrInsertGlobal 复用声明）。
+  auto *TablePtr = cast<GlobalVariable>(M.getOrInsertGlobal(
+      "__vllvm_enstr_table", PointerType::getUnqual(Ctx)));
+  Constant *Zero32 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+  Constant *TableIndexes[] = {Zero32, Zero32};
+  TablePtr->setInitializer(ConstantExpr::getInBoundsGetElementPtr(
+      TableTy, Table, TableIndexes));
+  TablePtr->setConstant(true);
+  TablePtr->setLinkage(GlobalValue::InternalLinkage);
 
-    Base = new GlobalVariable(M, PtrTy, false, GlobalValue::PrivateLinkage,
-                              Null, "__vllvm_enstr.pool.base");
-    Base->setAlignment(PtrAlign);
+  auto DefineConst = [&](StringRef Name, Type *Ty, Constant *Value) {
+    auto *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, Ty));
+    GV->setInitializer(Value);
+    GV->setConstant(true);
+    GV->setLinkage(GlobalValue::InternalLinkage);
+  };
+  DefineConst("__vllvm_enstr_count", I64Ty,
+              ConstantInt::get(I64Ty, Members.size()));
+  DefineConst("__vllvm_enstr_pool_size", I64Ty,
+              ConstantInt::get(I64Ty, TotalSize));
 
-    Init = Function::Create(FunctionType::get(Type::getVoidTy(Ctx), false),
-                            Function::PrivateLinkage, "__vllvm_enstr.init", &M);
-    Get = Function::Create(FunctionType::get(PtrTy, {I64Ty}, false),
-                           Function::PrivateLinkage, "__vllvm_enstr.get", &M);
+  // MAP_PRIVATE|MAP_ANON：Android/ELF 0x22，Darwin 0x1002；PROT_RW、fd
+  // 固定在运行时里。
+  Triple TT(M.getTargetTriple());
+  uint32_t Flags = TT.isOSBinFormatMachO() ? 0x1002 : 0x22;
+  DefineConst("__vllvm_enstr_mmap_flags", Type::getInt32Ty(Ctx),
+              ConstantInt::get(Type::getInt32Ty(Ctx), Flags));
+  return true;
+}
 
-    BasicBlock *InitEntryBB = BasicBlock::Create(Ctx, "entry", Init);
-    BasicBlock *CheckBB = BasicBlock::Create(Ctx, "pool.check", Init);
-    BasicBlock *ReadyBB = BasicBlock::Create(Ctx, "pool.ready", Init);
-    BasicBlock *DoneBB = BasicBlock::Create(Ctx, "pool.done", Init);
-    BasicBlock *ClaimBB = BasicBlock::Create(Ctx, "pool.claim", Init);
-    BasicBlock *AllocBB = BasicBlock::Create(Ctx, "pool.allocate", Init);
-    BasicBlock *FailedBB = BasicBlock::Create(Ctx, "pool.failed", Init);
-
-    // 自旋回边指向 pool.check，入口块必须保持无前驱。
-    IRB.SetInsertPoint(InitEntryBB);
-    IRB.CreateBr(CheckBB);
-
-    IRB.SetInsertPoint(CheckBB);
-    LoadInst *Cached =
-        IRB.CreateAlignedLoad(PtrTy, Base, PtrAlign, "pool.base");
-    Cached->setAtomic(AtomicOrdering::Acquire);
-    IRB.CreateCondBr(IRB.CreateICmpEQ(Cached, Null), ClaimBB, ReadyBB);
-
-    IRB.SetInsertPoint(ReadyBB);
-    // 自旋等待初始化中的池发布，避免把 Busy 哨兵当字符串地址用。
-    IRB.CreateCondBr(IRB.CreateICmpEQ(Cached, Busy), CheckBB, DoneBB);
-
-    IRB.SetInsertPoint(DoneBB);
-    IRB.CreateRetVoid();
-
-    IRB.SetInsertPoint(ClaimBB);
-    AtomicCmpXchgInst *Claim = IRB.CreateAtomicCmpXchg(
-        Base, Null, Busy, PtrAlign, AtomicOrdering::AcquireRelease,
-        AtomicOrdering::Acquire);
-    IRB.CreateCondBr(IRB.CreateExtractValue(Claim, 1), AllocBB, CheckBB);
-
-    IRB.SetInsertPoint(AllocBB);
-    // 申请大小按目标指针宽度（i386 是 i32），与 mmap/VirtualAlloc 声明一致。
-    auto [Alloc, Failure] = emitAnonymousAlloc(
-        IRB, M,
-        ConstantInt::get(DL.getIntPtrType(Ctx), TotalSize));
-    Value *Region = Alloc;
-    // 失败比较在此算好；分支在接入第一个解密块时发出。
-    Value *AllocFailed = IRB.CreateICmpEQ(Region, Failure);
-    BasicBlock *Cursor = AllocBB;
-
-    IRB.SetInsertPoint(FailedBB);
-    // 分配失败不能发布哨兵指针，也不能让其他线程永久等待初始化。
-    IRB.CreateCall(Intrinsic::getOrInsertDeclaration(&M, Intrinsic::trap));
-    IRB.CreateUnreachable();
-
-    ArrayType *KeyArrayType = ArrayType::get(I8Ty, KeySize);
-
-    // 逐个字符串解密：region[offset + i] = str[i] ^ key[i % 16]。
-    // key/游标 alloca 放在循环前置块，避免循环内反复扩张栈。首块的
-    // 占位 cond-br 需要先移除；后续块的 NextBB 本就是空块。
-    for (const PoolMember &Member : Members) {
-      BasicBlock *LoopBB = BasicBlock::Create(Ctx, "pool.decrypt", Init);
-      BasicBlock *BodyBB =
-          BasicBlock::Create(Ctx, "pool.decrypt.body", Init);
-      BasicBlock *NextBB = BasicBlock::Create(Ctx, "pool.decrypt.next", Init);
-
-      if (Instruction *Term = Cursor->getTerminator())
-        Term->eraseFromParent();
-      IRB.SetInsertPoint(Cursor);
-      Value *KeyVar = IRB.CreateAlloca(KeyArrayType, nullptr, "key");
-      for (size_t I = 0; I < Member.Key->size(); ++I) {
-        Value *KeyElemPtr =
-            IRB.CreateGEP(KeyArrayType, KeyVar,
-                          {IRB.getInt32(0), IRB.getInt32(static_cast<uint32_t>(I))});
-        IRB.CreateStore(IRB.getInt8((*Member.Key)[I]), KeyElemPtr);
-      }
-      Value *IVar = IRB.CreateAlloca(I64Ty, nullptr, "i");
-      IRB.CreateStore(IRB.getInt64(0), IVar);
-      // 首块（allocate）保留分配失败检查；后续块的 NextBB 是空块。
-      if (Cursor == AllocBB)
-        IRB.CreateCondBr(AllocFailed, FailedBB, LoopBB);
-      else
-        IRB.CreateBr(LoopBB);
-
-      auto *ArrayTy = cast<ArrayType>(Member.GV->getValueType());
-      uint64_t StrSize = ArrayTy->getNumElements();
-
-      IRB.SetInsertPoint(LoopBB);
-      Value *ILoad = IRB.CreateLoad(I64Ty, IVar, "iLoad");
-      IRB.CreateCondBr(
-          IRB.CreateICmpULT(ILoad, IRB.getInt64(StrSize), "cond"), BodyBB,
-          NextBB);
-
-      IRB.SetInsertPoint(BodyBB);
-      Value *StrPtr =
-          IRB.CreateGEP(I8Ty, Member.GV, ILoad, "strPtr");
-      Value *StrLoad = IRB.CreateLoad(I8Ty, StrPtr, "strLoad");
-      Value *KeyOffset =
-          IRB.CreateURem(ILoad, IRB.getInt64(Member.Key->size()), "keyOffset");
-      Value *KeyPtr = IRB.CreateInBoundsGEP(
-          KeyArrayType, KeyVar, {IRB.getInt32(0), KeyOffset}, "keyPtr");
-      Value *KeyLoad = IRB.CreateLoad(I8Ty, KeyPtr, "keyLoad");
-      Value *XorValue = IRB.CreateXor(StrLoad, KeyLoad, "xorValue");
-      Value *OutPtr = IRB.CreateGEP(
-          I8Ty, Region,
-          IRB.CreateAdd(ILoad, IRB.getInt64(Member.Offset), "poolIdx"),
-          "outPtr");
-      IRB.CreateStore(XorValue, OutPtr);
-      IRB.CreateStore(IRB.CreateAdd(ILoad, IRB.getInt64(1), "iNext"), IVar);
-      IRB.CreateBr(LoopBB);
-
-      Cursor = NextBB;
-    }
-
-    // 解密完成后才发布基地址；明文保持进程生命周期，不主动释放。
-    // 最后一个成员的 NextBB 此时为空块，直接作为发布块。
-    IRB.SetInsertPoint(Cursor);
-    StoreInst *Publish = IRB.CreateAlignedStore(Region, Base, PtrAlign);
-    Publish->setAtomic(AtomicOrdering::Release);
-    IRB.CreateRetVoid();
-
-    // 访问器：传入池内下标，惰性初始化后返回 基址+下标。初始化期间
-    // base 是 BUSY 哨兵，必须自旋等发布，不能把哨兵当基址做 GEP。
-    BasicBlock *EntryBB = BasicBlock::Create(Ctx, "entry", Get);
-    BasicBlock *CheckBusyBB = BasicBlock::Create(Ctx, "check.busy", Get);
-    BasicBlock *InitBB = BasicBlock::Create(Ctx, "init", Get);
-    BasicBlock *WaitBB = BasicBlock::Create(Ctx, "wait", Get);
-    BasicBlock *CalcBB = BasicBlock::Create(Ctx, "calc", Get);
-    auto Arg = Get->arg_begin();
-    Value *IndexArg = Arg++;
-    IndexArg->setName("index");
-
-    IRB.SetInsertPoint(EntryBB);
-    LoadInst *Base0 = IRB.CreateAlignedLoad(PtrTy, Base, PtrAlign, "pool.base");
-    Base0->setAtomic(AtomicOrdering::Acquire);
-    IRB.CreateCondBr(IRB.CreateICmpEQ(Base0, Null), InitBB, CheckBusyBB);
-
-    IRB.SetInsertPoint(CheckBusyBB);
-    IRB.CreateCondBr(IRB.CreateICmpEQ(Base0, Busy), WaitBB, CalcBB);
-
-    IRB.SetInsertPoint(InitBB);
-    IRB.CreateCall(Init);
-    IRB.CreateBr(CalcBB);
-
-    IRB.SetInsertPoint(WaitBB);
-    LoadInst *WaitBase =
-        IRB.CreateAlignedLoad(PtrTy, Base, PtrAlign, "pool.base");
-    WaitBase->setAtomic(AtomicOrdering::Acquire);
-    IRB.CreateCondBr(IRB.CreateICmpEQ(WaitBase, Busy), WaitBB, CalcBB);
-
-    IRB.SetInsertPoint(CalcBB);
-    LoadInst *Base1 = IRB.CreateAlignedLoad(PtrTy, Base, PtrAlign, "pool.base");
-    Base1->setAtomic(AtomicOrdering::Acquire);
-    IRB.CreateRet(IRB.CreateGEP(I8Ty, Base1, IndexArg, "strPtr"));
-  }
-
-  Function *accessor() const { return Get; }
-
-private:
-  Module &M;
-  const DataLayout &DL;
-  uint64_t TotalSize = 0;
-  GlobalVariable *Base = nullptr;
-  Function *Init = nullptr;
-  Function *Get = nullptr;
-};
-
-// level 2：常量加密。把作用域内函数的标量整数常量换成
 // trunc(volatile load @vllvm.enstr.const.table[i] ^ K)；表里存的是密文，
 // 分析侧看不到原始立即数。
 bool encryptConstants(Module &M) {
@@ -480,16 +348,18 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
   std::vector<EncryptoStr *> encryptoStrPool = makeEncryptoStrPool(M);
 
   if (!encryptoStrPool.empty()) {
-    StringPool Pool(M);
     // 主字符串依次入池；指针别名（isDouble）与主字符串共用 strID，
     // 沿用同一份明文与下标。
+    uint64_t TotalSize = 0;
     std::map<uint64_t, uint64_t> OffsetOfID;
     for (EncryptoStr *encryptoStr : encryptoStrPool) {
       if (encryptoStr->isDouble)
         continue;
-      encryptoStr->poolOffset = Pool.addString(
-          cast<ArrayType>(encryptoStr->strVar->getValueType())
-              ->getNumElements());
+      encryptoStr->poolOffset = TotalSize;
+      TotalSize += (cast<ArrayType>(encryptoStr->strVar->getValueType())
+                        ->getNumElements() +
+                    PoolSlotAlign - 1) &
+                   ~(PoolSlotAlign - 1);
       OffsetOfID.try_emplace(encryptoStr->strID, encryptoStr->poolOffset);
     }
     for (EncryptoStr *encryptoStr : encryptoStrPool)
@@ -503,10 +373,17 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
       Members.push_back(
           {encryptoStr->strVar, &encryptoStr->encKey, encryptoStr->poolOffset});
     }
-    Pool.finalize(Members);
+
+    // 先链运行时再生成描述表（表类型来自链入的 struct），失败则整段
+    // 回退：不加密任何字符串，保持语义完整。
+    Function *Accessor = linkEnstrPoolRuntime(M);
+    if (!Accessor || !materializePoolTable(M, Members, TotalSize)) {
+      M.getContext().emitError("vllvm enstr: failed to link pool runtime");
+      return PreservedAnalyses::all();
+    }
 
     for (EncryptoStr *encryptoStr : encryptoStrPool)
-      if (!encryptoStr->insertPoolAccess(Pool.accessor())) {
+      if (!encryptoStr->insertPoolAccess(Accessor)) {
         // 收集阶段已过滤非常量用户，这里不可达。
         M.getContext().emitError("vllvm enstr: unsupported string use remained");
         return PreservedAnalyses::all();

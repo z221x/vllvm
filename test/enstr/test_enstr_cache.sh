@@ -17,19 +17,21 @@ for opt in 0 2; do
     "$ROOT/test/enstr/test_enstr_cache.ll" -o "$ir"
   "$LLVM_AS" "$ir" -o /dev/null
   # 整个模块只有一个匿名池：一个 base、一次申请、一次解密发布。
-  # O2 会把 init/get 内联进调用方，函数形态断言只在 O0 做。
-  [[ $(grep -Ec '^@__vllvm_enstr\.pool\.base = .*global ptr null' "$ir") == 1 ]]
+  # 池逻辑来自链入的 C 运行时；描述表/flags 是 internal 常量，O2 会把
+  # 它们折叠进指令，相关断言只在 O0 做。
+  [[ $(grep -Ec '^@vllvm_enstr_pool_base = internal global ptr null' "$ir") == 1 ]]
   if [[ $opt == 0 ]]; then
-    [[ $(grep -Ec 'define .*@__vllvm_enstr\.init\(' "$ir") == 1 ]]
-    [[ $(grep -Ec 'define .*@__vllvm_enstr\.get\(' "$ir") == 1 ]]
+    [[ $(grep -Ec '^@__vllvm_enstr_table = internal .* constant ptr @' "$ir") == 1 ]]
+    grep -q '@__vllvm_enstr_mmap_flags = internal .* constant i32 34' "$ir"
+    [[ $(grep -Ec 'define .*@__vllvm_enstr_get\(' "$ir") == 1 ]]
   fi
-  grep -q 'load atomic ptr.*acquire' "$ir"
+  grep -Eq 'load atomic (ptr|i64).*acquire' "$ir"
   grep -q 'cmpxchg ptr.*acq_rel acquire' "$ir"
-  grep -q 'store atomic ptr.*release' "$ir"
+  grep -Eq 'store atomic (ptr|i64).*release' "$ir"
   grep -q 'call void @llvm.trap' "$ir"
   # 下标访问：直接引用与指针别名都走 get(i64 下标)。O2 内联后看不到调用形态。
   if [[ $opt == 0 ]]; then
-    [[ $(grep -Ec 'call ptr @__vllvm_enstr\.get\(i64 [0-9]+\)' "$ir") -ge 3 ]]
+    [[ $(grep -Ec 'call ptr @__vllvm_enstr_get\(i64 [0-9]+\)' "$ir") -ge 3 ]]
   fi
   if grep -Eq 'cache-alpha|cache-beta' "$ir"; then
     echo 'plaintext string survived encryption' >&2; exit 1
@@ -70,6 +72,10 @@ for target in aarch64-linux-android23 i386-unknown-linux-gnu; do
     -o "$OUT_DIR/$target.ll"
   "$LLVM_AS" "$OUT_DIR/$target.ll" -o /dev/null
 done
-# 12 + 11 字节按 16 对齐各占一槽：池大小 32。
-grep -q 'call ptr @mmap(ptr null, i32 32,' "$OUT_DIR/i386-unknown-linux-gnu.ll"
-echo 'PASS enstr pool: one anonymous region; index access; stable pointers; cold-start races'
+# 12 + 11 字节按 16 对齐各占一槽：池大小 32；mmap 调用来自链入的 C
+# 运行时，参数宽度固定为 i64（LP64 位码），-O0 下常量经全局加载。
+grep -Eq 'call ptr @mmap\(ptr( noundef)? null, i64' "$OUT_DIR/i386-unknown-linux-gnu.ll"
+# Android 目标确认 ELF 常量：MAP_PRIVATE|MAP_ANONYMOUS=0x22。
+grep -q '@__vllvm_enstr_mmap_flags = internal .* constant i32 34' "$OUT_DIR/aarch64-linux-android23.ll"
+grep -Eq 'call ptr @mmap\(ptr( noundef)? null, i64' "$OUT_DIR/aarch64-linux-android23.ll"
+echo 'PASS enstr pool: linked C runtime; one anonymous region; index access; races'

@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMVLLVM
   Pass/BB2FuncPass.cpp
   Pass/BogusControlFlowPass.cpp
   Pass/EncryptoStrPass.cpp
+  Pass/EnstrPoolRuntimeEmbed.cpp
   Pass/FlattenFuncPass.cpp
   Pass/IndirectBranchPass.cpp
   Pass/IndirectCallPass.cpp
@@ -20,6 +21,7 @@ add_llvm_component_library(LLVMVLLVM
   # 使其 quote-include 的 "c_func/..." 相对路径成立。
   VmpRuntimeEmbed.cpp
   c_func/vminterpreter/VmpRuntimeBitcode.inc
+  c_func/enstrpool/EnstrPoolBitcode.inc
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/VLLVM

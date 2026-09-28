@@ -80,6 +80,7 @@ function Copy-VllvmSources {
 
   cmake -E remove_directory (Join-Path $Dst "c_func")
   cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "c_func") "vminterpreter") (Join-Path $Dst "c_func\vminterpreter")
+  cmake -E copy_directory (Join-Path (Join-Path (Join-Path $RepoRoot "src") "c_func") "enstrpool") (Join-Path $Dst "c_func\enstrpool")
 
   cmake -E copy_if_different (Join-Path (Join-Path $RepoRoot "src") "CMakeLists.txt") (Join-Path $Dst "CMakeLists.txt")
   Get-ChildItem -LiteralPath (Join-Path (Join-Path $RepoRoot "src") "include") -Filter *.h | ForEach-Object {

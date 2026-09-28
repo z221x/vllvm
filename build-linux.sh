@@ -65,6 +65,7 @@ copy_vllvm_sources() {
 
   cmake -E remove_directory "$dst/c_func"
   cmake -E copy_directory "$ROOT_DIR/src/c_func/vminterpreter" "$dst/c_func/vminterpreter"
+  cmake -E copy_directory "$ROOT_DIR/src/c_func/enstrpool" "$dst/c_func/enstrpool"
 
   cmake -E copy_if_different "$ROOT_DIR/src/CMakeLists.txt" "$dst/CMakeLists.txt"
   for file in "$ROOT_DIR"/src/include/*.h; do

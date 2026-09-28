@@ -48,12 +48,16 @@ src/
 - 命令行解析发生在 Pass 注册之前：未注册的名字先记录，注册时收敛；
   越界等级钳制到 `[0, max]` 并打印 `[vllvm] VLLVMConfig:*: level clamped` 告警。
 - bcf 参考实现：1=单轮随机覆盖（55%~90%），2=两轮，3=三轮且全量覆盖。
-- enstr：字符串重构为模块级**匿名内存池**——mmap（Darwin/ELF）或
-  VirtualAlloc（COFF）一次申请整块匿名页，全部密文解密到池内（16 字节
-  对齐分槽），调用点经 `__vllvm_enstr.get(i64 下标)` 取 基址+下标，不再
-  出现明文绝对地址；初始化用原子 CAS 抢锁，并发首访单次分配，
-  失败走 fail-fast trap。level 1=字符串入池；level 2=再把作用域内
-  标量整数常量（|v|≥256）换成 `trunc(volatile load 密文表 ^ K)`。
+- enstr：字符串重构为模块级**匿名内存池**，池逻辑（mmap、CAS 抢锁、
+  解密、下标访问）改为 C 实现 `src/c_func/enstrpool/enstrpool.c`，按
+  解释器 runtime 的方式编成位码（`EnstrPoolBitcode.inc`）由 pass 链入
+  目标模块——pass 只生成描述表（密文指针/下标/长度/密钥）与平台常量。
+  调用点经 `__vllvm_enstr_get(i64 下标)` 取 基址+下标，不再出现明文
+  绝对地址；密钥经 volatile 读取，O2 也不会把解密折叠成明文常量。
+  **目标平台优先 Android/ELF**（不再兼容 Windows）；mmap flags 按
+  triple 生成（ELF 0x22 / Darwin 0x1002），最终由目标 libc 提供 mmap。
+  level 1=字符串入池；level 2=再把作用域内标量整数常量（|v|≥256）
+  换成 `trunc(volatile load 密文表 ^ K)`。
 - icall：level 1=只做池化间接调用（icallcc 跳板）；level 2=目标入口/
   调用点再加可逆参数加密链，且每个调用点写入一条独立随机的
   **fake 诱饵下标**（过同构运算链后 volatile 存入 decoy 全局，

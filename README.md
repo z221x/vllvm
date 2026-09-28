@@ -151,6 +151,7 @@ src/common/              公共工具（Utils、CryptoUtils）
 src/config/              全局混淆等级配置（VLLVMConfig）
 src/include/             Pass 和公共头文件
 src/c_func/vminterpreter/ VMP 解释器与 runtime bitcode 生成
+src/c_func/enstrpool/    enstr 字符串池 C 运行时（mmap 匿名内存 + 下标访问）
 src/c_func/funccaller/   间接调用运行时辅助
 src/VMP/                 实验性 LLVM VMP target 与 runtime 嵌入
 patches/                 LLVM/Clang 集成补丁

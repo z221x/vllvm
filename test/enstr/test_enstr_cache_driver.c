@@ -28,26 +28,26 @@ const char *cached_beta(void);
 void *enstr_test_mmap(void *hint, size_t size, int prot, int flags, int fd,
                       long offset) {
   atomic_fetch_add_explicit(&Allocations, 1, memory_order_relaxed);
+  if (FailAllocation)
+    return (void *)-1;
   for (int i = 0; i < 100; ++i)
     sched_yield();
 #ifdef _WIN32
-  // COFF 目标不会生成 mmap 调用；shim 存在只为符号对齐。
+  // COFF 宿主没有 mmap；测试里用页分配器等价替代。
   (void)hint; (void)prot; (void)flags; (void)fd; (void)offset;
   return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 #else
-  if (FailAllocation)
-    return (void *)-1;
   return mmap(hint, size, prot, flags, fd, (off_t)offset);
 #endif
 }
 
 void *enstr_test_virtual_alloc(void *hint, size_t size, int type, int prot) {
   atomic_fetch_add_explicit(&Allocations, 1, memory_order_relaxed);
+  if (FailAllocation)
+    return NULL;
   for (int i = 0; i < 100; ++i)
     sched_yield();
 #ifdef _WIN32
-  if (FailAllocation)
-    return NULL;
   return VirtualAlloc(hint, size, type, prot);
 #else
   (void)hint; (void)type; (void)prot;
