@@ -42,9 +42,29 @@ grep -Eq "i32 0, ptr @__vllvm_icall\..*\.register_funcs" "$OUT_DIR/icall.ll"
 grep -Eq "ubfx[[:space:]]+w16, w19, #16, #8" "$OUT_DIR/icall.s"
 grep -Eq "mov[[:space:]]+w19," "$OUT_DIR/icall.s"
 
-# 参数加密：icall 目标全部走随机可逆运算链（调用点正向、入口逆向；
-# 值名字会被后续优化剥掉，用函数属性断言加密生效）。
-grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"
+# level 1（默认）：只间接调用，不混入参数加密与 fake 诱饵逻辑。
+if grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"; then
+  echo "level 1 must not enable argument encryption" >&2
+  exit 1
+fi
+if grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall.ll"; then
+  echo "level 1 must not enable decoy fake logic" >&2
+  exit 1
+fi
+
+# level 2：参数加密 + fake 诱饵下标。icall 目标全部走随机可逆运算链
+# （调用点正向、入口逆向；值名字会被后续优化剥掉，用函数属性断言
+# 加密生效）。
+"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm \
+  -mllvm -vllvm-config=icall=2 \
+  -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall_l2.ll"
+grep -q "vllvm.icall.crypt" "$OUT_DIR/icall_l2.ll"
+grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall_l2.ll"
+grep -q "call icallcc" "$OUT_DIR/icall_l2.ll"
+if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine)\(" "$OUT_DIR/icall_l2.ll"; then
+  echo "direct calls to icall targets must be rewritten at level 2" >&2
+  exit 1
+fi
 
 # 被调方语义：注册目标不允许再被直接调用（函数地址仅作为
 # register_func 参数出现）。
@@ -70,7 +90,10 @@ case "$($VLLVM_CLANG -dumpmachine)" in
     "$VLLVM_CLANG" "${LINK_ARGS[@]}" -O0 "$SRC" -o "$OUT_DIR/base"
     "$VLLVM_CLANG" "${LINK_ARGS[@]}" -O0 -DVLLVM_TEST_ICALL=1 \
       "$SRC" -o "$OUT_DIR/icall"
+    "$VLLVM_CLANG" "${LINK_ARGS[@]}" -O0 -DVLLVM_TEST_ICALL=1 \
+      -mllvm -vllvm-config=icall=2 "$SRC" -o "$OUT_DIR/icall_l2"
     "$OUT_DIR/base"
     "$OUT_DIR/icall"
+    "$OUT_DIR/icall_l2"
     ;;
 esac

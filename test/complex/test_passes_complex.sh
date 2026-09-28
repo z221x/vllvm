@@ -49,12 +49,17 @@ run_case() {
   local upper_name
   upper_name=$(printf "%s" "$name" | tr "[:lower:]" "[:upper:]")
   local mode_define="-DVLLVM_TEST_${upper_name}=1"
+  # icall 的 crypt 断言属于 level 2 行为（1=纯间接调用）。
+  local config_args=()
+  case "$name" in
+  icall) config_args=(-mllvm -vllvm-config=icall=2) ;;
+  esac
 
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
-    -emit-llvm "$mode_define" "$SRC" -o "$ll"
+    -emit-llvm "$mode_define" "${config_args[@]}" "$SRC" -o "$ll"
 
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-    "$mode_define" "$SRC" -o "$exe"
+    "$mode_define" "${config_args[@]}" "$SRC" -o "$exe"
   strip_binary "$exe"
 
   set +e

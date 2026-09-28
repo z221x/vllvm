@@ -24,10 +24,10 @@ src/
 
 | Pass | 注解 | 功能 | 状态 | 等级语义 |
 |------|------|------|------|----------|
-| EncryptoStr | `vllvm:enstr` | 字符串加密 + PHI 降级 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
+| EncryptoStr | `vllvm:enstr` | 字符串/常量加密（匿名内存池 + 下标访问） | ✅ 可用 | 0-2：1=字符串，2=再加密常量 |
 | FlattenFunc | `vllvm:fla` | 控制流平坦化（switch + 常量表参数化） | ✅ 可用 | 0-3，≥1 等价（待差异化） |
 | IndirectBranch | `vllvm:ibr` | 间接跳转 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
-| IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest + 可逆参数加密） | ✅ 可用（仅 AArch64） | 0-3，≥1 等价（待差异化） |
+| IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密与 fake 诱饵下标 |
 | BogusControlFlow | `vllvm:bcf` | 虚假控制流（不透明谓词 + fake 路径） | ✅ 可用 | 0-3 全梯度（轮数+覆盖率） |
 | BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
 | Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 0-3，≥1 等价（待差异化） |
@@ -35,7 +35,7 @@ src/
 | Vmp | `vllvm:vmp` | 函数虚拟化（VM 字节码 + 解释器运行时） | ✅ 可用（仅 AArch64） | 0-3，≥1 等价（待差异化） |
 
 等级语义列指 `VLLVMConfig`（见下节）：每个 Pass 自己 `registerPassLevels`
-声明区间并解释含义；目前只有 bcf 实现了完整 0-3 梯度，其余 Pass ≥1 等价于
+声明区间并解释含义；enstr/icall/bcf 已实现完整梯度，其余 Pass ≥1 等价于
 原行为，后续按 Pass 逐个补齐差异化。
 
 ## 三、全局混淆等级配置（新）
@@ -48,8 +48,20 @@ src/
 - 命令行解析发生在 Pass 注册之前：未注册的名字先记录，注册时收敛；
   越界等级钳制到 `[0, max]` 并打印 `[vllvm] VLLVMConfig:*: level clamped` 告警。
 - bcf 参考实现：1=单轮随机覆盖（55%~90%），2=两轮，3=三轮且全量覆盖。
+- enstr：字符串重构为模块级**匿名内存池**——mmap（Darwin/ELF）或
+  VirtualAlloc（COFF）一次申请整块匿名页，全部密文解密到池内（16 字节
+  对齐分槽），调用点经 `__vllvm_enstr.get(i64 下标)` 取 基址+下标，不再
+  出现明文绝对地址；初始化用原子 CAS 抢锁，并发首访单次分配，
+  失败走 fail-fast trap。level 1=字符串入池；level 2=再把作用域内
+  标量整数常量（|v|≥256）换成 `trunc(volatile load 密文表 ^ K)`。
+- icall：level 1=只做池化间接调用（icallcc 跳板）；level 2=目标入口/
+  调用点再加可逆参数加密链，且每个调用点写入一条独立随机的
+  **fake 诱饵下标**（过同构运算链后 volatile 存入 decoy 全局，
+  干扰 nest 下标分析）。
 - 测试：`test/config/test_config.sh` 覆盖 0 关闭、默认档、3 档规模递增、
-  运行结果一致、钳制与非法片段告警。
+  运行结果一致、钳制与非法片段告警；`test_enstr*.sh` 覆盖池形态、
+  下标访问、并发冷启动、OOM trap、i386/aarch64 交叉目标；
+  `test_indirectcall.sh` 分别断言 level 1 无 crypt/decoy、level 2 皆有。
 
 ## 四、构建与测试状态（Windows x64 实测，2026-09-28）
 

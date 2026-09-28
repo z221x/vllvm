@@ -14,9 +14,10 @@ for opt in 0 2; do
   "$CLANG" "${args[@]}" -O"$opt" -S -emit-llvm \
     "$ROOT/test/enstr/test_enstr_phi.ll" -o "$OUT_DIR/O$opt.ll"
   "$LLVM_AS" "$OUT_DIR/O$opt.ll" -o /dev/null
-  # O2 may inline the decryptor; O0 verifies that it was actually generated.
+  # O2 may inline the pool; O0 verifies that it was actually generated.
   if [[ $opt == 0 ]]; then
-    grep -q '_decrypto' "$OUT_DIR/O$opt.ll"
+    grep -q '__vllvm_enstr.init' "$OUT_DIR/O$opt.ll"
+    grep -q '__vllvm_enstr.get' "$OUT_DIR/O$opt.ll"
     grep -q 'reg2mem' "$OUT_DIR/O$opt.ll"
     # Later LCSSA may introduce fresh PHIs; the original PHIs must be gone.
     if grep -Eq '%(text|slot|unused|i) = phi ' "$OUT_DIR/O$opt.ll"; then

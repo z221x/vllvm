@@ -51,6 +51,9 @@ struct ICallRuntime {
   Function *CreatePool = nullptr;
   Function *RegisterFunc = nullptr;
   Function *CallFunc = nullptr;
+  // level 2 诱饵下标缓冲：调用点额外写入一条过加密链的假下标，
+  // 让真实 nest 下标淹没在同构噪声里。
+  GlobalVariable *Decoy = nullptr;
 };
 
 // —— 参数加密：调用点按随机可逆运算链加密标量整数参数，经跳板传输的
@@ -361,7 +364,8 @@ Function *createCallFunc(Module &M, StringRef Name, GlobalVariable *PoolData) {
 }
 
 ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
-                           uint32_t GroupLength, StringRef Suffix) {
+                           uint32_t GroupLength, StringRef Suffix,
+                           bool WithDecoy) {
   LLVMContext &Ctx = M.getContext();
   Type *I32Ty = Type::getInt32Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
@@ -407,6 +411,12 @@ ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
       M, Prefix + ".register_func", GroupTy, GroupsTy, Groups);
   Runtime.CallFunc =
       createCallFunc(M, Prefix + ".call_func", PoolData);
+  if (WithDecoy) {
+    Runtime.Decoy = new GlobalVariable(
+        M, I32Ty, false, GlobalValue::InternalLinkage, Zero,
+        Prefix + ".decoy");
+    appendToCompilerUsed(M, {Runtime.Decoy});
+  }
   return Runtime;
 }
 
@@ -483,9 +493,20 @@ AttributeList createICallAttrs(CallInst &OldCall) {
 }
 
 void rewriteCall(const ICallRuntime &Runtime, uint32_t PackedIndex,
-                 CallInst *OldCall, ArrayRef<ArgCryptPlan> Crypt) {
-  // 参与加密的参数先过正向运算链，再送进 icallcc 跳板。
+                 CallInst *OldCall, ArrayRef<ArgCryptPlan> Crypt,
+                 ArrayRef<CryptOp> DecoyOps, uint32_t DecoyBase) {
   IRBuilder<> B(OldCall);
+  // fake 逻辑：先写一条与真实下标同宽、同样过可逆链的诱饵下标，
+  // 基值独立随机，静态分析难以区分哪条运算链真正汇入 nest 参数。
+  if (Runtime.Decoy && !DecoyOps.empty()) {
+    Value *Decoy = ConstantInt::get(
+        Type::getInt32Ty(OldCall->getContext()), DecoyBase);
+    Decoy = emitCryptForward(B, Decoy, DecoyOps);
+    StoreInst *Store = B.CreateStore(Decoy, Runtime.Decoy);
+    Store->setVolatile(true);
+  }
+
+  // 参与加密的参数先过正向运算链，再送进 icallcc 跳板。
   SmallVector<Value *, 8> Args;
   for (unsigned I = 0; I < OldCall->arg_size(); ++I) {
     Value *Arg = OldCall->getArgOperand(I);
@@ -521,9 +542,13 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
                                         ModuleAnalysisManager &MAM) {
   (void)MAM;
   llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
-  Config.registerPassLevels("icall", 1, 3);
-  if (!Config.isEnabled("icall"))
+  // icall 等级（Pass 自定语义）：1=只间接调用；2=再混入参数加密与
+  // fake 诱饵下标逻辑。
+  Config.registerPassLevels("icall", 1, 2);
+  unsigned Level = Config.getLevel("icall");
+  if (Level == 0)
     return PreservedAnalyses::all();
+  bool UseCrypt = Level >= 2;
   Triple TT(M.getTargetTriple());
   if (TT.getArch() != Triple::aarch64 && TT.getArch() != Triple::aarch64_be)
     return PreservedAnalyses::all();
@@ -581,18 +606,38 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
     }
   }
   DenseMap<Function *, std::vector<ArgCryptPlan>> CryptPlans;
-  for (Function *Target : Targets) {
-    if (CryptBlocked.count(Target) || isFunctionAddressTaken(*Target))
-      continue;
-    std::vector<ArgCryptPlan> Plans = buildArgCryptPlans(*Target, Engine);
-    if (!Plans.empty()) {
-      CryptPlans.try_emplace(Target, std::move(Plans));
-      Target->addFnAttr(CryptAttr);
+  if (UseCrypt) {
+    for (Function *Target : Targets) {
+      if (CryptBlocked.count(Target) || isFunctionAddressTaken(*Target))
+        continue;
+      std::vector<ArgCryptPlan> Plans = buildArgCryptPlans(*Target, Engine);
+      if (!Plans.empty()) {
+        CryptPlans.try_emplace(Target, std::move(Plans));
+        Target->addFnAttr(CryptAttr);
+      }
     }
   }
 
   ICallRuntime Runtime =
-      createRuntime(M, GroupCount, GroupLength, Suffix);
+      createRuntime(M, GroupCount, GroupLength, Suffix, UseCrypt);
+  // 诱饵运算链整模块共享一条，基值逐调用点随机。
+  SmallVector<CryptOp, 4> DecoyOps;
+  if (UseCrypt) {
+    std::uniform_int_distribution<unsigned> PickKind(0, 5);
+    std::uniform_int_distribution<uint64_t> PickConst(0, ~0ULL);
+    for (unsigned I = 0, E = 2 + PickKind(Engine) % 3; I < E; ++I) {
+      CryptOp Op;
+      Op.K = static_cast<CryptOp::Kind>(PickKind(Engine));
+      if (Op.K == CryptOp::MulOdd)
+        Op.C = PickConst(Engine) | 1ULL;
+      else if (Op.K == CryptOp::Rol || Op.K == CryptOp::Ror)
+        Op.C = PickConst(Engine) % 32;
+      else
+        Op.C = PickConst(Engine);
+      DecoyOps.push_back(Op);
+    }
+  }
+  std::uniform_int_distribution<uint32_t> PickDecoyBase(0, ~0u);
   // 第三步：在 init_array 中注册所有函数。
   createRegistrationCtor(M, Runtime, Targets, Locations, GroupCount,
                          GroupLength, Suffix);
@@ -628,7 +673,8 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
       rewriteCall(Runtime, P.Packed, P.Call,
                   It == CryptPlans.end()
                       ? ArrayRef<ArgCryptPlan>()
-                      : ArrayRef(It->second));
+                      : ArrayRef(It->second),
+                  DecoyOps, PickDecoyBase(Engine));
     }
   }
 

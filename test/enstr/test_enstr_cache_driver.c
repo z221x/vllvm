@@ -6,6 +6,13 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#else
+// mingw 没有 alarm；用 tick 计数兜底防初始化卡死回归。
+#include <windows.h>
+#endif
+
 enum { ThreadCount = 16, Iterations = 10000 };
 static _Atomic unsigned Allocations;
 static _Atomic unsigned Ready;
@@ -16,19 +23,42 @@ const char *cached_alpha(void);
 const char *cached_alpha_alias(void);
 const char *cached_beta(void);
 
-// Only allocations emitted by EncryptoStrPass are redirected here; allocations
-// inside pthread/libc do not affect the count. Yield to stress cold-start races.
-void *enstr_test_malloc(size_t size) {
+// mmap 的失败哨兵是 MAP_FAILED(-1)，VirtualAlloc 是 NULL；shim 必须各自
+// 返回对应哨兵才能命中 IR 里的 fail-fast 路径。
+void *enstr_test_mmap(void *hint, size_t size, int prot, int flags, int fd,
+                      long offset) {
   atomic_fetch_add_explicit(&Allocations, 1, memory_order_relaxed);
-  if (FailAllocation)
-    return NULL;
   for (int i = 0; i < 100; ++i)
     sched_yield();
-  return malloc(size);
+#ifdef _WIN32
+  // COFF 目标不会生成 mmap 调用；shim 存在只为符号对齐。
+  (void)hint; (void)prot; (void)flags; (void)fd; (void)offset;
+  return VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+#else
+  if (FailAllocation)
+    return (void *)-1;
+  return mmap(hint, size, prot, flags, fd, (off_t)offset);
+#endif
+}
+
+void *enstr_test_virtual_alloc(void *hint, size_t size, int type, int prot) {
+  atomic_fetch_add_explicit(&Allocations, 1, memory_order_relaxed);
+  for (int i = 0; i < 100; ++i)
+    sched_yield();
+#ifdef _WIN32
+  if (FailAllocation)
+    return NULL;
+  return VirtualAlloc(hint, size, type, prot);
+#else
+  (void)hint; (void)type; (void)prot;
+  return mmap(NULL, size, PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
 }
 
 // The instrumented IR redirects only the failure trap, avoiding a deliberate
-// crash/core dump while checking that malloc failure takes the fail-fast path.
+// crash/core dump while checking that allocation failure takes the fail-fast
+// path.
 _Noreturn void enstr_test_trap(void) {
   unsigned allocations = atomic_load_explicit(&Allocations, memory_order_relaxed);
   if (!FailAllocation || allocations != 1)
@@ -68,7 +98,9 @@ static void *exercise(void *arg) {
 }
 
 int main(int argc, char **argv) {
+#ifndef _WIN32
   alarm(20); // Bound a regression that accidentally leaves initialization stuck.
+#endif
   if (argc > 1 && strcmp(argv[1], "oom") == 0) {
     FailAllocation = 1;
     cached_alpha();
@@ -94,8 +126,8 @@ int main(int argc, char **argv) {
   }
 
   unsigned allocations = atomic_load_explicit(&Allocations, memory_order_relaxed);
-  if (allocations != 2) {
-    fprintf(stderr, "expected two allocations, got %u\n", allocations);
+  if (allocations != 1) {
+    fprintf(stderr, "expected one pool allocation, got %u\n", allocations);
     return 1;
   }
   for (int i = 0; i < count; ++i)
