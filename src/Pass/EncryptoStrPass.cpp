@@ -168,6 +168,11 @@ Function *linkEnstrPoolRuntime(Module &M) {
   std::unique_ptr<Module> Runtime = std::move(*Parsed);
   Runtime->setTargetTriple(M.getTargetTriple());
   Runtime->setDataLayout(M.getDataLayout());
+  // 运行时位码带着生成宿主的模块标志（wchar_size/PIC 等随平台不同），
+  // 与目标模块冲突会让 linkInModule 报错；池运行时不依赖任何模块标志，
+  // 统一清除。
+  if (NamedMDNode *Flags = Runtime->getModuleFlagsMetadata())
+    Flags->eraseFromParent();
   // 嵌入位码的宿主目标属性不属于目标模块，统一剥掉。
   for (Function &F : *Runtime) {
     F.removeFnAttr("target-cpu");

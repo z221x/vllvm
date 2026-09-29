@@ -4,7 +4,12 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 OUT_DIR="${OUT_DIR:-$ROOT/test/android/out}"
 SDK="${ANDROID_SDK_ROOT:-/Users/work/Library/Android/sdk}"
 NDK="${ANDROID_NDK_ROOT:-$SDK/ndk/27.0.12077973}"
-NDK_BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin"
+# NDK 预构建目录按宿主平台变化。
+case "$(uname -s)" in
+  Darwin) NDK_BIN="$NDK/toolchains/llvm/prebuilt/darwin-x86_64/bin" ;;
+  Linux) NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" ;;
+  *) NDK_BIN="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin" ;;
+esac
 mkdir -p "$OUT_DIR/core"
 failed=0
 modes=("$@")
