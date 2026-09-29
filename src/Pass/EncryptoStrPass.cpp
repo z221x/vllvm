@@ -1,4 +1,5 @@
 #include "EncryptoStrPass.h"
+#include "CryptoUtils.h"
 #include "EnstrPoolRuntimeEmbed.h"
 #include "Utils.h"
 #include "VLLVMAttribute.h"
@@ -167,6 +168,7 @@ struct PoolMember {
   GlobalVariable *GV = nullptr;
   const std::array<uint8_t, KeySize> *Key = nullptr;
   uint64_t Offset = 0;
+  std::string Cipher; // 与运行时解密同源的密文（按池布局写入 blob）
 };
 
 // 链接 enstr 池运行时位码，返回 __vllvm_enstr_get 访问器；失败返回
@@ -203,9 +205,10 @@ Function *linkEnstrPoolRuntime(Module &M) {
   return Get;
 }
 
-// 生成描述表并填充运行时声明的链接期常量。全部保持 internal：
-// 多 TU 各自持池互不冲突，也不给分析侧留符号入口。
-// 表必须可写（isdec 运行时置位），密文随表进入 .data。
+// 生成描述表、密文源 blob 并填充运行时声明的链接期常量。全部保持
+// internal：多 TU 各自持池互不冲突，也不给分析侧留符号入口。
+// 表必须可写（isdec 运行时置位）；密文集中进一个平铺 blob，槽间间隙
+// 填随机字节，避免从布局反推字符串边界。
 bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
                           uint64_t TotalSize) {
   LLVMContext &Ctx = M.getContext();
@@ -219,30 +222,51 @@ bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
 
   SmallVector<Constant *, 16> Elems;
   for (const PoolMember &Member : Members) {
-    auto *ArrayTy = cast<ArrayType>(Member.GV->getValueType());
-    uint64_t Size = ArrayTy->getNumElements();
     // 密钥流只用首字节种子；isdec 初始为 0（未解密）。
     Elems.push_back(ConstantStruct::get(
-        DescTy, {Member.GV, ConstantInt::get(I64Ty, Member.Offset),
-                 ConstantInt::get(I32Ty, Size),
+        DescTy, {ConstantInt::get(I64Ty, Member.Offset),
+                 ConstantInt::get(I32Ty, Member.Cipher.size()),
                  ConstantInt::get(I8Ty, (*Member.Key)[0]),
                  ConstantInt::get(I8Ty, 0)}));
   }
 
+  // 按池布局平铺的密文源。
+  std::vector<uint8_t> Blob(TotalSize);
+  CryptoUtils Crypto(&M);
+  for (uint8_t &Byte : Blob)
+    Byte = static_cast<uint8_t>(Crypto.getRandom32());
+  for (const PoolMember &Member : Members)
+    memcpy(Blob.data() + Member.Offset, Member.Cipher.data(),
+           Member.Cipher.size());
+  auto *CipherGV = new GlobalVariable(
+      M, ArrayType::get(I8Ty, TotalSize), true, GlobalValue::PrivateLinkage,
+      ConstantDataArray::getString(
+          Ctx, StringRef(reinterpret_cast<const char *>(Blob.data()),
+                         Blob.size()),
+          false),
+      "vllvm.enstr.cipher");
+
+  // 表必须可写：isdec 运行时置位，密文随表进入 .data。
   ArrayType *TableTy = ArrayType::get(DescTy, Elems.size());
   auto *Table = new GlobalVariable(
       M, TableTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
       ConstantArray::get(TableTy, Elems), "vllvm.enstr.desc.table");
 
   // 运行时里的 extern 声明在此补上定义（getOrInsertGlobal 复用声明）。
-  auto *TablePtr = cast<GlobalVariable>(M.getOrInsertGlobal(
-      "__vllvm_enstr_table", PointerType::getUnqual(Ctx)));
+  auto DefinePtr = [&](StringRef Name, Constant *Init) {
+    auto *GV = cast<GlobalVariable>(
+        M.getOrInsertGlobal(Name, PointerType::getUnqual(Ctx)));
+    GV->setInitializer(Init);
+    GV->setConstant(true);
+    GV->setLinkage(GlobalValue::InternalLinkage);
+  };
   Constant *Zero32 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
   Constant *TableIndexes[] = {Zero32, Zero32};
-  TablePtr->setInitializer(ConstantExpr::getInBoundsGetElementPtr(
-      TableTy, Table, TableIndexes));
-  TablePtr->setConstant(true);
-  TablePtr->setLinkage(GlobalValue::InternalLinkage);
+  DefinePtr("__vllvm_enstr_table", ConstantExpr::getInBoundsGetElementPtr(
+                                       TableTy, Table, TableIndexes));
+  DefinePtr("__vllvm_enstr_src", ConstantExpr::getInBoundsGetElementPtr(
+                                     CipherGV->getValueType(), CipherGV,
+                                     TableIndexes));
 
   auto DefineConst = [&](StringRef Name, Type *Ty, Constant *Value) {
     auto *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, Ty));
@@ -378,13 +402,18 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
         continue;
       encryptoStr->poolOffset = TotalSize;
       encryptoStr->tableIndex = Members.size();
+      auto *Cda = cast<ConstantDataArray>(encryptoStr->strVar->getInitializer());
+      PoolMember Member;
+      Member.GV = encryptoStr->strVar;
+      Member.Key = &encryptoStr->encKey;
+      Member.Offset = encryptoStr->poolOffset;
+      Member.Cipher = encryptoStr->encrypto(Cda->getAsString());
       TotalSize += (cast<ArrayType>(encryptoStr->strVar->getValueType())
                         ->getNumElements() +
                     PoolSlotAlign - 1) &
                    ~(PoolSlotAlign - 1);
       IndexOfID.try_emplace(encryptoStr->strID, encryptoStr->tableIndex);
-      Members.push_back(
-          {encryptoStr->strVar, &encryptoStr->encKey, encryptoStr->poolOffset});
+      Members.push_back(std::move(Member));
     }
     for (EncryptoStr *encryptoStr : encryptoStrPool)
       if (encryptoStr->isDouble)
@@ -404,8 +433,25 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
         M.getContext().emitError("vllvm enstr: unsupported string use remained");
         return PreservedAnalyses::all();
       }
+
+    // 密文已并入平铺 blob：无引用的 local 全局直接删除（指针全局先于
+    // 主字符串处理，避免 initializer 残留引用）；external 的可能被其他
+    // TU 引用不能删——指针全局原样保留，主字符串保留节点但把
+    // initializer 换成密文防泄漏。
     for (EncryptoStr *encryptoStr : encryptoStrPool)
+      if (encryptoStr->isDouble && encryptoStr->strVar->use_empty() &&
+          encryptoStr->strVar->hasLocalLinkage())
+        encryptoStr->strVar->eraseFromParent();
+    for (EncryptoStr *encryptoStr : encryptoStrPool) {
+      if (encryptoStr->isDouble)
+        continue;
+      if (encryptoStr->strVar->use_empty() &&
+          encryptoStr->strVar->hasLocalLinkage()) {
+        encryptoStr->strVar->eraseFromParent();
+        continue;
+      }
       encryptoStr->encryptoStr();
+    }
     isChanged = true;
   }
 

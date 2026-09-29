@@ -22,6 +22,11 @@ for opt in 0 2; do
   [[ $(grep -Ec '^@vllvm_enstr_pool_base = internal global ptr null' "$ir") == 1 ]]
   if [[ $opt == 0 ]]; then
     [[ $(grep -Ec '^@__vllvm_enstr_table = internal .* constant ptr @' "$ir") == 1 ]]
+    # 密文源改为平铺 blob：原字符串全局整体删除，符号不再出现。
+    [[ $(grep -Ec '^@__vllvm_enstr_src = internal .* constant ptr @' "$ir") == 1 ]]
+    if grep -Eq '@(alpha_text|beta_text|alpha_pointer) = ' "$ir"; then
+      echo 'retired string globals must be erased' >&2; exit 1
+    fi
     grep -q '@__vllvm_enstr_mmap_flags = internal .* constant i32 34' "$ir"
     [[ $(grep -Ec 'define .*@__vllvm_enstr_get\(' "$ir") == 1 ]]
   fi
