@@ -62,14 +62,28 @@ bool isMarkedStringTarget(GlobalVariable &StringGV) {
 }
 } // namespace
 
+namespace {
+// 与 enstrpool.c 的 enstr_key_byte 保持一致：单字节种子做 xorshift8
+// 步进并混入字节位置；密文与运行时解密由同一函数派生密钥流。
+uint8_t enstrKeyByte(uint8_t Key, uint64_t J) {
+  uint8_t K = Key;
+  for (unsigned I = static_cast<unsigned>(J & 7); I; --I) {
+    K ^= static_cast<uint8_t>(K << 1);
+    K ^= static_cast<uint8_t>(K >> 2);
+  }
+  return static_cast<uint8_t>(K ^ static_cast<uint8_t>(J));
+}
+} // namespace
+
 class EncryptoStrPass::EncryptoStr {
 public:
   uint64_t strID; // 用于标识以及密钥生成
   GlobalVariable *strVar;
   std::array<uint8_t, KeySize> encKey{};
   std::vector<User *> callUser;
-  // 明文在匿名池内的字节下标；由 StringPool 统一分配。
+  // 明文在匿名池内的字节下标与描述表下标；由 run() 统一分配。
   uint64_t poolOffset = 0;
+  uint64_t tableIndex = 0;
   Module &M;
   bool isDouble;
 
@@ -93,11 +107,12 @@ public:
     strVar->setConstant(false);
   }
 
+  // 运行时密钥流只用首字节种子；其余字节保留给后续扩展。
   std::string encrypto(StringRef strRef) const {
     std::string result(strRef.begin(), strRef.end());
     for (size_t i = 0; i < result.size(); ++i) {
-      result[i] = static_cast<char>(
-          static_cast<uint8_t>(result[i]) ^ encKey[i % encKey.size()]);
+      result[i] = static_cast<char>(static_cast<uint8_t>(result[i]) ^
+                                    enstrKeyByte(encKey[0], i));
     }
     return result;
   }
@@ -112,8 +127,8 @@ public:
     memcpy(encKey.data() + 8, &part2, 8);
   }
 
-  // 用下标访问替换原字符串地址：分析侧只能看到匿名池基址 + 偏移，
-  // 不再出现明文的绝对地址。
+  // 用描述表下标替换原字符串地址：分析侧只能看到 池基址+表项，
+  // 不再出现明文的绝对地址；明文在首访时才在池内解密。
   bool insertPoolAccess(Function *Accessor) {
     if (!Accessor)
       return false;
@@ -121,7 +136,7 @@ public:
     auto createDecryptedValue = [&](Instruction *Before) -> Value * {
       IRBuilder<> IRB(Before);
       Value *Plain = fixEH(IRB.CreateCall(
-          Accessor, {IRB.getInt64(static_cast<uint64_t>(poolOffset))}));
+          Accessor, {IRB.getInt64(static_cast<uint64_t>(tableIndex))}));
       if (!isDouble)
         return Plain;
       Value *Slot = IRB.CreateAlloca(IRB.getPtrTy(), nullptr);
@@ -190,10 +205,13 @@ Function *linkEnstrPoolRuntime(Module &M) {
 
 // 生成描述表并填充运行时声明的链接期常量。全部保持 internal：
 // 多 TU 各自持池互不冲突，也不给分析侧留符号入口。
+// 表必须可写（isdec 运行时置位），密文随表进入 .data。
 bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
                           uint64_t TotalSize) {
   LLVMContext &Ctx = M.getContext();
   IntegerType *I64Ty = Type::getInt64Ty(Ctx);
+  IntegerType *I32Ty = Type::getInt32Ty(Ctx);
+  IntegerType *I8Ty = Type::getInt8Ty(Ctx);
   StructType *DescTy =
       StructType::getTypeByName(Ctx, "struct.vllvm_enstr_desc");
   if (!DescTy)
@@ -203,21 +221,18 @@ bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
   for (const PoolMember &Member : Members) {
     auto *ArrayTy = cast<ArrayType>(Member.GV->getValueType());
     uint64_t Size = ArrayTy->getNumElements();
-    // 16 字节密钥按小端打包进 key0/key1，与运行时的展开方式一致。
-    uint64_t Key0, Key1;
-    memcpy(&Key0, Member.Key->data(), 8);
-    memcpy(&Key1, Member.Key->data() + 8, 8);
+    // 密钥流只用首字节种子；isdec 初始为 0（未解密）。
     Elems.push_back(ConstantStruct::get(
         DescTy, {Member.GV, ConstantInt::get(I64Ty, Member.Offset),
-                 ConstantInt::get(I64Ty, Size), ConstantInt::get(I64Ty, Key0),
-                 ConstantInt::get(I64Ty, Key1)}));
+                 ConstantInt::get(I32Ty, Size),
+                 ConstantInt::get(I8Ty, (*Member.Key)[0]),
+                 ConstantInt::get(I8Ty, 0)}));
   }
 
   ArrayType *TableTy = ArrayType::get(DescTy, Elems.size());
   auto *Table = new GlobalVariable(
-      M, TableTy, true, GlobalValue::PrivateLinkage,
+      M, TableTy, /*isConstant=*/false, GlobalValue::PrivateLinkage,
       ConstantArray::get(TableTy, Elems), "vllvm.enstr.desc.table");
-  Table->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
 
   // 运行时里的 extern 声明在此补上定义（getOrInsertGlobal 复用声明）。
   auto *TablePtr = cast<GlobalVariable>(M.getOrInsertGlobal(
@@ -353,31 +368,27 @@ PreservedAnalyses EncryptoStrPass::run(Module &M, ModuleAnalysisManager &MAM) {
   std::vector<EncryptoStr *> encryptoStrPool = makeEncryptoStrPool(M);
 
   if (!encryptoStrPool.empty()) {
-    // 主字符串依次入池；指针别名（isDouble）与主字符串共用 strID，
-    // 沿用同一份明文与下标。
+    // 主字符串依次入池（表下标 = 入池顺序）；指针别名（isDouble）与主
+    // 字符串共用 strID，沿用同一表项与明文。
     uint64_t TotalSize = 0;
-    std::map<uint64_t, uint64_t> OffsetOfID;
-    for (EncryptoStr *encryptoStr : encryptoStrPool) {
-      if (encryptoStr->isDouble)
-        continue;
-      encryptoStr->poolOffset = TotalSize;
-      TotalSize += (cast<ArrayType>(encryptoStr->strVar->getValueType())
-                        ->getNumElements() +
-                    PoolSlotAlign - 1) &
-                   ~(PoolSlotAlign - 1);
-      OffsetOfID.try_emplace(encryptoStr->strID, encryptoStr->poolOffset);
-    }
-    for (EncryptoStr *encryptoStr : encryptoStrPool)
-      if (encryptoStr->isDouble)
-        encryptoStr->poolOffset = OffsetOfID[encryptoStr->strID];
-
+    std::map<uint64_t, uint64_t> IndexOfID;
     SmallVector<PoolMember, 16> Members;
     for (EncryptoStr *encryptoStr : encryptoStrPool) {
       if (encryptoStr->isDouble)
         continue;
+      encryptoStr->poolOffset = TotalSize;
+      encryptoStr->tableIndex = Members.size();
+      TotalSize += (cast<ArrayType>(encryptoStr->strVar->getValueType())
+                        ->getNumElements() +
+                    PoolSlotAlign - 1) &
+                   ~(PoolSlotAlign - 1);
+      IndexOfID.try_emplace(encryptoStr->strID, encryptoStr->tableIndex);
       Members.push_back(
           {encryptoStr->strVar, &encryptoStr->encKey, encryptoStr->poolOffset});
     }
+    for (EncryptoStr *encryptoStr : encryptoStrPool)
+      if (encryptoStr->isDouble)
+        encryptoStr->tableIndex = IndexOfID[encryptoStr->strID];
 
     // 先链运行时再生成描述表（表类型来自链入的 struct），失败则整段
     // 回退：不加密任何字符串，保持语义完整。
