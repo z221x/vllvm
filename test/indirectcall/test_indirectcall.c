@@ -20,6 +20,25 @@ VLLVM_ICALL __attribute__((noinline)) static long sum_nine(
   return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8;
 }
 
+// 指针参数（x0）与整数参数（x1）都参与加密：x0~x7 的整数类寄存器均可能
+// 被加密，入口经 ptrtoint/inttoptr 还原指针。
+VLLVM_ICALL __attribute__((noinline)) static long ptr_mix(const long *p,
+                                                          long k) {
+  return p[0] + p[1] * 3 + k;
+}
+
+// 聚合参数/大结构体返回会打乱 x 寄存器序号（sret 走 x8、struct 占多枚
+// x 寄存器）：这类形态之后的参数必须保持明文，不能按推算序号加密。
+struct Quad {
+  long a, b, c, d;
+};
+
+VLLVM_ICALL __attribute__((noinline)) static struct Quad quad_shift(
+    struct Quad q, long k) {
+  struct Quad r = {q.a + k, q.b + k, q.c + k, q.d + k};
+  return r;
+}
+
 __attribute__((noinline)) static long protected_integer(long seed) {
   long total = add_bias(seed, 5);
   for (long i = 0; i < 3; ++i)
@@ -43,5 +62,12 @@ __attribute__((constructor)) static void call_before_main(void) {
 int main(void) {
   long a = protected_integer(11);
   long b = protected_mixed(13);
-  return (ctor_result == 33 && a == 434 && b == 101) ? 0 : 1;
+  static const long pair[2] = {40, 1};
+  long c = ptr_mix(pair, 7);
+  static const struct Quad in = {1, 2, 3, 4};
+  struct Quad out = quad_shift(in, 10);
+  return (ctor_result == 33 && a == 434 && b == 101 && c == 50 &&
+          out.a == 11 && out.b == 12 && out.c == 13 && out.d == 14)
+             ? 0
+             : 1;
 }

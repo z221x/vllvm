@@ -25,24 +25,31 @@ if [ "$(uname -s)" = Darwin ]; then
   LINK_ARGS=(-isysroot "$SDK_PATH" -Xclang -llvm-verify-each)
 fi
 
-"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm \
+"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm -fno-discard-value-names \
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall.ll"
 "$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S \
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall.s"
 
+# 跳板为 naked 汇编函数（icallcc 约定）：加密链就地改写 x0~x7；调用号
+# 由调用点常量经 i32 nest 送入 w19，跳板用 ubfx/and 从 w19 解码查池并
+# ret x19 跳转（与 src/funccaller 的 call_func 一致）。
+grep -Eq "define internal icallcc .*@__vllvm_icall\.[0-9A-F]+\.call\." "$OUT_DIR/icall.ll"
 grep -q "call icallcc" "$OUT_DIR/icall.ll"
 grep -Eq "i32 nest [0-9]+" "$OUT_DIR/icall.ll"
+grep -q "ret x19" "$OUT_DIR/icall.ll"
+grep -Eq "ret[[:space:]]+x19" "$OUT_DIR/icall.s"
+grep -Eq "ubfx[[:space:]]+w16, w19, #16, #8" "$OUT_DIR/icall.s"
+grep -Eq "mov[[:space:]]+w19," "$OUT_DIR/icall.s"
 if grep -q "vllvm.icall.index_array" "$OUT_DIR/icall.ll"; then
-  echo "icall packed indexes must be call-site constants" >&2
+  echo "icall packed indexes must be trampoline constants" >&2
   exit 1
 fi
 grep -q "register_func" "$OUT_DIR/icall.ll"
 grep -q "create_func_pool" "$OUT_DIR/icall.ll"
 grep -Eq "i32 0, ptr @__vllvm_icall\..*\.register_funcs" "$OUT_DIR/icall.ll"
-grep -Eq "ubfx[[:space:]]+w16, w19, #16, #8" "$OUT_DIR/icall.s"
-grep -Eq "mov[[:space:]]+w19," "$OUT_DIR/icall.s"
 
-# level 1（默认）：只间接调用，不混入参数加密与 fake 诱饵逻辑。
+# —— level 1（默认）：仅专属跳板间接化（icallcc/nest/w19/ret x19 查表），
+# 不启用参数加密与诱饵假下标。
 if grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"; then
   echo "level 1 must not enable argument encryption" >&2
   exit 1
@@ -51,32 +58,57 @@ if grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall.ll"; then
   echo "level 1 must not enable decoy fake logic" >&2
   exit 1
 fi
+if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine|ptr_mix|quad_shift)\(" "$OUT_DIR/icall.ll"; then
+  echo "direct calls to icall targets must be rewritten at level 1" >&2
+  exit 1
+fi
+# 全模块注册目标：add_bias、mix_double、sum_nine、ptr_mix、quad_shift。
+REGISTER_CALLS=$(grep -Ec "call void @.*register_func" "$OUT_DIR/icall.ll")
+if [ "$REGISTER_CALLS" -ne 5 ]; then
+  echo "expected 5 deduplicated register_func calls, got $REGISTER_CALLS" >&2
+  exit 1
+fi
 
-# level 2：参数加密 + fake 诱饵下标。icall 目标全部走随机可逆运算链
-# （调用点正向、入口逆向；值名字会被后续优化剥掉，用函数属性断言
-# 加密生效）。
-"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm \
+# —— level 2：参数加密（仅 add/sub/xor）+ fake 诱饵下标 + 入口左值解密。
+"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm -fno-discard-value-names \
   -mllvm -vllvm-config=icall=2 \
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall_l2.ll"
 grep -q "vllvm.icall.crypt" "$OUT_DIR/icall_l2.ll"
 grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall_l2.ll"
-grep -q "call icallcc" "$OUT_DIR/icall_l2.ll"
-if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine)\(" "$OUT_DIR/icall_l2.ll"; then
-  echo "direct calls to icall targets must be rewritten at level 2" >&2
+# 加密常量在跳板汇编里经字面池读入（asm printer 把 =imm 物化为 Ltmp）。
+"$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -mllvm -vllvm-config=icall=2 \
+  -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall_l2.s"
+grep -Eq "ldr[[:space:]]+x9, Ltmp" "$OUT_DIR/icall_l2.s"
+for fn in add_bias sum_nine ptr_mix; do
+  grep -Eq "define internal .*@__vllvm_icall\.[0-9A-F]+\.call\.[0-9]+\.$fn\(" \
+    "$OUT_DIR/icall_l2.ll" || { echo "missing call trampoline for $fn" >&2; exit 1; }
+  grep -Eq "call [^@]*@__vllvm_icall\.[0-9A-F]+\.call\.[0-9]+\.$fn\(" \
+    "$OUT_DIR/icall_l2.ll" || { echo "call site must target its own trampoline: $fn" >&2; exit 1; }
+done
+# 入口解密左值：明文写回参数槽位 + volatile 读取。
+grep -Eq "store i[0-9]+ %vllvm.icall.arg.plain" "$OUT_DIR/icall_l2.ll"
+grep -q "load volatile" "$OUT_DIR/icall_l2.ll"
+MIX_BODY=$(awk '/^define .*@mix_double\(/,/^\}/' "$OUT_DIR/icall_l2.ll")
+if printf '%s\n' "$MIX_BODY" | grep -q "vllvm.icall.arg"; then
+  echo "double-only args must not be encrypted" >&2
   exit 1
 fi
-
-# 被调方语义：注册目标不允许再被直接调用（函数地址仅作为
-# register_func 参数出现）。
-if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine)\(" "$OUT_DIR/icall.ll"; then
+# 调用者函数体不参与加密，也不允许直接调用注册目标；解密入口必须
+# 出现在目标函数体内。
+STRIPPED=$(awk 'BEGIN{keep=1}
+  /^define/{keep = ($0 !~ /@__vllvm_icall\./)}
+  keep{print}' "$OUT_DIR/icall_l2.ll")
+if printf '%s\n' "$STRIPPED" | grep -q "vllvm.icall.arg.crypt"; then
+  echo "call sites must forward plaintext args" >&2
+  exit 1
+fi
+printf '%s\n' "$STRIPPED" | grep -q "vllvm.icall.arg.plain" || {
+  echo "callee entry must decrypt args" >&2
+  exit 1
+}
+if printf '%s\n' "$STRIPPED" | grep -Eq \
+  "call [^@]*@(add_bias|mix_double|sum_nine|ptr_mix|quad_shift)\("; then
   echo "direct calls to icall targets must be rewritten" >&2
-  exit 1
-fi
-
-# 全模块只有 add_bias、mix_double、sum_nine 三个 icall 注册目标。
-REGISTER_CALLS=$(grep -Ec "call void @.*register_func" "$OUT_DIR/icall.ll")
-if [ "$REGISTER_CALLS" -ne 3 ]; then
-  echo "expected 3 deduplicated register_func calls, got $REGISTER_CALLS" >&2
   exit 1
 fi
 

@@ -50,70 +50,35 @@ struct PoolLocation {
 struct ICallRuntime {
   Function *CreatePool = nullptr;
   Function *RegisterFunc = nullptr;
-  Function *CallFunc = nullptr;
+  // 跳板 naked 汇编查表的池数据全局（ptr -> groups）。
+  GlobalVariable *PoolData = nullptr;
   // level 2 诱饵下标缓冲：调用点额外写入一条过加密链的假下标，
   // 让真实 nest 下标淹没在同构噪声里。
   GlobalVariable *Decoy = nullptr;
 };
 
-// —— 参数加密：调用点按随机可逆运算链加密标量整数参数，经跳板传输的
-// 是密文；icall 函数入口先做逆运算还原出明文参数。 ——
+// —— 参数加密：每个改写调用点有专属跳板函数（签名与被调函数一致），
+// 调用者明文直调跳板；跳板内对参数应用随机可逆运算链（仅 add/sub/xor）
+// 并查池间接跳转到目标；目标入口把参数解密一次写回参数槽位，之后按
+// 左值（volatile 槽位读取）使用。加密在跳板、解密在被调函数，调用者不参与。 ——
 
 struct CryptOp {
-  enum Kind : uint8_t { Add, Sub, Xor, MulOdd, Rol, Ror };
+  enum Kind : uint8_t { Add, Sub, Xor };
   Kind K;
   uint64_t C;
 };
 
 struct ArgCryptPlan {
   unsigned ArgPos = 0;
+  // 参数所在的 x 寄存器序号（0..7）：加密链在跳板的 naked 汇编里就地
+  // 改写该寄存器；栈传参数不参与加密。
+  unsigned Reg = 0;
+  // 运算链位宽：整数按自身位宽（32/64），指针按指针位宽（64），入口
+  // 解密经 ptrtoint/inttoptr 往返。
+  unsigned Width = 64;
+  bool IsPointer = false;
   SmallVector<CryptOp, 4> Ops;
 };
-
-// 奇数 C 模 2^W 的乘法逆元（牛顿迭代），是 MulOdd 的逆运算常量。
-uint64_t mulInverseOdd(uint64_t C, unsigned W) {
-  uint64_t Mask = W >= 64 ? ~0ULL : (1ULL << W) - 1;
-  C &= Mask;
-  uint64_t Inv = 1;
-  for (unsigned I = 0; I < 6; ++I)
-    Inv *= 2 - C * Inv;
-  return Inv & Mask;
-}
-
-Value *emitFunnelShift(IRBuilder<> &B, Intrinsic::ID IID, Value *V,
-                       uint64_t Shift, const Twine &Name) {
-  return B.CreateIntrinsic(IID, {V->getType()},
-                           {V, V, ConstantInt::get(V->getType(), Shift)},
-                           nullptr, Name);
-}
-
-// 按生成顺序应用加密链。
-Value *emitCryptForward(IRBuilder<> &B, Value *V, ArrayRef<CryptOp> Ops) {
-  for (const CryptOp &Op : Ops) {
-    Constant *Cst = ConstantInt::get(V->getType(), Op.C);
-    switch (Op.K) {
-    case CryptOp::Add:
-      V = B.CreateAdd(V, Cst, "vllvm.icall.arg.crypt");
-      break;
-    case CryptOp::Sub:
-      V = B.CreateSub(V, Cst, "vllvm.icall.arg.crypt");
-      break;
-    case CryptOp::Xor:
-      V = B.CreateXor(V, Cst, "vllvm.icall.arg.crypt");
-      break;
-    case CryptOp::MulOdd:
-      V = B.CreateMul(V, Cst, "vllvm.icall.arg.crypt");
-      break;
-    case CryptOp::Rol:
-      V = emitFunnelShift(B, Intrinsic::fshl, V, Op.C, "vllvm.icall.arg.crypt");
-      break;
-    case CryptOp::Ror:
-      V = emitFunnelShift(B, Intrinsic::fshr, V, Op.C, "vllvm.icall.arg.crypt");
-      break;
-    }
-  }
-  return V;
-}
 
 // 逆序应用各步逆运算；Head 返回链头（直接读取密文参数的指令），
 // 替换参数使用时要把它排除在外。
@@ -131,18 +96,6 @@ Value *emitCryptInverse(IRBuilder<> &B, Value *V, ArrayRef<CryptOp> Ops,
     case CryptOp::Xor:
       V = B.CreateXor(V, ConstantInt::get(Ty, Op.C), "vllvm.icall.arg.plain");
       break;
-    case CryptOp::MulOdd: {
-      Constant *Inv = ConstantInt::get(
-          Ty, mulInverseOdd(Op.C, Ty->getIntegerBitWidth()));
-      V = B.CreateMul(V, Inv, "vllvm.icall.arg.plain");
-      break;
-    }
-    case CryptOp::Rol:
-      V = emitFunnelShift(B, Intrinsic::fshr, V, Op.C, "vllvm.icall.arg.plain");
-      break;
-    case CryptOp::Ror:
-      V = emitFunnelShift(B, Intrinsic::fshl, V, Op.C, "vllvm.icall.arg.plain");
-      break;
     }
     if (*Head == nullptr)
       *Head = cast<Instruction>(V);
@@ -150,34 +103,63 @@ Value *emitCryptInverse(IRBuilder<> &B, Value *V, ArrayRef<CryptOp> Ops,
   return V;
 }
 
-// 每个宽度 >= 8 的标量整数参数生成独立的随机运算链（长度 2..4，
-// 全部由可逆操作组成）；指针/浮点/超窄整数保持明文。
+// 每个经 x0~x7 寄存器传入的标量整数参数（32/64 位）与普通地址空间指针
+// 参数生成独立的随机运算链（长度 2..4，全部由可逆操作组成），x0~x7 上
+// 的整数类寄存器都可能被加密；浮点（v 寄存器）、栈传参数、8/16/128 位
+// 整数、arm64e/PAC 目标的指针保持明文。
 std::vector<ArgCryptPlan>
 buildArgCryptPlans(Function &F, std::default_random_engine &Engine) {
   std::uniform_int_distribution<unsigned> PickLen(2, 4);
-  std::uniform_int_distribution<unsigned> PickKind(0, 5);
+  std::uniform_int_distribution<unsigned> PickKind(0, 2);
   std::uniform_int_distribution<uint64_t> PickConst(0, ~0ULL);
 
+  bool IsArm64e = Triple(F.getParent()->getTargetTriple()).isArm64e();
   std::vector<ArgCryptPlan> Plans;
+  unsigned XReg = 0;
+  // x 寄存器序号只在参数形态简单时可静态推算：sret 走 x8 不占 x0~x7；
+  // 聚合类型（struct/array/vector）与 i128 占用的寄存器数依赖完整
+  // AAPCS 分类，遇到之后序号不再可靠，后续参数一律不加密。
+  bool Tracking = true;
   for (unsigned I = 0; I < F.arg_size(); ++I) {
-    Type *Ty = F.getArg(I)->getType();
-    if (!Ty->isIntegerTy() || Ty->getIntegerBitWidth() < 8)
+    Argument *Arg = F.getArg(I);
+    Type *Ty = Arg->getType();
+    if (Arg->hasAttribute(Attribute::StructRet))
       continue;
-    unsigned W = Ty->getIntegerBitWidth();
+    bool Complex = Ty->isStructTy() || Ty->isArrayTy() || Ty->isVectorTy() ||
+                   (Ty->isIntegerTy() && Ty->getIntegerBitWidth() > 64);
+    if (Complex) {
+      Tracking = false;
+      continue;
+    }
+    bool IntClass = Ty->isIntegerTy() || Ty->isPointerTy();
+    unsigned Reg = XReg;
+    if (IntClass)
+      ++XReg;
+    if (!Tracking || !IntClass || Reg >= 8)
+      continue; // 浮点在 v 寄存器；栈传参数不在 x0~x7 上
+
+    bool IsPointer = Ty->isPointerTy();
+    unsigned W;
+    if (IsPointer) {
+      // 改写带 PAC 签名/特殊地址空间的指针会破坏签名或被运行时拦截。
+      if (IsArm64e || Ty->getPointerAddressSpace() != 0)
+        continue;
+      W = F.getDataLayout().getPointerSizeInBits(0);
+    } else {
+      W = Ty->getIntegerBitWidth();
+      if (W != 32 && W != 64)
+        continue;
+    }
 
     ArgCryptPlan Plan;
     Plan.ArgPos = I;
+    Plan.Reg = Reg;
+    Plan.Width = W;
+    Plan.IsPointer = IsPointer;
     for (unsigned K = 0, E = PickLen(Engine); K < E; ++K) {
       CryptOp Op;
       Op.K = static_cast<CryptOp::Kind>(PickKind(Engine));
-      if (Op.K == CryptOp::MulOdd && W > 64)
-        Op.K = CryptOp::Xor; // 超过 64 位没有 64 位乘法逆元可用
-      if (Op.K == CryptOp::MulOdd)
-        Op.C = PickConst(Engine) | 1ULL;
-      else if (Op.K == CryptOp::Rol || Op.K == CryptOp::Ror)
-        Op.C = PickConst(Engine) % W;
-      else
-        Op.C = PickConst(Engine);
+      Op.C = PickConst(Engine);
       Plan.Ops.push_back(Op);
     }
     Plans.push_back(std::move(Plan));
@@ -225,16 +207,46 @@ bool isFunctionAddressTaken(Function &F) {
   return false;
 }
 
-// 在函数入口插入逆运算链，并把函数体里对密文参数的使用全部换成明文。
+// 在函数入口把参数解密一次，写回 IRGen 的参数 alloca 槽位；之后对该
+// 槽位的读取全部改为 volatile。这样「参数 = 解密的参数」之后的使用都
+// 是左值（槽位变量）读取：mem2reg 不能提升 volatile 槽位，后端也无法
+// 把解密算术重物化回各使用点的密文表达式。
 void insertArgDecrypt(Function &F, ArrayRef<ArgCryptPlan> Plans) {
-  IRBuilder<> B(&F.getEntryBlock().front());
   for (const ArgCryptPlan &Plan : Plans) {
     Argument *Arg = F.getArg(Plan.ArgPos);
-    Instruction *Head = nullptr;
-    Value *Plain = emitCryptInverse(B, Arg, Plan.Ops, &Head);
-    // 链头读取的是密文参数本身，不能被替换；其余使用全部换成明文。
+    // IRGen 的参数初始化 store：把写入槽位的密文换成明文。
+    StoreInst *Init = nullptr;
+    for (User *U : Arg->users())
+      if (auto *SI = dyn_cast<StoreInst>(U); SI && SI->getValueOperand() == Arg) {
+        Init = SI;
+        break;
+      }
+    IRBuilder<> B(Init ? static_cast<Instruction *>(Init)
+                       : &F.getEntryBlock().front());
+    // 指针参数经 ptrtoint 参与整数逆链，还原后 inttoptr 回指针类型。
+    // Exclude 是直接读取密文参数的链头（指针为 ptrtoint，整数为首个
+    // 逆运算指令），替换使用时要排除，否则自引用成环。
+    Instruction *Exclude = nullptr;
+    Value *Base = Arg;
+    if (Plan.IsPointer) {
+      auto *PI = cast<Instruction>(B.CreatePtrToInt(
+          Arg, Type::getIntNTy(F.getContext(), Plan.Width)));
+      Base = PI;
+      Exclude = PI;
+    }
+    Value *Plain = emitCryptInverse(B, Base, Plan.Ops, &Exclude);
+    if (Plan.IsPointer)
+      Plain = B.CreateIntToPtr(Plain, Arg->getType());
+    // 密文参数的所有使用都换成明文：包括初始化 store 的值操作数，以及
+    // byval 等不经槽位、直接使用参数值的形态。
     Arg->replaceUsesWithIf(
-        Plain, [&Head](Use &U) { return U.getUser() != Head; });
+        Plain, [&Exclude](Use &U) { return U.getUser() != Exclude; });
+    if (!Init)
+      continue;
+    Value *Slot = Init->getPointerOperand();
+    for (User *U : Slot->users())
+      if (auto *LI = dyn_cast<LoadInst>(U))
+        LI->setVolatile(true);
   }
 }
 
@@ -311,58 +323,6 @@ Function *createRegisterFunction(Module &M, StringRef Name,
   return F;
 }
 
-// 生成共享跳板 call_func：index 由调用点经 icallcc 的 nest i32 送入 w19，
-// 跳板按 (group_id, index) 查池并 ret 到真实目标，参数与返回值保持原 ABI。
-Function *createCallFunc(Module &M, StringRef Name, GlobalVariable *PoolData) {
-  LLVMContext &Ctx = M.getContext();
-  Type *I32Ty = Type::getInt32Ty(Ctx);
-  Function *F = Function::Create(
-      FunctionType::get(Type::getVoidTy(Ctx), {I32Ty}, false),
-      GlobalValue::InternalLinkage, Name, M);
-  F->setCallingConv(CallingConv::ICall);
-  F->addParamAttr(0, Attribute::Nest);
-  addRuntimeAttrs(*F);
-  F->addFnAttr(Attribute::Naked);
-
-  std::string PoolSymbol = PoolData->getName().str();
-  Triple TT(M.getTargetTriple());
-  std::string Asm;
-  if (TT.isOSBinFormatMachO()) {
-    Asm = "ubfx w16, w19, #16, #8\n"
-          "and w17, w19, #0xff\n"
-          "adrp x9, _" +
-          PoolSymbol +
-          "@PAGE\n"
-          "ldr x9, [x9, _" +
-          PoolSymbol +
-          "@PAGEOFF]\n"
-          "add x9, x9, x16, lsl #4\n"
-          "ldr x9, [x9, #8]\n"
-          "ldr x19, [x9, x17, lsl #3]\n"
-          "ret x19\n";
-  } else {
-    Asm = "ubfx w16, w19, #16, #8\n"
-          "and w17, w19, #0xff\n"
-          "adrp x9, " +
-          PoolSymbol +
-          "\n"
-          "ldr x9, [x9, :lo12:" +
-          PoolSymbol +
-          "]\n"
-          "add x9, x9, x16, lsl #4\n"
-          "ldr x9, [x9, #8]\n"
-          "ldr x19, [x9, x17, lsl #3]\n"
-          "ret x19\n";
-  }
-
-  IRBuilder<> IRB(BasicBlock::Create(Ctx, "entry", F));
-  FunctionType *AsmTy = FunctionType::get(Type::getVoidTy(Ctx), false);
-  InlineAsm *Thunk = InlineAsm::get(AsmTy, Asm, "", true);
-  IRB.CreateCall(AsmTy, Thunk);
-  IRB.CreateUnreachable();
-  return F;
-}
-
 ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
                            uint32_t GroupLength, StringRef Suffix,
                            bool WithDecoy) {
@@ -409,8 +369,7 @@ ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
       M, Prefix + ".create_func_pool", GroupCountState, GroupLengthState);
   Runtime.RegisterFunc = createRegisterFunction(
       M, Prefix + ".register_func", GroupTy, GroupsTy, Groups);
-  Runtime.CallFunc =
-      createCallFunc(M, Prefix + ".call_func", PoolData);
+  Runtime.PoolData = PoolData;
   if (WithDecoy) {
     Runtime.Decoy = new GlobalVariable(
         M, I32Ty, false, GlobalValue::InternalLinkage, Zero,
@@ -479,22 +438,32 @@ getPooledIndex(CallInst &Call, const DenseMap<Function *, uint32_t> &Pool) {
   return It == Pool.end() ? nullptr : &It->second;
 }
 
-AttributeList createICallAttrs(CallInst &OldCall) {
-  LLVMContext &Ctx = OldCall.getContext();
-  AttributeList OldAttrs = OldCall.getAttributes();
-  SmallVector<AttributeSet, 8> ParamAttrs;
-  for (unsigned I = 0; I < OldCall.arg_size(); ++I)
-    ParamAttrs.push_back(OldAttrs.getParamAttrs(I));
-  ParamAttrs.push_back(AttributeSet::get(
-      Ctx, {Attribute::get(Ctx, Attribute::Nest)}));
-  // 函数级 memory 等属性描述的是原目标，不适用于查表 trampoline。
-  return AttributeList::get(Ctx, AttributeSet(), OldAttrs.getRetAttrs(),
-                            ParamAttrs);
+// 按生成顺序应用加密链（仅 add/sub/xor）：诱饵下标与历史参数链共用。
+Value *emitCryptForward(IRBuilder<> &B, Value *V, ArrayRef<CryptOp> Ops) {
+  for (const CryptOp &Op : Ops) {
+    Constant *Cst = ConstantInt::get(V->getType(), Op.C);
+    switch (Op.K) {
+    case CryptOp::Add:
+      V = B.CreateAdd(V, Cst, "vllvm.icall.decoy.crypt");
+      break;
+    case CryptOp::Sub:
+      V = B.CreateSub(V, Cst, "vllvm.icall.decoy.crypt");
+      break;
+    case CryptOp::Xor:
+      V = B.CreateXor(V, Cst, "vllvm.icall.decoy.crypt");
+      break;
+    }
+  }
+  return V;
 }
 
-void rewriteCall(const ICallRuntime &Runtime, uint32_t PackedIndex,
-                 CallInst *OldCall, ArrayRef<ArgCryptPlan> Crypt,
+void rewriteCall(Function &Trampoline, const ICallRuntime &Runtime,
+                 uint32_t PackedIndex, CallInst *OldCall,
                  ArrayRef<CryptOp> DecoyOps, uint32_t DecoyBase) {
+  // 调用点退化为对专属跳板的直调：明文实参、无加密运算，调用者函数体
+  // 保持干净。调用号（group_id<<16|index）作为调用点常量经尾部 i32 nest
+  // 参数送入 w19（icallcc 约定），跳板据此解码查表。调用约定 icallcc：
+  // 参数/返回沿用标准 ABI 位置，后端 CSR 掩码把 x19 视为调用方保存。
   IRBuilder<> B(OldCall);
   // fake 逻辑：先写一条与真实下标同宽、同样过可逆链的诱饵下标，
   // 基值独立随机，静态分析难以区分哪条运算链真正汇入 nest 参数。
@@ -508,33 +477,113 @@ void rewriteCall(const ICallRuntime &Runtime, uint32_t PackedIndex,
 
   // 参与加密的参数先过正向运算链，再送进 icallcc 跳板。
   SmallVector<Value *, 8> Args;
-  for (unsigned I = 0; I < OldCall->arg_size(); ++I) {
-    Value *Arg = OldCall->getArgOperand(I);
-    for (const ArgCryptPlan &Plan : Crypt)
-      if (Plan.ArgPos == I) {
-        Arg = emitCryptForward(B, Arg, Plan.Ops);
-        break;
-      }
-    Args.push_back(Arg);
-  }
+  for (unsigned I = 0; I < OldCall->arg_size(); ++I)
+    Args.push_back(OldCall->getArgOperand(I));
   Args.push_back(ConstantInt::get(Type::getInt32Ty(OldCall->getContext()),
                                   PackedIndex));
-  SmallVector<Type *, 8> ParamTypes;
-  for (Value *Arg : Args)
-    ParamTypes.push_back(Arg->getType());
-  FunctionType *ICallTy = FunctionType::get(
-      OldCall->getType(), ParamTypes, false);
-  CallInst *NewCall = CallInst::Create(
-      ICallTy, Runtime.CallFunc, Args, OldCall->getName(),
-      OldCall->getIterator());
+  CallInst *NewCall =
+      CallInst::Create(&Trampoline, Args, OldCall->getName(),
+                       OldCall->getIterator());
   NewCall->setCallingConv(CallingConv::ICall);
-  NewCall->setAttributes(createICallAttrs(*OldCall));
+  AttributeList OldAttrs = OldCall->getAttributes();
+  SmallVector<AttributeSet, 8> ParamAttrs;
+  for (unsigned I = 0; I < OldCall->arg_size(); ++I)
+    ParamAttrs.push_back(OldAttrs.getParamAttrs(I));
+  ParamAttrs.push_back(AttributeSet::get(
+      OldCall->getContext(),
+      {Attribute::get(OldCall->getContext(), Attribute::Nest)}));
+  NewCall->setAttributes(AttributeList::get(OldCall->getContext(),
+                                            AttributeSet(),
+                                            OldAttrs.getRetAttrs(),
+                                            ParamAttrs));
   NewCall->setDebugLoc(OldCall->getDebugLoc());
   NewCall->copyMetadata(*OldCall);
-
   if (!OldCall->getType()->isVoidTy())
     OldCall->replaceAllUsesWith(NewCall);
   OldCall->eraseFromParent();
+}
+
+// 每个改写调用点独有的跳板：naked 函数，签名与被调函数一致。函数体为
+// 按目标随机生成的汇编：先在 x0~x7 上就地应用参数正向运算链（常量经
+// 字面池 ldr 读入 x9/w9），再以编译期常量 (group_id, index) 查池，经
+// ldr x19 / ret x19 跳转到真实目标（目标入口做逆运算）。naked 保证不
+// 动 lr，目标 ret 直接返回原始调用者；x19 由目标按被调约定保存恢复。
+// runtime 属性防止跳板被内联或优化改写。
+Function *createCallTrampoline(Function &Target,
+                               ArrayRef<ArgCryptPlan> Plans,
+                               GlobalVariable *PoolData, StringRef Suffix,
+                               unsigned Site) {
+  Module &M = *Target.getParent();
+  LLVMContext &Ctx = M.getContext();
+  // 签名 = 目标签名 + 尾部一个 i32 nest：调用号（group_id<<16|index）
+  // 由调用点常量经 icallcc 送入 w19（后端按 CCIfNest 分配 W19），
+  // 跳板运行期从 w19 解码查表。其余参数/返回与目标完全一致。
+  SmallVector<Type *, 8> Params;
+  for (unsigned I = 0; I < Target.arg_size(); ++I)
+    Params.push_back(Target.getArg(I)->getType());
+  Params.push_back(Type::getInt32Ty(Ctx));
+  Function *Tramp = Function::Create(
+      FunctionType::get(Target.getReturnType(), Params, false),
+      GlobalValue::InternalLinkage,
+      (Twine("__vllvm_icall.") + Suffix + ".call." + Twine(Site) + "." +
+       Target.getName())
+          .str(),
+      M);
+  addRuntimeAttrs(*Tramp);
+  Tramp->addFnAttr(Attribute::Naked);
+  // icallcc：参数/返回沿用标准 ABI 位置（nest i32 进 w19），但后端 CSR
+  // 掩码把 x19 视为调用方保存——ret x19 查表跳转会破坏 x19，调用方的
+  // 寄存器分配必须知情。
+  Tramp->setCallingConv(CallingConv::ICall);
+  Tramp->addParamAttr(Tramp->arg_size() - 1, Attribute::Nest);
+
+  Triple TT(M.getTargetTriple());
+  std::string Sym = PoolData->getName().str();
+  if (TT.isOSBinFormatMachO())
+    Sym = "_" + Sym;
+
+  std::string Asm;
+  for (const ArgCryptPlan &Plan : Plans) {
+    bool Is64 = Plan.Width == 64;
+    std::string R = (Is64 ? "x" : "w") + std::to_string(Plan.Reg);
+    std::string SCR = Is64 ? "x9" : "w9";
+    for (const CryptOp &Op : Plan.Ops) {
+      switch (Op.K) {
+      case CryptOp::Add:
+        Asm += "ldr " + SCR + ", =0x" + utohexstr(Is64 ? Op.C : (uint32_t)Op.C) +
+               "\nadd " + R + ", " + R + ", " + SCR + "\n";
+        break;
+      case CryptOp::Sub:
+        Asm += "ldr " + SCR + ", =0x" + utohexstr(Is64 ? Op.C : (uint32_t)Op.C) +
+               "\nsub " + R + ", " + R + ", " + SCR + "\n";
+        break;
+      case CryptOp::Xor:
+        Asm += "ldr " + SCR + ", =0x" + utohexstr(Is64 ? Op.C : (uint32_t)Op.C) +
+               "\neor " + R + ", " + R + ", " + SCR + "\n";
+        break;
+      }
+    }
+  }
+  // 查表跳转（与 src/funccaller 的 call_func 一致）：从 w19 解码
+  // group_id/index，group 结构 {i32, ptr} 长 16 字节、func_array 在 +8，
+  // 槽位宽 8 字节，取目标地址后 ret x19。
+  if (TT.isOSBinFormatMachO())
+    Asm += "adrp x9, " + Sym + "@PAGE\nldr x9, [x9, " + Sym + "@PAGEOFF]\n";
+  else
+    Asm += "adrp x9, " + Sym + "\nldr x9, [x9, :lo12:" + Sym + "]\n";
+  Asm += "ubfx w16, w19, #16, #8\n";
+  Asm += "and w17, w19, #0xff\n";
+  Asm += "add x9, x9, x16, lsl #4\n";
+  Asm += "ldr x9, [x9, #8]\n";
+  Asm += "ldr x19, [x9, x17, lsl #3]\n";
+  Asm += "ret x19\n";
+
+  IRBuilder<> IRB(BasicBlock::Create(Ctx, "entry", Tramp));
+  FunctionType *AsmTy = FunctionType::get(Type::getVoidTy(Ctx), false);
+  InlineAsm *Thunk = InlineAsm::get(AsmTy, Asm, "", true);
+  IRB.CreateCall(AsmTy, Thunk);
+  IRB.CreateUnreachable();
+  return Tramp;
 }
 } // namespace
 
@@ -585,7 +634,9 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
 
   // 参数加密的前提是目标的所有调用点都会被改写：invoke、musttail、
   // operand bundle、可变参数、vmp 调用方保持明文直调，地址被取用的
-  // 目标还存在间接调用，这些目标一律不加密。
+  // 目标还存在间接调用，这些目标一律不加密。非 local linkage 的目标
+  // 还可能被其他编译单元明文直调（跨模块调用点对本 module pass 不可
+  // 见，无法改写），同样保持明文，只入池不做参数加密。
   SmallPtrSet<Function *, 16> CryptBlocked;
   for (Function &F : M) {
     if (F.isDeclaration())
@@ -601,7 +652,7 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
         continue;
       auto *Call = dyn_cast<CallInst>(CB);
       if (Call && !CallerIsVmp && getPooledIndex(*Call, PackedIndexes))
-        continue; // 该调用点会被改写并加密
+        continue; // 该调用点会被改写为专属跳板调用并加密
       CryptBlocked.insert(Callee);
     }
   }
@@ -610,6 +661,8 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
     for (Function *Target : Targets) {
       if (CryptBlocked.count(Target) || isFunctionAddressTaken(*Target))
         continue;
+      if (!Target->hasLocalLinkage())
+        continue; // 跨模块可直调的目标不加密，避免明文实文命中解密入口
       std::vector<ArgCryptPlan> Plans = buildArgCryptPlans(*Target, Engine);
       if (!Plans.empty()) {
         CryptPlans.try_emplace(Target, std::move(Plans));
@@ -620,30 +673,28 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
 
   ICallRuntime Runtime =
       createRuntime(M, GroupCount, GroupLength, Suffix, UseCrypt);
-  // 诱饵运算链整模块共享一条，基值逐调用点随机。
+  // 诱饵运算链整模块共享一条（仅 add/sub/xor），基值逐调用点随机。
   SmallVector<CryptOp, 4> DecoyOps;
   if (UseCrypt) {
-    std::uniform_int_distribution<unsigned> PickKind(0, 5);
+    std::uniform_int_distribution<unsigned> PickKind(0, 2);
     std::uniform_int_distribution<uint64_t> PickConst(0, ~0ULL);
     for (unsigned I = 0, E = 2 + PickKind(Engine) % 3; I < E; ++I) {
       CryptOp Op;
       Op.K = static_cast<CryptOp::Kind>(PickKind(Engine));
-      if (Op.K == CryptOp::MulOdd)
-        Op.C = PickConst(Engine) | 1ULL;
-      else if (Op.K == CryptOp::Rol || Op.K == CryptOp::Ror)
-        Op.C = PickConst(Engine) % 32;
-      else
-        Op.C = PickConst(Engine);
+      Op.C = PickConst(Engine);
       DecoyOps.push_back(Op);
     }
   }
   std::uniform_int_distribution<uint32_t> PickDecoyBase(0, ~0u);
-  // 第三步：在 init_array 中注册所有函数。
+  // 第三步：在 init_array 中注册所有目标，池槽直接登记原函数地址。
   createRegistrationCtor(M, Runtime, Targets, Locations, GroupCount,
                          GroupLength, Suffix);
 
-  // 第四步：改写模块内所有调用点。packed index 只在编译期存在，直接
-  // 作为调用点常量经 icallcc 送入 w19；加密目标同时应用正向运算链。
+  // 第四步：为每个改写调用点生成专属跳板，并把原调用替换为对跳板的
+  // 普通直调（明文实参）。跳板函数签名与目标一致，内部完成可选的正向
+  // 参数加密与 (group_id, index) 查池，再间接尾调用目标；index 只在
+  // 编译期作为跳板内常量存在。
+  unsigned SiteCounter = 0;
   for (Function &F : M) {
     if (F.isDeclaration() || F.hasFnAttribute(RuntimeAttr))
       continue;
@@ -670,11 +721,13 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
     errs() << "[vllvm] IndirectCallPass:" << F.getName() << "\n";
     for (const PlannedCall &P : Planned) {
       auto It = CryptPlans.find(P.Callee);
-      rewriteCall(Runtime, P.Packed, P.Call,
-                  It == CryptPlans.end()
-                      ? ArrayRef<ArgCryptPlan>()
-                      : ArrayRef(It->second),
-                  DecoyOps, PickDecoyBase(Engine));
+      Function *Tramp = createCallTrampoline(
+          *P.Callee,
+          It == CryptPlans.end() ? ArrayRef<ArgCryptPlan>()
+                                 : ArrayRef(It->second),
+          Runtime.PoolData, Suffix, SiteCounter++);
+      rewriteCall(*Tramp, Runtime, P.Packed, P.Call, DecoyOps,
+                  PickDecoyBase(Engine));
     }
   }
 

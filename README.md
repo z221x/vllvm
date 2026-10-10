@@ -9,7 +9,7 @@ VLLVM 将 OLLVM 风格和实验性 VMP 混淆 Pass 集成进 LLVM/Clang 源码�
 | `enstr` | EncryptoStrPass | 字符串加密，Module Pass；每个字符串首次解密后缓存地址，后续复用。 |
 | `fla` | FlattenFuncPass | 控制流平坦化。 |
 | `lvars`（表参数化） | moveTablesToImplParams | 函数级混淆完成后把 fla 等每函数常量表改为参数传递：函数体搬进带表参数的私有 `vllvm.impl`，原函数退化为传表包装器，并以 volatile 守卫的伪调用点阻断 -O2 过程间常量传播把参数折叠回全局。indirectbr/musttail 等场景整体回退。 |
-| `icall` | IndirectCallPass | 标注在被调函数上：模块内所有调用点都改走随机注册的模块级调用池（乱序分组，`group_id<<16\|index` 编码），经 `icallcc`/`x19` 查表跳板间接调用；注册在 `init_array` 完成。标量整数参数再叠加随机可逆运算链加密（add/sub/xor/奇数乘/循环移位），函数入口先逆运算还原；地址被取用或存在不可改写调用点（invoke/musttail/vmp 调用方等）的目标保持明文。 |
+| `icall` | IndirectCallPass | 标注在被调函数上：模块内所有调用点改写为对**各自专属 naked 跳板函数**（`__vllvm_icall.<id>.call.<n>.<fn>`，签名 = 目标签名 + 隐藏 `i32 nest` 调用号）的直调；调用方先把注册号（`group_id<<16\|index`）作为调用点常量经 icallcc 的 nest 通道写入 w19（`mov w19, #imm`），跳板函数体是按目标随机生成的汇编——x0~x7 上就地应用参数的随机可逆运算链加密（仅 add/sub/xor），再用 `ubfx/and` 从 w19 解码 (group,index) 查随机注册的调用池，经 `ldr x19`/`ret x19` 跳转到真实目标（与 `src/funccaller` 的 call_func 序列一致）；池在 `init_array` 乱序注册。icallcc 约定参数/返回沿用标准 ABI 位置、CSR 掩码不含 x19。目标入口把参数解密一次写回参数栈槽（`参数 = 解密的参数`），之后的使用全部按左值（volatile 槽位读取）进行，优化器无法把解密算术重物化回使用点。地址被取用、存在不可改写调用点（invoke/musttail/vmp 调用方等）、或非内部链接的目标不参与参数加密，仅入池。加密覆盖 x0~x7 寄存器传入的 32/64 位整数与普通地址空间指针（入口经 ptrtoint/inttoptr 还原；arm64e/PAC 目标与非零地址空间指针保持明文）；浮点（v 寄存器）、栈传参数与 8/16/128 位整数保持明文。 |
 | `ibr` | IndirectBranchPass | 先将 `switch` 降为 if/else 分支，再随机使用混合、ADD、XOR、SUB 或明文模式处理下标，动态查全部非入口块的地址表（LLVM 禁止对入口块取地址）。 |
 | `lvars` | （vmfla 捆绑） | 局部变量结构体化不再是独立 pass：`lvars` 标注别名到 `vmfla`，结构化只能随 vmfla 捆绑执行；字段布局随机打乱，偏移经 vmfla 共享常量表加密，不再对应源码声明顺序。 |
 | `bcf` | BogusControlFlowPass | 插入基于可写全局状态和 `volatile` load 的虚假控制流。 |
@@ -87,6 +87,7 @@ Windows：
 ./test/flatten/test_flatten.sh
 ./test/indirectcall/test_indirectcall.sh
 ./test/indirectcall/test_icall_verifier.sh
+./test/indirectcall/test_icall_cross_tu.sh
 ./test/indirectbranch/test_indirectbr.sh
 ./test/localvarstruct/test_lvars.sh
 ./test/localvarstruct/test_lvars_fla.sh
@@ -115,6 +116,9 @@ bb2func/merge 与 vmfla 链路测试：
 
 测试脚本会优先使用 `build/llvm-macos/bin/clang` 或 `build/llvm-linux/bin/clang`，也可通过 `CLANG=/path/to/clang` 指定编译器。
 新增的 IR 独立校验脚本还需要同一构建目录中的 `llvm-as`（可通过 `LLVM_AS` 覆盖）。
+
+开源应用级 Pass 性能基准见 `test/perf/`（zlib/lua/sqlite/bzip2 全程序标注，
+测运行时/体积/编译开销与正确性），结果报告在 `docs/PASS_PERF_REPORT.md`。
 Endless Tunnel 的 Android APK 构建、IR 校验和真机核心算法测试见 `test/android/README.md`。
 
 `enstr` 为每个加密字符串生成一个 `vllvm.enstr.cache.*` 全局指针，初始为空。

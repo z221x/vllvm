@@ -55,11 +55,18 @@ run_case() {
   icall) config_args=(-mllvm -vllvm-config=icall=2) ;;
   esac
 
-  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
-    -emit-llvm "$mode_define" "${config_args[@]}" "$SRC" -o "$ll"
+  # icall 用例需要保留值名字断言加密位置；其余用例的断言依赖匿名编号。
+  if [ "$name" = icall ]; then
+    "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
+      -fno-discard-value-names -emit-llvm "$mode_define" ${config_args[@]+"${config_args[@]}"} \
+      "$SRC" -o "$ll"
+  else
+    "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
+      -emit-llvm "$mode_define" ${config_args[@]+"${config_args[@]}"} "$SRC" -o "$ll"
+  fi
 
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-    "$mode_define" "${config_args[@]}" "$SRC" -o "$exe"
+    "$mode_define" ${config_args[@]+"${config_args[@]}"} "$SRC" -o "$exe"
   strip_binary "$exe"
 
   set +e
@@ -97,19 +104,29 @@ run_case() {
     ;;
   icall)
     grep -q "register_func" "$ll"
-    grep -q "call icallcc" "$ll"
     grep -Eq "i32 nest [0-9]+" "$ll"
+    grep -q "ret x19" "$ll"
     if grep -q "vllvm.icall.index_array" "$ll"; then
       echo "icall packed indexes must be call-site constants" >&2
       exit 1
     fi
-    # 被调方语义：icall 目标不允许再被直接调用。
-    if grep -Eq "call [^@]*@(op_add|op_sub|op_mix|score_string|recursive_flow)\(" "$ll"; then
+    # 被调方语义：icall 目标不允许被直接调用；调用点普通直调各自专属
+    # 跳板（__vllvm_icall.*.call.<n>.<fn>），加密运算只在跳板内。
+    STRIPPED_ICALL=$(awk 'BEGIN{keep=1}
+      /^define/{keep = ($0 !~ /@__vllvm_icall\./)}
+      keep{print}' "$ll")
+    if printf '%s\n' "$STRIPPED_ICALL" | grep -Eq \
+      "call [^@]*@(op_add|op_sub|op_mix|score_string|recursive_flow)\("; then
       echo "direct calls to icall targets must be rewritten" >&2
+      exit 1
+    fi
+    if printf '%s\n' "$STRIPPED_ICALL" | grep -q "vllvm.icall.arg.crypt"; then
+      echo "call sites must forward plaintext args" >&2
       exit 1
     fi
     # 地址被取用的 op_* 不加密，纯直调目标（如 recursive_flow）加密。
     grep -q "vllvm.icall.crypt" "$ll"
+    grep -Eq "define internal .*@__vllvm_icall\.[0-9A-F]+\.call\.[0-9]+\.recursive_flow\(" "$ll"
     ;;
   ibr)
     grep -q "indirectbr" "$ll"

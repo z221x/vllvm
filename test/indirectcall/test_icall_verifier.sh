@@ -18,10 +18,18 @@ reject() {
   fi
   grep -q "$reason" "$OUT_DIR/$name.log"
 }
+# 无 nest 的 icallcc 应被接受：icall 专属跳板形态不需要 nest index。
+accept() {
+  local name=$1 ir=$2
+  if ! printf '%s\n' "$ir" | "$LLVM_AS" -o /dev/null >"$OUT_DIR/$name.log" 2>&1; then
+    echo "unexpected verifier rejection: $name" >&2
+    cat "$OUT_DIR/$name.log" >&2
+    exit 1
+  fi
+}
 reject normal_i32 'declare void @bad(i32 nest)' 'incompatible type'
 reject index_i64 'declare icallcc void @bad(i64 nest)' 'must be i32'
 reject index_ptr 'declare icallcc void @bad(ptr nest)' 'must be i32'
-reject missing 'declare icallcc void @bad(i32)' 'exactly one nest i32'
 reject duplicate 'declare icallcc void @bad(i32 nest, i32 nest)' 'More than one parameter'
 reject varargs 'declare icallcc void @bad(i32 nest, ...)' 'does not support varargs'
 reject other_attr 'declare icallcc void @bad(i32 nest nonnull)' 'incompatible type'
@@ -30,9 +38,9 @@ define void @caller() {
   call icallcc void @target(i64 nest 0)
   ret void
 }' 'must be i32'
-reject call_missing 'declare icallcc void @target(i32 nest)
-define void @caller() {
-  call icallcc void @target(i32 0)
-  ret void
-}' 'exactly one nest i32'
-echo 'PASS icall verifier: valid ABI accepted; 9 invalid cases rejected'
+accept nestless_decl_call 'declare icallcc i64 @bad(i64)
+define i64 @caller(i64 %a) {
+  %r = call icallcc i64 @bad(i64 %a)
+  ret i64 %r
+}'
+echo 'PASS icall verifier: valid ABI accepted (incl. nest-less icallcc); 7 invalid cases rejected'

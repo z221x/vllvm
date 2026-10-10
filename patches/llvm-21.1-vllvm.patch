@@ -150,8 +150,8 @@ index 9afbefb8c..d72fb3fa5 100644
 +      Check(F.getArg(I)->getType()->isIntegerTy(32),
 +            "icallcc index parameter must be i32!", &F);
 +    }
-+    Check(IndexArgs == 1,
-+          "icallcc requires exactly one nest i32 index parameter!", &F);
++    Check(IndexArgs <= 1,
++          "icallcc allows at most one nest i32 index parameter!", &F);
 +    Check(!F.isVarArg(), "icallcc does not support varargs!", &F);
 +    break;
 +  }
@@ -171,8 +171,8 @@ index 9afbefb8c..d72fb3fa5 100644
 +      Check(Call.getArgOperand(I)->getType()->isIntegerTy(32),
 +            "icallcc index parameter must be i32!", Call);
 +    }
-+    Check(IndexArgs == 1,
-+          "icallcc requires exactly one nest i32 index parameter!", Call);
++    Check(IndexArgs <= 1,
++          "icallcc allows at most one nest i32 index parameter!", Call);
 +    Check(!FTy->isVarArg(), "icallcc does not support varargs!", Call);
 +  }
 +

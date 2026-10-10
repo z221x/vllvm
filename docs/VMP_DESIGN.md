@@ -1157,3 +1157,9 @@ M3 的栈上限/对齐、六参数限制、回退范围、`ConversionMode` 和 `
 - [LLVM Writing an LLVM Backend](https://llvm.org/docs/WritingAnLLVMBackend.html)
 - [LLVM Target-Independent Code Generator](https://llvm.org/docs/CodeGenerator.html)
 - [xVMP](https://github.com/GANGE666/xVMP)
+
+
+## 已知问题
+
+性能与正确性测试发现的 VMP 缺陷与能力限制（递归崩溃、CRC 形态 VM 断言、
+哈希类不可表达、回退静默等）记录在 `VMP_ISSUES.md`，含复现方式与修复建议。
