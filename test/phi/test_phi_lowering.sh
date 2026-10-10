@@ -36,7 +36,8 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
       awk '/^; \*\*\* IR Dump After/ {
         show = /VLLVMEncryptoStrDispatchPass|VLLVMFunctionDispatchPass/
       }
-      show && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
+      /^define / { skip = ($0 ~ /@__vllvm_enstr/) }
+      show && !skip && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
         > "$OUT_DIR/$mode.after-lowering.log"
       # The enstr dispatch is a no-op for fla/vmfla-only input.
       if [[ $mode == fla ]]; then

@@ -27,7 +27,12 @@ for opt in 0 2; do
     if grep -Eq '@(alpha_text|beta_text|alpha_pointer) = ' "$ir"; then
       echo 'retired string globals must be erased' >&2; exit 1
     fi
-    grep -q '@__vllvm_enstr_mmap_flags = internal .* constant i32 34' "$ir"
+# MAP_PRIVATE|MAP_ANON 平台相关：Android/ELF 0x22=34，Darwin 0x1002=4098
+MMAP_FLAGS=34
+if [ "$(uname -s)" = Darwin ]; then
+  MMAP_FLAGS=4098
+fi
+grep -q "@__vllvm_enstr_mmap_flags = internal .* constant i32 $MMAP_FLAGS" "$ir"
     [[ $(grep -Ec 'define .*@__vllvm_enstr_get\(' "$ir") == 1 ]]
   fi
   grep -Eq 'load atomic (ptr|i64).*acquire' "$ir"

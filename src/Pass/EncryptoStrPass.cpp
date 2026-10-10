@@ -485,6 +485,14 @@ EncryptoStrPass::makeEncryptoStrPool(Module &M) {
     if (!EncryptAllStrings && !isMarkedStringTarget(globalVar))
       continue;
 
+    // 跨 TU 语义保护（与 icall 同构的问题）：非 local linkage 的目标可能
+    // 被其他编译单元直接引用（典型：zlib deflate.h 把 tally/d_code 内联成
+    // 宏直接读 _dist_code/_length_code）。本 module pass 只能改写本模块
+    // 引用，initializer 换密文后其他 TU 会读到密文字节（zlib 实测即
+    // dyn_dtree[密文].Freq++ 越界写坏堆）。外部可见目标一律不进池。
+    if (!globalVar.hasLocalLinkage())
+      continue;
+
     auto *encryptoStr = new EncryptoStr(ID, &globalVar, false, M);
     std::vector<EncryptoStr *> pendingDoubleStrings;
     bool supported = true;
