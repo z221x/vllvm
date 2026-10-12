@@ -27,8 +27,7 @@ Program makeImage(const std::vector<Instruction> &Code,
 
 std::uint32_t run(const Program &Image,
                   const std::vector<std::uint64_t> &Arguments,
-                  std::uint64_t &Result, std::uint8_t *Stack = nullptr,
-                  std::uint32_t StackSize = 0,
+                  std::uint64_t &Result, std::uint32_t StackSize = 0,
                   const std::vector<const void *> &FunctionTable = {}) {
   std::vector<std::uint64_t> MutableArguments = Arguments;
   return __vllvm_vmp_execute_checked(
@@ -36,7 +35,7 @@ std::uint32_t run(const Program &Image,
       FunctionTable.empty() ? nullptr : FunctionTable.data(),
       Image.Values.empty() ? nullptr : Image.Values.data(), Image.Values.size(),
       MutableArguments.empty() ? nullptr : MutableArguments.data(),
-      MutableArguments.size(), Stack, StackSize, &Result);
+      MutableArguments.size(), StackSize, &Result);
 }
 
 std::uint64_t testHostTarget(std::uint64_t A0, std::uint64_t A1,
@@ -278,10 +277,8 @@ void testStackAndHostMemory() {
       ret(),
   };
   auto StackImage = makeImage(StackCode, {}, 1, 16);
-  alignas(16) std::uint8_t Stack[16]{};
   std::uint64_t Result = 0;
-  assert(run(StackImage, {0xAABBCCDDEEFF0011ULL}, Result, Stack,
-             sizeof(Stack)) == 0);
+  assert(run(StackImage, {0xAABBCCDDEEFF0011ULL}, Result, 16) == 0);
   assert(Result == 0xAABBCCDDEEFF0011ULL);
 
   std::uint32_t HostValue = 0x12345678U;
@@ -330,47 +327,74 @@ void testStackAndHostMemory() {
 }
 
 void testHostCall() {
-  Program HostProgram = makeImage({{.opcode = Opcode::HOSTCALL,
-                                    .payload = packHostCallPayload(0, 8),
-                                    .format = InstFormat::CALL},
-                                   ret()},
-                                  {}, 6, 16);
-  alignas(16) std::uint8_t Stack[16]{};
-  auto *StackArguments = reinterpret_cast<std::uint64_t *>(Stack);
-  StackArguments[0] = 7;
-  StackArguments[1] = 8;
+  // 栈参数 7/8 由 VM 程序 STORE 进 SA 溢出区（解释器自分配帧；
+  // argc=8 → OverflowSize=16，位于帧尾）。
+  Program HostProgram = makeImage(
+      {{.opcode = Opcode::LDC,
+        .dst = Reg::R6,
+        .payload = 0,
+        .format = InstFormat::CONST_POOL},
+       {.opcode = Opcode::LDC,
+        .dst = Reg::R7,
+        .payload = 1,
+        .format = InstFormat::CONST_POOL},
+       {.opcode = Opcode::STORE64,
+        .dst = Reg::SA,
+        .src1 = Reg::R6,
+        .payload = 0,
+        .format = InstFormat::MEM_DST},
+       {.opcode = Opcode::STORE64,
+        .dst = Reg::SA,
+        .src1 = Reg::R7,
+        .payload = 8,
+        .format = InstFormat::MEM_DST},
+       {.opcode = Opcode::HOSTCALL,
+        .payload = packHostCallPayload(0, 8),
+        .format = InstFormat::CALL},
+       ret()},
+      {7, 8}, 6, 16);
   std::vector<const void *> FunctionTable = {
       reinterpret_cast<const void *>(&testHostTarget)};
   std::uint64_t Result = 0;
-  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, Stack, sizeof(Stack),
+  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, 16,
              FunctionTable) == 0);
   assert(Result == 1 + 4 + 9 + 16 + 25 + 36 + 49 + 64);
 
-  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, Stack, sizeof(Stack)) ==
+  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, 16) ==
          static_cast<std::uint32_t>(VmpTrap::InvalidHostCall));
   std::vector<const void *> NullFunctionTable = {nullptr};
-  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, Stack, sizeof(Stack),
+  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, 16,
              NullFunctionTable) ==
          static_cast<std::uint32_t>(VmpTrap::InvalidHostCall));
-  assert(
-      run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, Stack, 8, FunctionTable) ==
-      static_cast<std::uint32_t>(VmpTrap::StackOutOfRange));
+  // 溢出参数区大小（argc=8 → 16 字节）超过 StackSize=8。
+  assert(run(HostProgram, {1, 2, 3, 4, 5, 6}, Result, 8, FunctionTable) ==
+         static_cast<std::uint32_t>(VmpTrap::StackOutOfRange));
 
-  Program FifteenProgram = makeImage(
-      {{.opcode = Opcode::HOSTCALL,
-        .payload = packHostCallPayload(0, 15),
-        .format = InstFormat::CALL},
-       ret()},
-      {}, 6, 80);
-  alignas(16) std::uint8_t FifteenStack[80]{};
-  auto *FifteenStackArguments =
-      reinterpret_cast<std::uint64_t *>(FifteenStack);
-  for (std::uint64_t I = 0; I != 9; ++I)
-    FifteenStackArguments[I] = I + 7;
+  // 15 参：栈参数 7..15（9 个）由 VM STORE 进溢出区。
+  // 栈参数 7..15（9 个）：LDC 装入 R6 后逐个 STORE 进溢出区。
+  std::vector<Instruction> FifteenCode;
+  std::vector<std::uint64_t> FifteenValues;
+  for (std::uint64_t I = 0; I != 9; ++I) {
+    FifteenValues.push_back(I + 7);
+    FifteenCode.push_back({.opcode = Opcode::LDC,
+                           .dst = Reg::R6,
+                           .payload = static_cast<std::uint32_t>(I),
+                           .format = InstFormat::CONST_POOL});
+    FifteenCode.push_back({.opcode = Opcode::STORE64,
+                           .dst = Reg::SA,
+                           .src1 = Reg::R6,
+                           .payload = static_cast<std::uint32_t>(I * 8),
+                           .format = InstFormat::MEM_DST});
+  }
+  FifteenCode.push_back({.opcode = Opcode::HOSTCALL,
+                         .payload = packHostCallPayload(0, 15),
+                         .format = InstFormat::CALL});
+  FifteenCode.push_back(ret());
+  Program FifteenProgram = makeImage(FifteenCode, FifteenValues, 6, 80);
   std::vector<const void *> FifteenFunctionTable = {
       reinterpret_cast<const void *>(&testHostTargetFifteen)};
-  assert(run(FifteenProgram, {1, 2, 3, 4, 5, 6}, Result, FifteenStack,
-             sizeof(FifteenStack), FifteenFunctionTable) == 0);
+  assert(run(FifteenProgram, {1, 2, 3, 4, 5, 6}, Result, 80,
+             FifteenFunctionTable) == 0);
   assert(Result == 1240);
 
   Program TooManyArguments = makeImage(
@@ -379,8 +403,8 @@ void testHostCall() {
         .format = InstFormat::CALL},
        ret()},
       {}, 6, 80);
-  assert(run(TooManyArguments, {1, 2, 3, 4, 5, 6}, Result, FifteenStack,
-             sizeof(FifteenStack), FifteenFunctionTable) ==
+  assert(run(TooManyArguments, {1, 2, 3, 4, 5, 6}, Result, 80,
+             FifteenFunctionTable) ==
          static_cast<std::uint32_t>(VmpTrap::InvalidFormat));
 }
 
@@ -402,7 +426,7 @@ void testTraps() {
   std::uint64_t Arguments[] = {7, 1};
   assert(__vllvm_vmp_execute_checked(
              Image.Code.data(), Image.Code.size() * sizeof(std::uint64_t) - 1,
-             nullptr, nullptr, 0, Arguments, 2, nullptr, 0,
+             nullptr, nullptr, 0, Arguments, 2, 0,
              &Result) == static_cast<std::uint32_t>(VmpTrap::InvalidFormat));
 
   std::vector<Instruction> SignedOverflow = {
@@ -460,14 +484,14 @@ void testTraps() {
                       .format = InstFormat::MEM_SRC},
                      ret()},
                     {}, 0, 16);
-  alignas(16) std::uint8_t Stack[16]{};
-  assert(run(Image, {}, Result, Stack, sizeof(Stack)) ==
+  // 越界检查由解释器在自分配帧上执行：偏移 9+8 超出 16 字节帧。
+  assert(run(Image, {}, Result, 16) ==
          static_cast<std::uint32_t>(VmpTrap::StackOutOfRange));
-  assert(run(Image, {}, Result, Stack, 8) ==
+  assert(run(Image, {}, Result, 8) ==
          static_cast<std::uint32_t>(VmpTrap::StackOutOfRange));
   assert(__vllvm_vmp_execute_checked(
              Image.Code.data(), Image.Code.size() * sizeof(std::uint64_t),
-             nullptr, nullptr, 0, nullptr, 0, Stack, kMaxFrameSize + 1,
+             nullptr, nullptr, 0, nullptr, 0, kMaxFrameSize + 1,
              &Result) == static_cast<std::uint32_t>(VmpTrap::StackOverflow));
 
   Image = makeImage({{.opcode = Opcode::FADD32}, ret()}, {}, 0);
@@ -486,7 +510,7 @@ void testTraps() {
   Image = makeImage({ret()}, {}, 0);
   assert(__vllvm_vmp_execute_checked(
              Image.Code.data(), Image.Code.size() * sizeof(std::uint64_t),
-             nullptr, nullptr, 1, nullptr, 0, nullptr, 0,
+             nullptr, nullptr, 1, nullptr, 0, 0,
              &Result) == static_cast<std::uint32_t>(VmpTrap::InvalidFormat));
 
   Image = makeImage(

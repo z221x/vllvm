@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <utility>
 
@@ -395,13 +396,20 @@ void dispatch(VMContext &Context, const Instruction &Inst) noexcept {
   }
 }
 
+// VM 栈生命周期与一次执行绑定：入口 malloc、RET/trap/校验失败统一 free。
+// malloc/free 以 libc 符号进入位码，最终链接时由目标平台解析；AArch64
+// 三平台的 malloc 都保证 >= 16 字节对齐，满足 kFrameAlignment。
+struct StackGuard {
+  std::uint8_t *Ptr = nullptr;
+  ~StackGuard() { std::free(Ptr); }
+};
+
 [[nodiscard]] VmpTrap
 executeChecked(const std::uint64_t *Code, std::uint32_t CodeSize,
                const void *const *FunctionTable,
                const std::uint64_t *ValueTable, std::uint32_t ValueCount,
                std::uint64_t *Arguments, std::uint32_t ArgumentCount,
-               std::uint8_t *Stack, std::uint32_t StackSize,
-               std::uint64_t &Result) noexcept {
+               std::uint32_t StackSize, std::uint64_t &Result) noexcept {
   static_assert(sizeof(std::uintptr_t) == sizeof(std::uint64_t),
                 "M3 解释器只支持 64 位宿主指针");
 
@@ -411,11 +419,16 @@ executeChecked(const std::uint64_t *Code, std::uint32_t CodeSize,
       (ArgumentCount != 0 && Arguments == nullptr) ||
       (ValueCount != 0 && ValueTable == nullptr))
     return VmpTrap::InvalidFormat;
-  if (StackSize > kMaxFrameSize || (StackSize != 0 && Stack == nullptr))
+  if (StackSize > kMaxFrameSize)
     return VmpTrap::StackOverflow;
-  if (Stack != nullptr &&
-      (reinterpret_cast<std::uintptr_t>(Stack) % kFrameAlignment) != 0)
-    return VmpTrap::StackOutOfRange;
+
+  StackGuard Guard;
+  if (StackSize != 0) {
+    Guard.Ptr = static_cast<std::uint8_t *>(std::malloc(StackSize));
+    if (Guard.Ptr == nullptr)
+      return VmpTrap::StackOverflow;
+  }
+  std::uint8_t *const Stack = Guard.Ptr;
 
   VMContext Context;
   Context.program.code = reinterpret_cast<const std::uint8_t *>(Code);
@@ -464,10 +477,10 @@ __vllvm_vmp_execute(const std::uint64_t *Code, std::uint32_t CodeSize,
                     const void *const *FunctionTable,
                     const std::uint64_t *ValueTable, std::uint32_t ValueCount,
                     std::uint64_t *Arguments, std::uint32_t ArgumentCount,
-                    std::uint8_t *Stack, std::uint32_t StackSize) noexcept {
+                    std::uint32_t StackSize) noexcept {
   std::uint64_t Result = 0;
   if (executeChecked(Code, CodeSize, FunctionTable, ValueTable, ValueCount,
-                     Arguments, ArgumentCount, Stack, StackSize,
+                     Arguments, ArgumentCount, StackSize,
                      Result) != VmpTrap::None)
     __builtin_trap();
   return Result;
@@ -621,13 +634,13 @@ extern "C" std::uint32_t __vllvm_vmp_execute_checked(
     const std::uint64_t *Code, std::uint32_t CodeSize,
     const void *const *FunctionTable, const std::uint64_t *ValueTable,
     std::uint32_t ValueCount, std::uint64_t *Arguments,
-    std::uint32_t ArgumentCount, std::uint8_t *Stack, std::uint32_t StackSize,
+    std::uint32_t ArgumentCount, std::uint32_t StackSize,
     std::uint64_t *Result) noexcept {
   if (Result == nullptr)
     return static_cast<std::uint32_t>(VmpTrap::InvalidFormat);
   return static_cast<std::uint32_t>(
       executeChecked(Code, CodeSize, FunctionTable, ValueTable, ValueCount,
-                     Arguments, ArgumentCount, Stack, StackSize, *Result));
+                     Arguments, ArgumentCount, StackSize, *Result));
 }
 #endif
 

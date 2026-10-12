@@ -9,11 +9,13 @@ namespace vllvm::vm {
 // codeSize 使用字节数，Code 直接指向第一条 64 位 VM 指令。正常返回 R0；任何
 // Trap 都在解释器内部终止，不把错误码暴露到宿主包装函数。
 extern "C" std::uint64_t
+// VM 栈由解释器按 StackSize 自行动态分配/释放（16 字节对齐，来自 libc
+// malloc/free，最终链接时解析）；调用方不再传入栈缓冲。
 __vllvm_vmp_execute(const std::uint64_t *Code, std::uint32_t CodeSize,
                     const void *const *FunctionTable,
                     const std::uint64_t *ValueTable, std::uint32_t ValueCount,
                     std::uint64_t *Arguments, std::uint32_t ArgumentCount,
-                    std::uint8_t *Stack, std::uint32_t StackSize) noexcept;
+                    std::uint32_t StackSize) noexcept;
 
 #if defined(VLLVM_VMP_TESTING)
 // 单元测试使用同一执行核心观察 Trap；该符号不会编进嵌入运行时 bitcode。
@@ -21,7 +23,7 @@ extern "C" std::uint32_t __vllvm_vmp_execute_checked(
     const std::uint64_t *Code, std::uint32_t CodeSize,
     const void *const *FunctionTable, const std::uint64_t *ValueTable,
     std::uint32_t ValueCount, std::uint64_t *Arguments,
-    std::uint32_t ArgumentCount, std::uint8_t *Stack, std::uint32_t StackSize,
+    std::uint32_t ArgumentCount, std::uint32_t StackSize,
     std::uint64_t *Result) noexcept;
 #endif
 

@@ -52,7 +52,7 @@ for opt in 0 2; do
     exit 1
   fi
   grep -q 'call i64 @__vllvm_vmp_execute' "$OUT_DIR/vmp_O$opt.ll"
-  grep -q 'define.*i64 @__vllvm_vmp_execute(ptr.*i32.*ptr.*ptr.*i32.*ptr.*i32.*ptr.*i32' \
+  grep -q 'define.*i64 @__vllvm_vmp_execute(ptr.*i32.*ptr.*ptr.*i32.*ptr.*i32.*i32' \
     "$OUT_DIR/vmp_O$opt.ll"
   grep -q 'vllvm.vmp.processed' "$OUT_DIR/vmp_O$opt.ll"
   grep -q '@llvm.compiler.used' "$OUT_DIR/vmp_O$opt.ll"

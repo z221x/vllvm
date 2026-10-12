@@ -694,11 +694,8 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
     Builder.CreateStore(packVmScalar(Builder, &Arg), Slot);
   }
 
-  const unsigned StackBytes = std::max<std::uint32_t>(1, Compiled.FrameSize);
-  ArrayType *StackTy = ArrayType::get(Builder.getInt8Ty(), StackBytes);
-  AllocaInst *Stack = Builder.CreateAlloca(StackTy);
-  Stack->setAlignment(Align(kFrameAlignment));
-
+  // VM 栈由解释器按 FrameSize 自行 malloc/free，包装器不再在宿主栈上
+  // 分配帧缓冲（递归时不再逐层占用宿主栈）。
   Value *NullPointer = ConstantPointerNull::get(Builder.getPtrTy());
   Value *RawResult = Builder.CreateCall(
       Execute,
@@ -712,7 +709,6 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
        Builder.getInt32(Compiled.Constants.size()),
        Builder.CreatePointerCast(ArgumentArray, Builder.getPtrTy()),
        Builder.getInt32(F.arg_size()),
-       Builder.CreatePointerCast(Stack, Builder.getPtrTy()),
        Builder.getInt32(Compiled.FrameSize)});
 
   if (F.getReturnType()->isVoidTy()) {

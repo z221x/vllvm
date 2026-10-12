@@ -404,14 +404,16 @@ ValueTable 条目统一为 64 位原始位模式。M3 只生成整数和空指�
 
 ### 9.1 VM 栈
 
-每个 `VMContext` 使用包装函数在宿主栈分配的独立连续区域。进入解释器时：
+每个 `VMContext` 的 VM 栈由解释器在入口按 `StackSize`（即 frameSize）
+自行 `malloc` 分配、`RET`/trap/校验失败时统一 `free`；包装函数不再传入栈
+缓冲（递归重入时 VM 帧不再逐层占用宿主栈）。进入解释器时：
 
 ```text
-stackSize = frameSize
+stack = malloc(align(frameSize))   // AArch64 malloc >= 16 字节对齐
 SA = address(stack)
 ```
 
-这里冻结当前语义：`SA` 保存包装函数所分配 VM 栈区域内的宿主地址，而不是抽象
+这里冻结当前语义：`SA` 保存解释器自分配 VM 栈区域的宿主地址，而不是抽象
 FrameIndex 或整数槽编号。Direct CodeGen 在编译期间直接计算确定性栈槽偏移，
 生成最终字节码前将所有内部栈访问固定为 `SA + signedPayload`。
 
@@ -504,13 +506,12 @@ M3 Direct CodeGen 在每条前驱边上生成复制。它先把该边所有 inco
 define i64 @foo(i64 %a, i64 %b) {
 entry:
   %argv = alloca [2 x i64], align 8
-  %stack = alloca [frameSize x i8], align 16
   %result = call i64 @__vllvm_vmp_execute(
       ptr @__vllvm_vmp_code.foo, i32 codeSize,
       ptr null,
       ptr @__vllvm_vmp_values.foo, i32 valueCount,
       ptr %argv, i32 2,
-      ptr %stack, i32 frameSize)
+      i32 frameSize)             ; VM 栈由解释器 malloc/free
   ret i64 %result
 }
 ```
