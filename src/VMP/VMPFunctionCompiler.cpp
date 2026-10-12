@@ -12,6 +12,7 @@
 #include "llvm/Transforms/VLLVM/VmpCommon.h"
 
 #include <algorithm>
+#include <map>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -57,7 +58,11 @@ private:
   const DataLayout DL;
   DenseMap<const Value *, std::uint32_t> ValueSlots;
   DenseMap<const AllocaInst *, std::uint32_t> StackObjects;
-  DenseMap<std::uint64_t, std::uint32_t> ConstantIndices;
+  // 常量去重不能用 DenseMap<uint64_t>：其空桶哨兵是 ~0ULL（= -1）、
+  // 墓碑是 ~0ULL-1（= -2），与合法常量 -1/-2 撞键——try_emplace(-1)
+  // 会命中空桶误报已存在并返回垃圾下标（fib 递归实参变 n+2 即由此来）。
+  // std::map 无带外哨兵，常量数很小，复杂度无影响。
+  std::map<std::uint64_t, std::uint32_t> ConstantIndices;
   DenseMap<const BasicBlock *, std::uint32_t> BlockPcs;
   SmallVector<BranchFixup, 32> Branches;
   SmallVector<VmInstruction, 128> Code;

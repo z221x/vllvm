@@ -5,21 +5,24 @@
 数据见该报告）。按严重度排序，每条附复现方式
 与建议修复方向。复现统一使用 `build/llvm-macos/bin/clang`（下称 `$CLANG`）。
 
-## V-1 递归函数虚拟化后崩溃（SIGSEGV）
+## V-1 递归函数虚拟化后崩溃（SIGSEGV）——已修复
 
-- 严重度：高（正确性）；状态：**未修复**
-- 现象：`fib_recursive` 通过准入并生成字节码（`__vllvm_vmp_code.fib_recursive`
-  存在），运行即 SIGSEGV。
-- 根因推断：虚拟化函数对自身的递归调用经 hostcall 桥回接，桥接路径未
-  覆盖自递归场景（未验证深度相关性与具体出错指令）。
-- 复现：
-  ```bash
-  $CLANG -O2 -DALGO=1 -DRUNS=1 -DALGOS_VMP \
-    test/perf/workloads/vmp_algos.c test/perf/workloads/vmp_algo_driver.c -o fib
-  ./fib   # -> rc=139
-  ```
-- 建议：准入阶段显式拒绝含自递归/递归调用环的函数（保守），或修复
-  hostcall 桥的自递归回接；修前先在 pass 内检测并告警。
+- 严重度：高（正确性）；状态：**已修复**（2026-10-12）
+- 真实根因（非 hostcall 桥、非栈保护页）：**`DenseMap<uint64_t>` 的空桶
+  哨兵 = `~0ULL`（-1）、墓碑 = `~0ULL-1`（-2）**。`VMPFunctionCompiler`
+  的 `ConstantIndices` 用它做常量去重，`addConstant(-1)` 探测空桶时
+  哨兵值恰好等于查找键 → try_emplace 误报“已存在”返回垃圾下标 0，
+  **-1 永远进不了常量表**。`fib(n-1)` 的字节码 LDC 遂取 values[0]=2，
+  实参变成 n+2 → 递归无限加深 → 8MB 栈耗尽（崩溃地址在栈 rlimit 底部
+  之下，code=2）。此前的“解释器序言越保护页”理论不成立——栈一直在
+  正常生长，是无限递归把它打穿。
+- 修复：`ConstantIndices` 改用 `std::map`（无带外哨兵；常量数小，复杂度
+  无影响），附注释说明哨兵撞键陷阱。
+- 验证：手写同形 IR 复现常量表 `[2,-2]`（-1 丢失）→ 修复后 `[2,-1,-2]`；
+  `fib(10)=55` 正确；VMP 全回归 6 项通过。
+- 附带：同轮已把解释器改为自分配 VM 栈（execute 不再收 Stack 指针，
+  递归时 VM 帧不占宿主栈）。递归仍受宿主栈 rlimit 约束（每层 ≈ 0x2D0
+  字节），超深递归会正常 SIGSEGV——与原生语义一致，非缺陷。
 
 ## V-2 位运算 CRC 组合形态触发 VM 断言（SIGTRAP）
 
