@@ -36,8 +36,10 @@ mkdir -p "$OUT_DIR"
 
 # lvars 标注现在别名到 vmfla：参数（局部变量）结构化只能捆绑在 vmfla 中
 # 执行，不再提供独立的结构化 pass。本脚本验证别名语义与捆绑产物。
+# 局部变量结构化由 vmfla level 3 开启（1=bb2func+merge+平坦化，2=+BCF）。
+LVARS_CONFIG=(-mllvm -vllvm-config=vmfla=2)
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
-  -emit-llvm -DVLLVM_TEST_LVARS=1 "$SRC" \
+  -emit-llvm ${LVARS_CONFIG[@]+"${LVARS_CONFIG[@]}"} -DVLLVM_TEST_LVARS=1 "$SRC" \
   -o "$OUT_DIR/test_lvars.ll"
 
 # 结构化由 vmfla 内部计划承担：只允许一张 vmfla 常量表，独立
@@ -84,7 +86,7 @@ grep -Eq 'getelementptr .i8, ptr @vllvm\.[A-Za-z0-9_.]+, i64' \
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-  -DVLLVM_TEST_LVARS=1 "$SRC" \
+  ${LVARS_CONFIG[@]+"${LVARS_CONFIG[@]}"} -DVLLVM_TEST_LVARS=1 "$SRC" \
   -o "$OUT_DIR/test_lvars"
 strip_binary "$OUT_DIR/test_lvars_base"
 strip_binary "$OUT_DIR/test_lvars"

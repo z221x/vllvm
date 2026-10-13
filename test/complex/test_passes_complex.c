@@ -3,14 +3,14 @@ typedef int (*local_op_t)(int, int);
 
 #if defined(VLLVM_TEST_ENSTR)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:enstr")))
-#elif defined(VLLVM_TEST_FLA)
-#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:fla")))
 #elif defined(VLLVM_TEST_ICALL)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:icall")))
 #elif defined(VLLVM_TEST_IBR)
 #define VLLVM_TEST_OBF __attribute__((annotate("vllvm:ibr")))
+#elif defined(VLLVM_TEST_BCF)
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:bcf")))
 #elif defined(VLLVM_TEST_VMFLA)
-#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:bcf,vmfla")))
+#define VLLVM_TEST_OBF __attribute__((annotate("vllvm:vmfla")))
 #else
 #define VLLVM_TEST_OBF
 #endif

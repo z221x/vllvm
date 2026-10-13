@@ -5,15 +5,12 @@
 using namespace llvm;
 class VMFlattenFuncPass : public PassInfoMixin<VMFlattenFuncPass> {
 public:
-  explicit VMFlattenFuncPass(bool RunBogusControlFlow = false)
-      : RunBogusControlFlow(RunBogusControlFlow) {}
-
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
   static bool isRequired() { return true; }
 
 private:
-  bool runVMFlattenFunc(Function &F, FunctionAnalysisManager &FAM);
-  bool RunBogusControlFlow = false;
+  bool runVMFlattenFunc(Function &F, FunctionAnalysisManager &FAM,
+                        unsigned Level);
 };
 
 // 把每函数常量表（fla 路由表等）改为参数传递：函数体搬到带表参数的

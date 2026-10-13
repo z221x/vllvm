@@ -1,28 +1,35 @@
 #include "BogusControlFlowPass.h"
-#include "Utils.h"
 
+#include "CryptoUtils.h"
 #include "config/VLLVMConfig.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/Module.h"
 
-#include <algorithm>
 #include <cstdint>
-#include <utility>
 
 using namespace llvm;
 
 namespace {
-// 独立 BCF 也使用随机覆盖率，避免每个函数都生成同构 fake 分支。
-constexpr unsigned BogusMinProbability = 55;
-constexpr unsigned BogusProbabilityRange = 36;
+
+// pass 自产虚假块的块名前缀，也是判别生成块的依据。
+constexpr llvm::StringRef BogusBlockPrefix = "vllvm.bcf.fake.";
+
+// 等级 1/2 对单后继分支的随机改写覆盖率；等级 3 全量改写。
+constexpr unsigned Level1Probability = 60;
+constexpr unsigned Level2Probability = 85;
+
+// seed 的已知运行时值：运算统一用 uint16（i16 回绕），x + (x ^ -1)
+// 在 i16 上恒等于 0xFFFF。选用 add 形态：SelectionDAG 会对 xor/or 形态
+// 做 known-bits 折叠，add 带进位不会被折，Hex-Rays 类反编译器同样不做
+// 该代数化简。
+constexpr uint32_t KnownSeedValue = 0xFFFFu;
 
 bool isGeneratedBlock(BasicBlock &BB) {
-  return BB.hasName() && BB.getName().starts_with("vllvm.bcf.");
+  return BB.hasName() && BB.getName().starts_with(BogusBlockPrefix);
 }
 
 bool hasMustTailReturn(BasicBlock &BB) {
@@ -35,274 +42,253 @@ bool hasMustTailReturn(BasicBlock &BB) {
   return CB && CB->isMustTailCall();
 }
 
-bool canSplitForBogusFlow(BasicBlock &BB) {
-  Instruction *Term = BB.getTerminator();
-  if (!Term || isGeneratedBlock(BB) || BB.isEHPad() || hasMustTailReturn(BB))
+// 可作为虚假后继的块：入口块不允许有前驱；EH pad 块只能被异常边进入；
+// musttail 尾块依赖调用点契约。真实块与虚假块都在候选池内。
+bool canBogusBranchTo(BasicBlock &BB) {
+  return &BB != &BB.getParent()->getEntryBlock() && !BB.isEHPad() &&
+         !hasMustTailReturn(BB);
+}
+
+// 新前驱进入带 PHI 的目标块时补 undef incoming；假边永不执行，取值
+// 不影响语义。
+void addEdgeFixPhi(BasicBlock *From, BasicBlock *To) {
+  for (PHINode &PN : To->phis())
+    if (PN.getBasicBlockIndex(From) < 0)
+      PN.addIncoming(UndefValue::get(PN.getType()), From);
+}
+
+// seed 变量压入栈：值不能是明文常量，否则反编译器能顺着栈槽把密文链
+// 折叠掉、永假谓词直接消失。这里以槽位自身地址（栈帧位置，静态不可知）
+// 为不透明源，经恒等式 add(x, xor(x,-1)) 归一成已知值 -1 后 volatile
+// 写入：运行时恒为 KnownSeedValue，编译期与反编译期均不可求解。
+AllocaInst *createSeedSlot(Function &F, SmallVectorImpl<Instruction *> &Chain) {
+  BasicBlock *Entry = &F.getEntryBlock();
+  IRBuilder<> IRB(Entry->getTerminator());
+  Type *I16Ty = Type::getInt16Ty(F.getContext());
+
+  AllocaInst *Slot = IRB.CreateAlloca(I16Ty, 0, "vllvm.bcf.seed");
+  Value *Addr = IRB.CreatePtrToInt(Slot, Type::getInt64Ty(F.getContext()),
+                                   "vllvm.bcf.seed.addr");
+  Value *X = IRB.CreateTrunc(Addr, I16Ty, "vllvm.bcf.seed.x");
+  Value *NotX = IRB.CreateXor(X, ConstantInt::get(I16Ty, -1),
+                              "vllvm.bcf.seed.not");
+  Value *Norm = IRB.CreateAdd(X, NotX, "vllvm.bcf.seed.norm");
+  StoreInst *Store = IRB.CreateStore(Norm, Slot, "vllvm.bcf.seed.init");
+  Store->setVolatile(true);
+
+  for (Value *V : {cast<Value>(Slot), Addr, X, NotX, Norm, cast<Value>(Store)})
+    Chain.push_back(cast<Instruction>(V));
+  return Slot;
+}
+
+LoadInst *loadSeedVolatile(IRBuilder<> &IRB, AllocaInst *SeedSlot) {
+  LoadInst *Load = IRB.CreateLoad(Type::getInt16Ty(IRB.getContext()), SeedSlot,
+                                  "vllvm.bcf.seed.load");
+  Load->setVolatile(true);
+  return Load;
+}
+
+// 随机算法运算加密：对 seed 施加随机 add/sub/xor/mul 链。指令与镜像
+// 计算同步进行，加密后的值在编译期已知（Expected）。
+// 全部运算在 uint16（i16 回绕）上进行；镜像计算同步掩码，加密后的值
+// 在编译期已知。
+Value *buildEncryptionChain(IRBuilder<> &IRB, Value *Seed, uint32_t SeedValue,
+                            CryptoUtils &Crypto, uint32_t &Encrypted) {
+  Type *I16Ty = Type::getInt16Ty(IRB.getContext());
+  uint32_t Expected = SeedValue & 0xFFFF;
+  Value *V = Seed;
+
+  unsigned Rounds = 3 + Crypto.getRandom32() % 4;
+  for (unsigned I = 0; I < Rounds; ++I) {
+    uint32_t K = Crypto.getRandom32() & 0xFFFF;
+    switch (Crypto.getRandom32() % 4) {
+    case 0:
+      V = IRB.CreateAdd(V, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.add");
+      Expected = (Expected + K) & 0xFFFF;
+      break;
+    case 1:
+      V = IRB.CreateSub(V, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.sub");
+      Expected = (Expected - K) & 0xFFFF;
+      break;
+    case 2:
+      V = IRB.CreateXor(V, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.xor");
+      Expected ^= K;
+      break;
+    default:
+      V = IRB.CreateMul(V, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.mul");
+      Expected = (Expected * K) & 0xFFFF;
+      break;
+    }
+  }
+
+  Encrypted = Expected;
+  return V;
+}
+
+// 生成随机指令的虚假块：volatile 读 seed、随机运算链、volatile 写回。
+// 不设终结指令，由调用方把虚假块链接成链并锚定到永假分支后继上，
+// 否则不可达块不会进入后端发射，反编译时直接消失。
+BasicBlock *createJunkBlockBody(Function &F, AllocaInst *SeedSlot,
+                                CryptoUtils &Crypto, unsigned Index) {
+  BasicBlock *BB = BasicBlock::Create(
+      F.getContext(), (BogusBlockPrefix + Twine(Index)).str(), &F);
+  IRBuilder<> IRB(BB);
+
+  Value *V = loadSeedVolatile(IRB, SeedSlot);
+  uint32_t Discarded;
+  V = buildEncryptionChain(IRB, V, KnownSeedValue, Crypto, Discarded);
+  StoreInst *Store = IRB.CreateStore(V, SeedSlot, "vllvm.bcf.junk.store");
+  Store->setVolatile(true);
+  return BB;
+}
+
+void eraseSeedChain(MutableArrayRef<Instruction *> Chain) {
+  for (Instruction *I : llvm::reverse(Chain))
+    I->eraseFromParent();
+}
+
+bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
+  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
+    return false;
+  // seed 初始化要插在入口终结指令前，musttail 尾块不允许插任何指令。
+  if (hasMustTailReturn(F.getEntryBlock()))
     return false;
 
-  // C++ EH 函数可以做 BCF，但 landingpad/resume/catchret 等 EH 专用块
-  // 不能被 fake 分支包裹；invoke 本身允许保留在 split 后的 tail 块里。
-  if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term) ||
-      isa<CatchSwitchInst>(Term) || isa<CatchReturnInst>(Term) ||
-      isa<CleanupReturnInst>(Term) || isa<ResumeInst>(Term))
+  // 获取程序所有单后继分支（无条件 br）。
+  SmallVector<BranchInst *, 32> Branches;
+  for (BasicBlock &BB : F)
+    if (auto *Br = dyn_cast<BranchInst>(BB.getTerminator()))
+      if (!Br->isConditional() && !isGeneratedBlock(BB))
+        Branches.push_back(Br);
+  if (Branches.empty())
     return false;
+
+  // 按等级选择改写点（随机覆盖率），至少命中一个。
+  unsigned Probability = Level >= 3 ? 100 : (Level == 2 ? Level2Probability
+                                                        : Level1Probability);
+  SmallVector<BranchInst *, 32> Sites;
+  for (BranchInst *Br : Branches)
+    if (Crypto.getRandom32() % 100 < Probability)
+      Sites.push_back(Br);
+  if (Sites.empty())
+    Sites.push_back(Branches[Crypto.getRandom32() % Branches.size()]);
+
+  SmallVector<Instruction *, 8> SeedChain;
+  SmallVector<BasicBlock *, 8> Junks;
+  auto Cleanup = [&]() {
+    for (BasicBlock *BB : Junks)
+      BB->eraseFromParent();
+    eraseSeedChain(SeedChain);
+  };
+
+  AllocaInst *SeedSlot = createSeedSlot(F, SeedChain);
+
+  // 生成随机指令的虚假块。
+  unsigned JunkCount = 2 + Crypto.getRandom32() % 2 + (Level - 1);
+  for (unsigned I = 0; I < JunkCount; ++I)
+    Junks.push_back(createJunkBlockBody(F, SeedSlot, Crypto, I));
+
+  // 获取程序所有块（真实块 + 虚假块）作为虚假后继候选池。
+  SmallVector<BasicBlock *, 64> Pool;
+  for (BasicBlock &BB : F)
+    if (canBogusBranchTo(BB))
+      Pool.push_back(&BB);
+  if (Pool.empty()) {
+    Cleanup();
+    return false;
+  }
+
+  // 虚假块链接成链：链尾优先接回随机真实块（进入真实流的“活”路径），
+  // 没有可用真实块时闭环回链头。
+  BasicBlock *JunkHead = Junks[0];
+  BasicBlock *TailTarget = JunkHead;
+  for (BasicBlock *Candidate : Pool)
+    if (!isGeneratedBlock(*Candidate)) {
+      TailTarget = Candidate;
+      break;
+    }
+  for (unsigned I = 0; I < Junks.size(); ++I) {
+    BasicBlock *Next =
+        I + 1 < Junks.size() ? Junks[I + 1] : TailTarget;
+    IRBuilder<> IRB(Junks[I]);
+    IRB.CreateBr(Next);
+  }
+  if (TailTarget != JunkHead)
+    addEdgeFixPhi(Junks.back(), TailTarget);
+
+  struct Rewrite {
+    BranchInst *Br;
+    BasicBlock *Target;
+  };
+  SmallVector<Rewrite, 32> Rewrites;
+  for (BranchInst *Br : Sites) {
+    BasicBlock *SourceBB = Br->getParent();
+    BasicBlock *RealSucc = Br->getSuccessor(0);
+    // 虚假后继从候选池随机选择（包括真实块与虚假块），跳过自身与
+    // 真实后继（重复边不会增加混淆，还会制造重复 PHI incoming）。
+    SmallVector<BasicBlock *, 64> Choices;
+    for (BasicBlock *Candidate : Pool)
+      if (Candidate != SourceBB && Candidate != RealSucc)
+        Choices.push_back(Candidate);
+    if (Choices.empty())
+      continue;
+    Rewrites.push_back({Br, Choices[Crypto.getRandom32() % Choices.size()]});
+  }
+  if (Rewrites.empty()) {
+    Cleanup();
+    return false;
+  }
+
+  // 锚定：随机选择可能一条虚假块边都抽不到，而未被引用的虚假块不会
+  // 进入后端发射。强制把一条永假边的后继指到虚假块链头。
+  if (none_of(Rewrites, [](const Rewrite &R) {
+        return isGeneratedBlock(*R.Target);
+      }))
+    Rewrites[Crypto.getRandom32() % Rewrites.size()].Target = JunkHead;
+
+  for (const Rewrite &R : Rewrites) {
+    BasicBlock *SourceBB = R.Br->getParent();
+    BasicBlock *RealSucc = R.Br->getSuccessor(0);
+
+    // 单后继分支创建虚假分支：加密值链在分支前计算，比较值是
+    // 不等于加密值的随机数，条件 icmp eq 永不为真——真边走真实
+    // 后继，假边随机落进任意块。
+    IRBuilder<> IRB(R.Br);
+    Value *SeedValue = loadSeedVolatile(IRB, SeedSlot);
+    uint32_t Encrypted;
+    Value *EncryptedV = buildEncryptionChain(
+        IRB, SeedValue, KnownSeedValue, Crypto, Encrypted);
+    uint32_t Compare;
+    do {
+      Compare = Crypto.getRandom32() & 0xFFFF;
+    } while (Compare == Encrypted);
+    Value *Predicate = IRB.CreateICmpEQ(
+        EncryptedV,
+        ConstantInt::get(Type::getInt16Ty(F.getContext()), Compare),
+        "vllvm.bcf.cmp");
+    IRB.CreateCondBr(Predicate, R.Target, RealSucc);
+    R.Br->eraseFromParent();
+
+    addEdgeFixPhi(SourceBB, R.Target);
+  }
 
   return true;
 }
 
-GlobalVariable *createPredicateGlobal(Function &F, StringRef Suffix,
-                                      uint32_t Value) {
-  Module *M = F.getParent();
-  LLVMContext &Ctx = F.getContext();
-  auto *I32Ty = Type::getInt32Ty(Ctx);
-  auto *GV = new GlobalVariable(
-      *M, I32Ty, false, GlobalValue::PrivateLinkage,
-      ConstantInt::get(I32Ty, Value),
-      (Twine("vllvm.bcf.") + Suffix + "." + F.getName()).str());
-  GV->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
-  return GV;
-}
-
-LoadInst *createVolatileI32Load(IRBuilder<> &IRB, GlobalVariable *GV,
-                                Twine Name) {
-  auto *Load = IRB.CreateLoad(IRB.getInt32Ty(), GV, Name);
-  Load->setVolatile(true);
-  return Load;
-}
 } // namespace
 
 PreservedAnalyses BogusControlFlowPass::run(Function &F,
                                             FunctionAnalysisManager &FAM) {
-  // bcf 混淆等级（Pass 自定语义）：1=单轮随机覆盖；2=双轮；
-  // 3=三轮且全量覆盖候选块；0=关闭。
+  // bcf 混淆等级（Pass 自定语义）：1/2/3 对单后继分支的改写覆盖率
+  // 递增（60%/85%/全量），虚假块数量随之增加；0=关闭。
   llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
   Config.registerPassLevels("bcf", 1, 3);
   unsigned Level = Config.getLevel("bcf");
-
-  errs() << "[vllvm] BogusControlFlowPass:" << F.getName() << "\n";
   if (Level == 0)
     return PreservedAnalyses::all();
-  bool IsChanged = runBogusControlFlow(F, Level);
-  return IsChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
-}
 
-bool BogusControlFlowPass::runBogusControlFlow(Function &F, unsigned Level) {
-  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
-    return false;
-
+  errs() << "[vllvm] BogusControlFlowPass:" << F.getName() << "\n";
   CryptoUtils Crypto(F.getParent());
-  uint32_t XSeed = Crypto.getRandom32();
-  uint32_t YSeed = Crypto.getRandom32();
-  GlobalVariable *X = createPredicateGlobal(F, "x", XSeed);
-  GlobalVariable *Y = createPredicateGlobal(F, "y", YSeed);
-
-  unsigned Loops = std::min(Level, 3u);
-  bool Changed = false;
-  for (unsigned Loop = 0; Loop < Loops; ++Loop) {
-    SmallVector<BasicBlock *, 32> Candidates;
-    SmallVector<BasicBlock *, 32> Targets;
-    // 3 级全量覆盖候选块；低等级维持随机覆盖率。
-    unsigned Probability =
-        Level >= 3 ? 100
-                   : BogusMinProbability +
-                         (Crypto.getRandom32() % BogusProbabilityRange);
-    // 随机选择一部分可拆块，减少 CFG 中整齐重复的菱形结构。
-    for (BasicBlock &BB : F) {
-      if (!canSplitForBogusFlow(BB))
-        continue;
-      Candidates.push_back(&BB);
-      if (Crypto.getRandom32() % 100 < Probability)
-        Targets.push_back(&BB);
-    }
-    // 至少选择一个候选块，避免小函数显式启用 bcf 时没有变化。
-    if (Targets.empty() && !Candidates.empty())
-      Targets.push_back(Candidates[Crypto.getRandom32() % Candidates.size()]);
-
-    for (BasicBlock *BB : Targets)
-      if (BB->getParent() == &F)
-        Changed |= addBogusFlow(*BB, X, Y, XSeed, YSeed, Crypto);
-  }
-
-  if (Changed)
-    fixStackForFlatten(&F);
-  else {
-    X->eraseFromParent();
-    Y->eraseFromParent();
-  }
-  return Changed;
-}
-
-bool BogusControlFlowPass::addBogusFlow(BasicBlock &BB, GlobalVariable *X,
-                                        GlobalVariable *Y,
-                                        uint32_t XSeed, uint32_t YSeed,
-                                        CryptoUtils &Crypto) {
-  Instruction *Term = BB.getTerminator();
-  if (!Term || !canSplitForBogusFlow(BB))
-    return false;
-
-  Function *F = BB.getParent();
-  LLVMContext &Ctx = F->getContext();
-
-  BasicBlock *Tail = BB.splitBasicBlock(Term->getIterator(), "vllvm.bcf.tail");
-  BasicBlock *Fake =
-      BasicBlock::Create(Ctx, "vllvm.bcf.fake", F, Tail->getNextNode());
-
-  BB.getTerminator()->eraseFromParent();
-
-  IRBuilder<> RealIRB(&BB);
-  bool PredicateIsTrue = true;
-  Value *Predicate = createOpaquePredicate(RealIRB, X, Y, XSeed, YSeed, Crypto,
-                                           PredicateIsTrue);
-  BasicBlock *TrueBB = PredicateIsTrue ? Tail : Fake;
-  BasicBlock *FalseBB = PredicateIsTrue ? Fake : Tail;
-  RealIRB.CreateCondBr(Predicate, TrueBB, FalseBB);
-
-  terminateFakePath(Fake, Tail, X, Y, XSeed, YSeed, Crypto);
-  return true;
-}
-
-Value *BogusControlFlowPass::createOpaquePredicate(IRBuilder<> &IRB,
-                                                   GlobalVariable *X,
-                                                   GlobalVariable *Y,
-                                                   uint32_t XSeed,
-                                                   uint32_t YSeed,
-                                                   CryptoUtils &Crypto,
-                                                   bool &PredicateIsTrue) {
-  Value *XVal = createVolatileI32Load(IRB, X, "vllvm.bcf.x");
-  Value *YVal = createVolatileI32Load(IRB, Y, "vllvm.bcf.y");
-  Value *Expr = (Crypto.getRandom32() & 1) ? XVal : YVal;
-  uint32_t Expected = Expr == XVal ? XSeed : YSeed;
-
-  auto Other = [&](bool UseX) -> std::pair<Value *, uint32_t> {
-    return UseX ? std::make_pair(XVal, XSeed) : std::make_pair(YVal, YSeed);
-  };
-
-  unsigned Rounds = 4 + (Crypto.getRandom32() % 5);
-  for (unsigned I = 0; I < Rounds; ++I) {
-    uint32_t K = Crypto.getRandom32();
-    switch (Crypto.getRandom32() % 6) {
-    case 0:
-      Expr = IRB.CreateAdd(Expr, IRB.getInt32(K), "vllvm.bcf.mix.add");
-      Expected += K;
-      break;
-    case 1:
-      Expr = IRB.CreateSub(Expr, IRB.getInt32(K), "vllvm.bcf.mix.sub");
-      Expected -= K;
-      break;
-    case 2:
-      K |= 1U;
-      Expr = IRB.CreateMul(Expr, IRB.getInt32(K), "vllvm.bcf.mix.mul");
-      Expected *= K;
-      break;
-    case 3:
-      Expr = IRB.CreateXor(Expr, IRB.getInt32(K), "vllvm.bcf.mix.xor");
-      Expected ^= K;
-      break;
-    case 4: {
-      auto [OtherVal, OtherExpected] = Other(Crypto.getRandom32() & 1);
-      Expr = IRB.CreateAdd(Expr, OtherVal, "vllvm.bcf.mix.addv");
-      Expected += OtherExpected;
-      break;
-    }
-    default: {
-      auto [OtherVal, OtherExpected] = Other(Crypto.getRandom32() & 1);
-      Expr = IRB.CreateXor(Expr, OtherVal, "vllvm.bcf.mix.xorv");
-      Expected ^= OtherExpected;
-      break;
-    }
-    }
-  }
-
-  bool Negate = (Crypto.getRandom32() & 1) != 0;
-  PredicateIsTrue = !Negate;
-  Value *ExpectedValue = IRB.getInt32(Expected);
-  return Negate ? IRB.CreateICmpNE(Expr, ExpectedValue, "vllvm.bcf.pred")
-                : IRB.CreateICmpEQ(Expr, ExpectedValue, "vllvm.bcf.pred");
-}
-
-void BogusControlFlowPass::insertBogusJunk(IRBuilder<> &IRB, GlobalVariable *X,
-                                           GlobalVariable *Y,
-                                           CryptoUtils &Crypto) {
-  Value *A = createVolatileI32Load(IRB, X, "vllvm.bcf.fake.x");
-  Value *B = createVolatileI32Load(IRB, Y, "vllvm.bcf.fake.y");
-
-  Value *Junk = IRB.CreateXor(A, B, "vllvm.bcf.fake.mix");
-  Junk = IRB.CreateAdd(Junk, IRB.getInt32(Crypto.getRandom32()),
-                       "vllvm.bcf.fake.add");
-  Junk = IRB.CreateMul(Junk, IRB.getInt32((Crypto.getRandom32() | 1U)),
-                       "vllvm.bcf.fake.mul");
-
-  StoreInst *Store = IRB.CreateStore(Junk, X);
-  Store->setVolatile(true);
-}
-
-// fake 路径随机生成短链、分叉或自环，避免固定 fake -> tail 模板。
-void BogusControlFlowPass::terminateFakePath(BasicBlock *Fake, BasicBlock *Tail,
-                                             GlobalVariable *X,
-                                             GlobalVariable *Y,
-                                             uint32_t XSeed, uint32_t YSeed,
-                                             CryptoUtils &Crypto) {
-  Function *F = Fake->getParent();
-  LLVMContext &Ctx = F->getContext();
-
-  auto CreatePredicate = [&](IRBuilder<> &IRB) {
-    bool PredicateIsTrue = true;
-    return createOpaquePredicate(IRB, X, Y, XSeed, YSeed, Crypto,
-                                 PredicateIsTrue);
-  };
-
-  switch (Crypto.getRandom32() % 4) {
-  case 0: {
-    IRBuilder<> FakeIRB(Fake);
-    insertBogusJunk(FakeIRB, X, Y, Crypto);
-    FakeIRB.CreateBr(Tail);
-    return;
-  }
-  case 1: {
-    BasicBlock *Next =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.next", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertBogusJunk(FakeIRB, X, Y, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Next, Tail);
-
-    IRBuilder<> NextIRB(Next);
-    insertBogusJunk(NextIRB, X, Y, Crypto);
-    NextIRB.CreateBr(Tail);
-    return;
-  }
-  case 2: {
-    BasicBlock *Left =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.left", F, Tail->getNextNode());
-    BasicBlock *Right =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.right", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertBogusJunk(FakeIRB, X, Y, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Left, Right);
-
-    IRBuilder<> LeftIRB(Left);
-    insertBogusJunk(LeftIRB, X, Y, Crypto);
-    LeftIRB.CreateBr(Tail);
-
-    IRBuilder<> RightIRB(Right);
-    insertBogusJunk(RightIRB, X, Y, Crypto);
-    RightIRB.CreateBr(Tail);
-    return;
-  }
-  default: {
-    BasicBlock *Loop =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.loop", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertBogusJunk(FakeIRB, X, Y, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Loop, Tail);
-
-    IRBuilder<> LoopIRB(Loop);
-    insertBogusJunk(LoopIRB, X, Y, Crypto);
-    Value *KeepLooping = CreatePredicate(LoopIRB);
-    if (Crypto.getRandom32() & 1)
-      LoopIRB.CreateCondBr(KeepLooping, Tail, Loop);
-    else
-      LoopIRB.CreateCondBr(KeepLooping, Loop, Tail);
-    return;
-  }
-  }
+  bool Changed = runBogusControlFlow(F, Level, Crypto);
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

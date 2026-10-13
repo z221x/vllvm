@@ -49,14 +49,17 @@ run_case() {
   local upper_name
   upper_name=$(printf "%s" "$name" | tr "[:lower:]" "[:upper:]")
   local mode_define="-DVLLVM_TEST_${upper_name}=1"
-  # icall 的 crypt 断言属于 level 2 行为（1=纯间接调用）。
+  # icall 的 crypt 断言属于 level 2 行为（1=纯间接调用）；vmfla 的 lvars
+  # 断言属于 level 2 行为（1=bb2func+merge+平坦化，2=+lvars）。
   local config_args=()
   case "$name" in
   icall) config_args=(-mllvm -vllvm-config=icall=2) ;;
+  vmfla) config_args=(-mllvm -vllvm-config=vmfla=2) ;;
   esac
 
-  # icall 用例需要保留值名字断言加密位置；其余用例的断言依赖匿名编号。
-  if [ "$name" = icall ]; then
+  # icall/vmfla/bcf 用例需要保留值名字断言位置（icall 的 crypt 链、
+  # vmfla 的表访问、bcf 的 seed/虚假块标签）；其余用例的断言依赖匿名编号。
+  if [ "$name" = icall ] || [ "$name" = vmfla ] || [ "$name" = bcf ]; then
     "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S \
       -fno-discard-value-names -emit-llvm "$mode_define" ${config_args[@]+"${config_args[@]}"} \
       "$SRC" -o "$ll"
@@ -86,21 +89,6 @@ run_case() {
       echo "enstr left plaintext alpha string in IR" >&2
       exit 1
     fi
-    ;;
-  fla)
-    if grep -q "^  switch " "$ll"; then
-      echo "fla left a switch instruction in IR" >&2
-      exit 1
-    fi
-    grep -q "vllvm.fla.const.table" "$ll"
-    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
-    # 常量表改为参数传递：不允许解密访问模式（数组 GEP / volatile load）
-    # 直接引用表全局；防传播伪调用点的 i8 偏移 GEP 不算直引。
-    if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm\.fla\.const\.table' "$ll"; then
-      echo "fla constant table must be passed as a parameter" >&2
-      exit 1
-    fi
-    grep -Eq 'call[^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*@vllvm\.fla\.const\.table' "$ll"
     ;;
   icall)
     grep -q "register_func" "$ll"
@@ -136,15 +124,14 @@ run_case() {
     grep -q "define private .*vllvm.impl.*ptr %" "$ll"
     grep -q "call .*vllvm.impl.*ptr @vllvm.vmfla.const.table" "$ll"
     grep -q "getelementptr i32, ptr %" "$ll"
-    grep -Eq "icmp (ult|uge) i32 %[0-9]+, [0-9]+" "$ll"
+    # 保留值名字编译，操作数可能带名（%loadSwitchIndex...）或匿名编号。
+    grep -Eq "icmp (ult|uge) i32 %[A-Za-z0-9._-]+, [0-9]+" "$ll"
     grep -q "store volatile i32 .*ptr %.*" "$ll"
-    grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$ll"
-    if grep -Eq "@vllvm\\.bcf\\.[xy]" "$ll"; then
-      echo "vmfla bcf constants must use the vmfla integer constant table" >&2
-      exit 1
-    fi
+    grep -Eq "xor i32 %[A-Za-z0-9._-]+, %[A-Za-z0-9._-]+" "$ll"
+    # level 2：局部变量结构化结构体必须出现。
+    grep -q "vllvm.localvars." "$ll"
     if grep -Eq "load volatile i32, ptr getelementptr \\(i32, ptr @vllvm\\.vmfla\\.const\\.table" "$ll"; then
-      echo "vmfla bcf table loads must use the impl table parameter" >&2
+      echo "vmfla table loads must use the impl table parameter" >&2
       exit 1
     fi
     if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" "$ll"; then
@@ -157,11 +144,24 @@ run_case() {
       exit 1
     fi
     ;;
+  bcf)
+    # 独立 BCF：栈 seed（地址不透明归一）、随机指令虚假块（锚定在永假
+    # 分支后继上）、永假 icmp eq 谓词；不得触发 vmfla 链路产物。
+    grep -q "vllvm.bcf.seed" "$ll"
+    grep -Eq "^vllvm\.bcf\.fake\." "$ll"
+    grep -q "label %vllvm.bcf.fake" "$ll"
+    grep -q "vllvm.bcf.cmp" "$ll"
+    grep -q "icmp eq" "$ll"
+    if grep -q "vllvm.vmfla.const.table" "$ll"; then
+      echo "bcf must stay independent of the vmfla chain" >&2
+      exit 1
+    fi
+    ;;
   esac
 }
 
 # run_case enstr
-# run_case fla
 # run_case ibr
+run_case bcf
 run_case icall
 run_case vmfla

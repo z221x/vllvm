@@ -16,7 +16,7 @@ else
 fi
 
 EXTRA_ARGS=()
-if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
+if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
   SDK_PATH=$(xcrun --show-sdk-path 2>/dev/null || true)
   if [ -n "$SDK_PATH" ]; then
     EXTRA_ARGS+=(-isysroot "$SDK_PATH")
@@ -31,7 +31,7 @@ set +e
 BASE_STATUS=$?
 set -e
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -S -emit-llvm \
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names -S -emit-llvm \
   -DVLLVM_TEST_BCF=1 "$SRC" -o "$OUT_DIR/bcf.ll"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 \
@@ -46,7 +46,27 @@ if [ "$BCF_STATUS" -ne "$BASE_STATUS" ]; then
   exit 1
 fi
 
-grep -q "@vllvm.bcf.x" "$OUT_DIR/bcf.ll"
-grep -q "@vllvm.bcf.y" "$OUT_DIR/bcf.ll"
-grep -q "load volatile i32, ptr @vllvm.bcf" "$OUT_DIR/bcf.ll"
-grep -q "store volatile i32 .*@vllvm.bcf.x" "$OUT_DIR/bcf.ll"
+# 独立 BCF：栈 seed + 已知密文 + 单后继分支伪造；随机指令虚假块存在，
+# 谓词 icmp eq（加密值 vs 不等随机数）永假，真边回原后继。bcf 独立于
+# vmfla，不允许触发 vmfla 常量表。
+grep -q "vllvm.bcf.seed" "$OUT_DIR/bcf.ll"
+grep -Eq "^vllvm\.bcf\.fake\." "$OUT_DIR/bcf.ll"
+grep -q "vllvm.bcf.cmp" "$OUT_DIR/bcf.ll"
+grep -q "icmp eq" "$OUT_DIR/bcf.ll"
+if grep -q "vllvm.vmfla.const.table" "$OUT_DIR/bcf.ll"; then
+  echo "bcf must stay independent of the vmfla chain" >&2
+  exit 1
+fi
+
+# seed 不能是明文常量：由槽位地址经 i16 上的 x + (x ^ -1) 归一（恒为
+# 0xFFFF）后 volatile 压栈；全部运算走 uint16 回绕，反编译器无法折叠
+# 密文链，永假谓词与虚假块必须留在反编译视图里。
+grep -q "%vllvm.bcf.seed.addr = ptrtoint" "$OUT_DIR/bcf.ll"
+grep -Eq "add i16 %vllvm\.bcf\.seed\.x, %vllvm\.bcf\.seed\.not" "$OUT_DIR/bcf.ll"
+grep -q "icmp eq i16" "$OUT_DIR/bcf.ll"
+if grep -Eq "store volatile i(16|32) [0-9-]+, ptr %vllvm\.bcf\.seed" "$OUT_DIR/bcf.ll"; then
+  echo "seed must be derived opaquely, not stored as a constant" >&2
+  exit 1
+fi
+# 虚假块必须被至少一条永假分支引用（锚定），否则不可达块不进后端。
+grep -q "label %vllvm.bcf.fake" "$OUT_DIR/bcf.ll"

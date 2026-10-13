@@ -34,12 +34,18 @@ strip_binary() {
 
 mkdir -p "$OUT_DIR"
 
+# fla 已并入 vmfla 链路：VMFLA 模式的 lvars 断言需要 vmfla level 2
+# （1=bb2func+merge+平坦化，2=+lvars）。
+VMFLA_CONFIG=(-mllvm -vllvm-config=vmfla=2)
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
   -DVLLVM_TEST_LEGACY_COMBO=1 "$SRC" \
   -o "$OUT_DIR/test_lvars_legacy_combo.ll"
-# lvars 现在别名到 vmfla：fla,icall,lvars 组合会捆绑执行 vmfla，
-# 不再有独立的 localvars 偏移表。
-grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
+# fla/lvars 现在都别名到 vmfla：fla,icall,lvars 组合捆绑执行 vmfla，
+# 不再有独立的 fla 常量表和 localvars 偏移表。
+if grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
+  echo "fla must merge into the vmfla bundle" >&2
+  exit 1
+fi
 grep -q "vllvm.vmfla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
 if grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
   echo "legacy combo must not emit a standalone localvars table" >&2
@@ -57,7 +63,7 @@ if grep -q "register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
 fi
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -DVLLVM_TEST_VMFLA=1 "$SRC" \
+  ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
   -o "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.vmfla.const.table" "$OUT_DIR/test_lvars.ll"
 grep -q "vllvm.vmfla.const.table.* global " "$OUT_DIR/test_lvars.ll"
@@ -95,7 +101,8 @@ grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
 # the moved body's DISubprogram or contain an inlinable call without a location.
 for opt in 0 2; do
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g -O"$opt" -S -emit-llvm \
-    -DVLLVM_TEST_VMFLA=1 "$SRC" -o "$OUT_DIR/test_lvars_debug_O$opt.ll"
+    ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
+    -o "$OUT_DIR/test_lvars_debug_O$opt.ll"
   grep -q '!DISubprogram' "$OUT_DIR/test_lvars_debug_O$opt.ll"
   if [ "$opt" = 0 ]; then
     grep -Eq 'define.*vllvm.impl.*!dbg' "$OUT_DIR/test_lvars_debug_O$opt.ll"
@@ -105,7 +112,7 @@ done
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-  -DVLLVM_TEST_VMFLA=1 "$SRC" \
+  ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
   -o "$OUT_DIR/test_lvars"
 strip_binary "$OUT_DIR/test_lvars_base"
 strip_binary "$OUT_DIR/test_lvars"

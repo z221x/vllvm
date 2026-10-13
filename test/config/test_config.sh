@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-SRC="$ROOT_DIR/test/boguscontrolflow/test_bcf.c"
+BCF_SRC="$ROOT_DIR/test/boguscontrolflow/test_bcf.c"
+VMFLA_SRC="$ROOT_DIR/test/localvarstruct/test_lvars.c"
 OUT_DIR=${OUT_DIR:-"$ROOT_DIR/test/config/out"}
 
 if [ -n "${CLANG:-}" ]; then
@@ -15,7 +16,9 @@ else
   VLLVM_CLANG="clang"
 fi
 
-count_bcf() { grep -c "vllvm\.bcf" "$1" || true; }
+# vmfla 等级标记：局部变量结构化结构体；bcf 等级标记：虚假块标签。
+count_lvars() { grep -c "vllvm\.localvars\." "$1" || true; }
+count_bcf_fake() { grep -c "^vllvm\.bcf\.fake\." "$1" || true; }
 
 EXTRA_ARGS=()
 if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
@@ -27,65 +30,103 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 "$SRC" -o "$OUT_DIR/base"
-
-# test_bcf.c 的 main 返回校验和低 8 位，非零退出码是预期行为；
-# 与 test_bcf.sh 一致地用 set +e 捕获输出和退出码再比较。
+# vmfla 等级段用 vmfla 注解的 fixture；bcf 已独立，等级段用 bcf 注解的
+# test_bcf.c。两个 main 都以校验和低位作退出码，非零退出码是预期行为，
+# 用 set +e 捕获输出和退出码再比较。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 "$VMFLA_SRC" -o "$OUT_DIR/base"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 "$BCF_SRC" -o "$OUT_DIR/bcf_base"
 set +e
 BASE_OUT=$("$OUT_DIR/base")
 BASE_STATUS=$?
+BCF_BASE_OUT=$("$OUT_DIR/bcf_base")
+BCF_BASE_STATUS=$?
 set -e
 
-# level=0：bcf 全局关闭，IR 无任何 vllvm.bcf 产物，且公告行记录 level=0。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=0 \
-  "$SRC" -S -emit-llvm -o "$OUT_DIR/off.ll" 2>"$OUT_DIR/off.log"
-[ "$(count_bcf "$OUT_DIR/off.ll")" -eq 0 ] || {
-  echo "bcf=0 unexpectedly transformed the module" >&2
+# vmfla level=0：整条链路全局关闭，IR 无任何链路产物（表/helper/dispatcher）。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
+  -DVLLVM_TEST_VMFLA=1 -mllvm -vllvm-config=vmfla=0 \
+  "$VMFLA_SRC" -S -emit-llvm -o "$OUT_DIR/off.ll" 2>"$OUT_DIR/off.log"
+if grep -Eq "vllvm\.(vmfla\.const\.table|bb2f\.|merge\.)" "$OUT_DIR/off.ll"; then
+  echo "vmfla=0 unexpectedly transformed the module" >&2
   exit 1
-}
-grep -q '\[vllvm\] VLLVMConfig:bcf: level=0 (default=1 max=3)' "$OUT_DIR/off.log"
+fi
+grep -q '\[vllvm\] VLLVMConfig:vmfla: level=0 (default=1 max=2)' "$OUT_DIR/off.log"
 
-# 默认（level=1）：照常混淆，运行结果与基准一致。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 "$SRC" -S -emit-llvm \
+# vmfla level=1（默认）：bb2func + merge + 平坦化；不做局部变量结构化。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
+  -DVLLVM_TEST_VMFLA=1 "$VMFLA_SRC" -S -emit-llvm \
   -o "$OUT_DIR/l1.ll" 2>"$OUT_DIR/l1.log"
-grep -q '\[vllvm\] VLLVMConfig:bcf: level=1 (default=1 max=3)' "$OUT_DIR/l1.log"
-L1_COUNT=$(count_bcf "$OUT_DIR/l1.ll")
-[ "$L1_COUNT" -gt 0 ] || {
-  echo "bcf default level produced no bogus flow" >&2
+grep -q '\[vllvm\] VLLVMConfig:vmfla: level=1 (default=1 max=2)' "$OUT_DIR/l1.log"
+grep -q "vllvm\.vmfla\.const\.table" "$OUT_DIR/l1.ll"
+[ "$(count_lvars "$OUT_DIR/l1.ll")" -eq 0 ] || {
+  echo "vmfla=1 must not enable local var structuring" >&2
   exit 1
 }
 
-# level=3：三轮 + 全量覆盖，虚假流规模必须大于默认档，运行结果不变。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=3 \
-  "$SRC" -S -emit-llvm -o "$OUT_DIR/l3.ll" 2>"$OUT_DIR/l3.log"
-grep -q '\[vllvm\] VLLVMConfig:bcf: level=3 (default=1 max=3)' "$OUT_DIR/l3.log"
-L3_COUNT=$(count_bcf "$OUT_DIR/l3.ll")
-[ "$L3_COUNT" -gt "$L1_COUNT" ] || {
-  echo "bcf=3 ($L3_COUNT) did not exceed bcf=1 ($L1_COUNT)" >&2
+# vmfla level=2：再开启局部变量结构化，运行结果不变。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
+  -DVLLVM_TEST_VMFLA=1 -mllvm -vllvm-config=vmfla=2 \
+  "$VMFLA_SRC" -S -emit-llvm -o "$OUT_DIR/l2.ll" 2>"$OUT_DIR/l2.log"
+grep -q '\[vllvm\] VLLVMConfig:vmfla: level=2 (default=1 max=2)' "$OUT_DIR/l2.log"
+[ "$(count_lvars "$OUT_DIR/l2.ll")" -gt 0 ] || {
+  echo "vmfla=2 produced no local var structuring" >&2
   exit 1
 }
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=3 \
-  "$SRC" -o "$OUT_DIR/l3"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_VMFLA=1 -mllvm -vllvm-config=vmfla=2 \
+  "$VMFLA_SRC" -o "$OUT_DIR/l2"
 set +e
-L3_OUT=$("$OUT_DIR/l3")
-L3_STATUS=$?
+L2_OUT=$("$OUT_DIR/l2")
+L2_STATUS=$?
 set -e
-if [ "$BASE_OUT" != "$L3_OUT" ] || [ "$BASE_STATUS" -ne "$L3_STATUS" ]; then
-  echo "bcf=3 runtime output mismatch" >&2
+if [ "$BASE_OUT" != "$L2_OUT" ] || [ "$BASE_STATUS" -ne "$L2_STATUS" ]; then
+  echo "vmfla=2 runtime output mismatch" >&2
   exit 1
 fi
 
 # 越界等级被钳制到 max 并告警。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=9 \
-  "$SRC" -S -emit-llvm -o /dev/null 2>"$OUT_DIR/clamp.log"
-grep -q '\[vllvm\] VLLVMConfig:bcf: level clamped to 3' "$OUT_DIR/clamp.log"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_VMFLA=1 -mllvm -vllvm-config=vmfla=9 \
+  "$VMFLA_SRC" -S -emit-llvm -o /dev/null 2>"$OUT_DIR/clamp.log"
+grep -q '\[vllvm\] VLLVMConfig:vmfla: level clamped to 2' "$OUT_DIR/clamp.log"
 
-# 非法片段：告警并跳过，不影响其他项（bcf 仍按显式的 2 生效）。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 \
-  -mllvm -vllvm-config=baditem,bcf=2 \
-  "$SRC" -S -emit-llvm -o /dev/null 2>"$OUT_DIR/bad.log"
+# 非法片段：告警并跳过，不影响其他项（vmfla 仍按显式的 2 生效）。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_VMFLA=1 \
+  -mllvm -vllvm-config=baditem,vmfla=2 \
+  "$VMFLA_SRC" -S -emit-llvm -o /dev/null 2>"$OUT_DIR/bad.log"
 grep -q "\[vllvm\] VLLVMConfig: ignored bad item 'baditem'" "$OUT_DIR/bad.log"
-grep -q '\[vllvm\] VLLVMConfig:bcf: level=2 (default=1 max=3)' "$OUT_DIR/bad.log"
+grep -q '\[vllvm\] VLLVMConfig:vmfla: level=2 (default=1 max=2)' "$OUT_DIR/bad.log"
 
-echo "config: bcf=0 off, level1=$L1_COUNT, level3=$L3_COUNT, clamp+bad-item ok"
+# bcf 独立 pass 等级：0 关闭、默认开启、钳制到 3。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
+  -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=0 \
+  "$BCF_SRC" -S -emit-llvm -o "$OUT_DIR/bcf_off.ll" 2>"$OUT_DIR/bcf_off.log"
+if grep -Eq "vllvm\.bcf\.(seed|fake|cmp)" "$OUT_DIR/bcf_off.ll"; then
+  echo "bcf=0 unexpectedly transformed the module" >&2
+  exit 1
+fi
+grep -q '\[vllvm\] VLLVMConfig:bcf: level=0 (default=1 max=3)' "$OUT_DIR/bcf_off.log"
+
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
+  -DVLLVM_TEST_BCF=1 "$BCF_SRC" -S -emit-llvm -o "$OUT_DIR/bcf_l1.ll" 2>"$OUT_DIR/bcf_l1.log"
+grep -q '\[vllvm\] VLLVMConfig:bcf: level=1 (default=1 max=3)' "$OUT_DIR/bcf_l1.log"
+grep -q "vllvm\.bcf\.seed" "$OUT_DIR/bcf_l1.ll"
+[ "$(count_bcf_fake "$OUT_DIR/bcf_l1.ll")" -gt 0 ] || {
+  echo "bcf default level produced no bogus flow" >&2
+  exit 1
+}
+
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 "$BCF_SRC" \
+  -mllvm -vllvm-config=bcf=9 -S -emit-llvm -o /dev/null 2>"$OUT_DIR/bcf_clamp.log"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -DVLLVM_TEST_BCF=1 "$BCF_SRC" \
+  -mllvm -vllvm-config=bcf=9 -o "$OUT_DIR/bcf_l3"
+set +e
+BCF_L3_OUT=$("$OUT_DIR/bcf_l3")
+BCF_L3_STATUS=$?
+set -e
+if [ "$BCF_BASE_OUT" != "$BCF_L3_OUT" ] || [ "$BCF_BASE_STATUS" -ne "$BCF_L3_STATUS" ]; then
+  echo "bcf=3 runtime output mismatch" >&2
+  exit 1
+fi
+grep -q '\[vllvm\] VLLVMConfig:bcf: level clamped to 3' "$OUT_DIR/bcf_clamp.log"
+
+echo "config: vmfla=0/1/2 ok, bcf=0/1/clamp ok, bad-item ok"

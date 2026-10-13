@@ -6,7 +6,6 @@ add_llvm_component_library(LLVMVLLVM
   Pass/BogusControlFlowPass.cpp
   Pass/EncryptoStrPass.cpp
   Pass/EnstrPoolRuntimeEmbed.cpp
-  Pass/FlattenFuncPass.cpp
   Pass/IndirectBranchPass.cpp
   Pass/IndirectCallPass.cpp
   Pass/MergePass.cpp

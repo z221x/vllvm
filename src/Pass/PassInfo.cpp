@@ -1,9 +1,11 @@
 #include "PassInfo.h"
 #include "BB2FuncPass.h"
+#include "BogusControlFlowPass.h"
 #include "MergePass.h"
 #include "VLLVM.h"
 #include "VLLVMAttribute.h"
 #include "VmpPass.h"
+#include "config/VLLVMConfig.h"
 
 #include <utility>
 
@@ -15,12 +17,11 @@ constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
 // vmfla 链路标记：bb2func+merge 完成后，vmfla 在第二段函数级处理里执行。
 constexpr StringLiteral VmFlattenPendingAttr = "vllvm.vmfla.pending";
-constexpr StringLiteral VmFlattenPendingBcfAttr = "vllvm.vmfla.pending.bcf";
 
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
-  return Options.VMFlattenFunc || Options.FlattenFunc ||
-         Options.IndirectCall || Options.IndirectBranch ||
-         Options.BogusControlFlow || Options.BB2Func;
+  return Options.VMFlattenFunc || Options.IndirectCall ||
+         Options.IndirectBranch || Options.BogusControlFlow ||
+         Options.BB2Func;
 }
 
 void protectFromLaterOptimization(Function &F) {
@@ -59,6 +60,13 @@ public:
     if (!FunctionOptions.any())
       return PreservedAnalyses::all();
 
+    // vmfla 等级为 0 时整条链路（bb2func+merge+vmfla）全局关闭，
+    // 连第一段的 bb2func/merge 也不执行。
+    VLLVMConfig::get().registerPassLevels("vmfla", 1, 2);
+    if (FunctionOptions.VMFlattenFunc &&
+        !VLLVMConfig::get().isEnabled("vmfla"))
+      FunctionOptions.VMFlattenFunc = false;
+
     // VMP 在 OptimizerLast 独立处理。它与函数级混淆组合时拥有优先级，避免
     // 先改写 CFG 后使虚拟化资格和语义不可预测。
     if (FunctionOptions.Vmp) {
@@ -87,10 +95,6 @@ public:
       // merge 标记，vmfla 延迟到模块级 MergePass 之后执行。
       RunPass(BB2FuncPass(/*ChainToMerge=*/true));
       F.addFnAttr(VmFlattenPendingAttr);
-      if (FunctionOptions.BogusControlFlow) {
-        F.addFnAttr(VmFlattenPendingBcfAttr);
-        FunctionOptions.BogusControlFlow = false;
-      }
       FunctionOptions.VMFlattenFunc = false;
     }
 
@@ -107,9 +111,6 @@ public:
       }
       FunctionOptions.BogusControlFlow = false;
     }
-
-    if (FunctionOptions.FlattenFunc)
-      RunPass(FlattenFuncPass());
 
     if (FunctionOptions.IndirectBranch)
       RunPass(IndirectBranchPass());
@@ -134,12 +135,9 @@ public:
     if (!F.hasFnAttribute(VmFlattenPendingAttr))
       return PreservedAnalyses::all();
     F.removeFnAttr(VmFlattenPendingAttr);
-    bool RunBCF = F.hasFnAttribute(VmFlattenPendingBcfAttr);
-    if (RunBCF)
-      F.removeFnAttr(VmFlattenPendingBcfAttr);
 
     PreservedAnalyses PA = PreservedAnalyses::all();
-    PA.intersect(VMFlattenFuncPass(RunBCF).run(F, FAM));
+    PA.intersect(VMFlattenFuncPass().run(F, FAM));
     return PA;
   }
 };

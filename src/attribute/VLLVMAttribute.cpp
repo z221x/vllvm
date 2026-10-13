@@ -20,16 +20,15 @@ StringRef normalizeKind(StringRef Kind) {
   Kind = Kind.trim();
   Kind.consume_front("vllvm:");
   Kind.consume_front("vllvm.");
-  if (Kind == "flatten")
-    return "fla";
+  // 独立的 FlattenFuncPass 已删除：fla/lvars 标注都归并进 vmfla 链路，
+  // 平坦化在 vmfla level 1 生效。
+  if (Kind == "lvars" || Kind == "local-var-struct" || Kind == "localvars" ||
+      Kind == "flatten")
+    return "vmfla";
   if (Kind == "indirect-call")
     return "icall";
   if (Kind == "indirect-branch")
     return "ibr";
-  // 参数（局部变量）结构化只能捆绑到 vmfla：lvars 标注别名到 vmfla，
-  // 不再提供独立的结构化 pass。
-  if (Kind == "lvars" || Kind == "local-var-struct" || Kind == "localvars")
-    return "vmfla";
   if (Kind == "vm-flatten" || Kind == "vm_flatten" ||
       Kind == "vm-flatten-func" || Kind == "vm_flatten_func" ||
       Kind == "vm-flatten-function" || Kind == "vm_flatten_function")
@@ -52,16 +51,15 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
   Kind = normalizeKind(Kind);
   if (Kind == "enstr")
     Options.EncryptoStr = true;
-  else if (Kind == "vmfla")
+  else if (Kind == "vmfla" || Kind == "fla")
+    // fla 平坦化没有独立 pass：fla 标注进入 vmfla 链路。
     Options.VMFlattenFunc = true;
-  else if (Kind == "fla")
-    Options.FlattenFunc = true;
+  else if (Kind == "bcf")
+    Options.BogusControlFlow = true;
   else if (Kind == "icall")
     Options.IndirectCall = true;
   else if (Kind == "ibr")
     Options.IndirectBranch = true;
-  else if (Kind == "bcf")
-    Options.BogusControlFlow = true;
   else if (Kind == "vmp")
     Options.Vmp = true;
   else if (Kind == "bb2func")
@@ -154,10 +152,9 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
 
   AddAttr("enstr", Options.EncryptoStr);
   AddAttr("vmfla", Options.VMFlattenFunc);
-  AddAttr("fla", Options.FlattenFunc);
+  AddAttr("bcf", Options.BogusControlFlow);
   AddAttr("icall", Options.IndirectCall);
   AddAttr("ibr", Options.IndirectBranch);
-  AddAttr("bcf", Options.BogusControlFlow);
   AddAttr("vmp", Options.Vmp);
   AddAttr("bb2func", Options.BB2Func);
   AddAttr("merge", Options.Merge);
@@ -229,16 +226,15 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
   VLLVMOptions Options = parseOptionList(Attr.getValueAsString());
   if (Kind == "enstr")
     return Options.EncryptoStr;
-  if (Kind == "vmfla")
+  // fla 无独立 pass，归并到 vmfla 链路执行。
+  if (Kind == "vmfla" || Kind == "fla")
     return Options.VMFlattenFunc;
-  if (Kind == "fla")
-    return Options.FlattenFunc;
+  if (Kind == "bcf")
+    return Options.BogusControlFlow;
   if (Kind == "icall")
     return Options.IndirectCall;
   if (Kind == "ibr")
     return Options.IndirectBranch;
-  if (Kind == "bcf")
-    return Options.BogusControlFlow;
   if (Kind == "vmp")
     return Options.Vmp;
   if (Kind == "bb2func")
@@ -252,10 +248,11 @@ VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   VLLVMOptions Options;
   Options.EncryptoStr |= hasVLLVMAttribute(F, "enstr");
   Options.VMFlattenFunc |= hasVLLVMAttribute(F, "vmfla");
-  Options.FlattenFunc |= hasVLLVMAttribute(F, "fla");
+  // IR 里遗留的 vllvm.fla 属性也归并进 vmfla 链路。
+  Options.VMFlattenFunc |= hasVLLVMAttribute(F, "fla");
+  Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");
-  Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
   Options.Vmp |= hasVLLVMAttribute(F, "vmp");
   Options.BB2Func |= hasVLLVMAttribute(F, "bb2func");
   Options.Merge |= hasVLLVMAttribute(F, "merge");

@@ -87,8 +87,8 @@ struct SharedConstTable {
 
   void setTableBase(Value *Base) { TableBase = Base; }
 
-  // BCF 在创建 impl 前会先插入常量表访问；函数体搬入 impl 后，
-  // 这些访问需要从临时全局表改成读取 wrapper 传入的表参数。
+  // 函数体搬入 impl 后，表访问需要从临时全局表改成读取 wrapper
+  // 传入的表参数。
   void rebaseUsesInFunction(Function &Fn) {
     if (!GV || !TableBase)
       return;
@@ -391,277 +391,7 @@ Instruction *getInsertionPointForUse(Use &U) {
   return dyn_cast<Instruction>(TheUser);
 }
 
-// vmfla 模式下的 BCF 使用随机覆盖率，避免每个块都生成同构 fake 分支。
-constexpr unsigned SharedBogusMinProbability = 55;
-constexpr unsigned SharedBogusProbabilityRange = 36;
-constexpr unsigned SharedBogusLoops = 1;
-
-bool isSharedBogusGeneratedBlock(BasicBlock &BB) {
-  return BB.hasName() && BB.getName().starts_with("vllvm.bcf.");
-}
-
-bool hasMustTailReturn(BasicBlock &BB) {
-  auto *RI = dyn_cast<ReturnInst>(BB.getTerminator());
-  if (!RI)
-    return false;
-
-  Instruction *Prev = RI->getPrevNonDebugInstruction();
-  auto *CB = dyn_cast_or_null<CallBase>(Prev);
-  return CB && CB->isMustTailCall();
-}
-
-bool canSplitForSharedBogusFlow(BasicBlock &BB) {
-  Instruction *Term = BB.getTerminator();
-  if (!Term || isSharedBogusGeneratedBlock(BB) || BB.isEHPad() ||
-      hasMustTailReturn(BB))
-    return false;
-
-  // C++ EH 函数可以做 BCF，但 landingpad/resume/catchret 等 EH 专用块
-  // 不能被 fake 分支包裹；invoke 本身允许保留在 split 后的 tail 块里。
-  if (isa<IndirectBrInst>(Term) || isa<CallBrInst>(Term) ||
-      isa<CatchSwitchInst>(Term) || isa<CatchReturnInst>(Term) ||
-      isa<CleanupReturnInst>(Term) || isa<ResumeInst>(Term))
-    return false;
-
-  return true;
-}
-
-Value *loadSharedBogusConstant(IRBuilder<> &IRB, SharedConstTable &ConstTable,
-                               uint32_t Value, const Twine &Name) {
-  // BCF 的随机常量也放入同一张函数级常量表，避免额外散落全局变量。
-  return ConstTable.load(IRB, ConstTable.add(Value), Name);
-}
-
-Value *createSharedOpaquePredicate(IRBuilder<> &IRB,
-                                   SharedConstTable &ConstTable,
-                                   unsigned XIndex, unsigned YIndex,
-                                   uint32_t XSeed, uint32_t YSeed,
-                                   CryptoUtils &Crypto,
-                                   bool &PredicateIsTrue) {
-  Value *XVal = ConstTable.load(IRB, XIndex, "vllvm.bcf.x");
-  Value *YVal = ConstTable.load(IRB, YIndex, "vllvm.bcf.y");
-  Value *Expr = (Crypto.getRandom32() & 1) ? XVal : YVal;
-  uint32_t Expected = Expr == XVal ? XSeed : YSeed;
-
-  auto Other = [&](bool UseX) -> std::pair<Value *, uint32_t> {
-    return UseX ? std::make_pair(XVal, XSeed) : std::make_pair(YVal, YSeed);
-  };
-
-  unsigned Rounds = 4 + (Crypto.getRandom32() % 5);
-  for (unsigned I = 0; I < Rounds; ++I) {
-    uint32_t K = Crypto.getRandom32();
-    switch (Crypto.getRandom32() % 6) {
-    case 0: {
-      Value *KVal = loadSharedBogusConstant(IRB, ConstTable, K, "vllvm.bcf.k");
-      Expr = IRB.CreateAdd(Expr, KVal, "vllvm.bcf.mix.add");
-      Expected += K;
-      break;
-    }
-    case 1: {
-      Value *KVal = loadSharedBogusConstant(IRB, ConstTable, K, "vllvm.bcf.k");
-      Expr = IRB.CreateSub(Expr, KVal, "vllvm.bcf.mix.sub");
-      Expected -= K;
-      break;
-    }
-    case 2: {
-      K |= 1U;
-      Value *KVal = loadSharedBogusConstant(IRB, ConstTable, K, "vllvm.bcf.k");
-      Expr = IRB.CreateMul(Expr, KVal, "vllvm.bcf.mix.mul");
-      Expected *= K;
-      break;
-    }
-    case 3: {
-      Value *KVal = loadSharedBogusConstant(IRB, ConstTable, K, "vllvm.bcf.k");
-      Expr = IRB.CreateXor(Expr, KVal, "vllvm.bcf.mix.xor");
-      Expected ^= K;
-      break;
-    }
-    case 4: {
-      auto [OtherVal, OtherExpected] = Other(Crypto.getRandom32() & 1);
-      Expr = IRB.CreateAdd(Expr, OtherVal, "vllvm.bcf.mix.addv");
-      Expected += OtherExpected;
-      break;
-    }
-    default: {
-      auto [OtherVal, OtherExpected] = Other(Crypto.getRandom32() & 1);
-      Expr = IRB.CreateXor(Expr, OtherVal, "vllvm.bcf.mix.xorv");
-      Expected ^= OtherExpected;
-      break;
-    }
-    }
-  }
-
-  bool Negate = (Crypto.getRandom32() & 1) != 0;
-  PredicateIsTrue = !Negate;
-  Value *ExpectedValue =
-      loadSharedBogusConstant(IRB, ConstTable, Expected, "vllvm.bcf.expected");
-  return Negate ? IRB.CreateICmpNE(Expr, ExpectedValue, "vllvm.bcf.pred")
-                : IRB.CreateICmpEQ(Expr, ExpectedValue, "vllvm.bcf.pred");
-}
-
-void insertSharedBogusJunk(IRBuilder<> &IRB, SharedConstTable &ConstTable,
-                           unsigned XIndex, unsigned YIndex,
-                           CryptoUtils &Crypto) {
-  Value *A = ConstTable.load(IRB, XIndex, "vllvm.bcf.fake.x");
-  Value *B = ConstTable.load(IRB, YIndex, "vllvm.bcf.fake.y");
-
-  Value *Junk = IRB.CreateXor(A, B, "vllvm.bcf.fake.mix");
-  Junk = IRB.CreateAdd(
-      Junk,
-      loadSharedBogusConstant(IRB, ConstTable, Crypto.getRandom32(),
-                              "vllvm.bcf.fake.k"),
-      "vllvm.bcf.fake.add");
-  Junk = IRB.CreateMul(
-      Junk,
-      loadSharedBogusConstant(IRB, ConstTable, Crypto.getRandom32() | 1U,
-                              "vllvm.bcf.fake.k"),
-      "vllvm.bcf.fake.mul");
-
-  Value *XPtr = ConstTable.getEntryPtr(IRB, XIndex, "vllvm.bcf.fake.x");
-  StoreInst *Store = IRB.CreateStore(Junk, XPtr);
-  Store->setVolatile(true);
-}
-
-void terminateSharedFakePath(BasicBlock *Fake, BasicBlock *Tail,
-                             SharedConstTable &ConstTable, unsigned XIndex,
-                             unsigned YIndex, uint32_t XSeed, uint32_t YSeed,
-                             CryptoUtils &Crypto) {
-  Function *F = Fake->getParent();
-  LLVMContext &Ctx = F->getContext();
-
-  auto CreatePredicate = [&](IRBuilder<> &IRB) {
-    bool PredicateIsTrue = true;
-    return createSharedOpaquePredicate(IRB, ConstTable, XIndex, YIndex, XSeed,
-                                       YSeed, Crypto, PredicateIsTrue);
-  };
-
-  // fake 路径不能总是 fake -> tail；随机短链、分叉和自环能降低 CFG 模板感。
-  switch (Crypto.getRandom32() % 4) {
-  case 0: {
-    IRBuilder<> FakeIRB(Fake);
-    insertSharedBogusJunk(FakeIRB, ConstTable, XIndex, YIndex, Crypto);
-    FakeIRB.CreateBr(Tail);
-    return;
-  }
-  case 1: {
-    BasicBlock *Next =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.next", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertSharedBogusJunk(FakeIRB, ConstTable, XIndex, YIndex, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Next, Tail);
-
-    IRBuilder<> NextIRB(Next);
-    insertSharedBogusJunk(NextIRB, ConstTable, XIndex, YIndex, Crypto);
-    NextIRB.CreateBr(Tail);
-    return;
-  }
-  case 2: {
-    BasicBlock *Left =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.left", F, Tail->getNextNode());
-    BasicBlock *Right =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.right", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertSharedBogusJunk(FakeIRB, ConstTable, XIndex, YIndex, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Left, Right);
-
-    IRBuilder<> LeftIRB(Left);
-    insertSharedBogusJunk(LeftIRB, ConstTable, XIndex, YIndex, Crypto);
-    LeftIRB.CreateBr(Tail);
-
-    IRBuilder<> RightIRB(Right);
-    insertSharedBogusJunk(RightIRB, ConstTable, XIndex, YIndex, Crypto);
-    RightIRB.CreateBr(Tail);
-    return;
-  }
-  default: {
-    BasicBlock *Loop =
-        BasicBlock::Create(Ctx, "vllvm.bcf.fake.loop", F, Tail->getNextNode());
-    IRBuilder<> FakeIRB(Fake);
-    insertSharedBogusJunk(FakeIRB, ConstTable, XIndex, YIndex, Crypto);
-    FakeIRB.CreateCondBr(CreatePredicate(FakeIRB), Loop, Tail);
-
-    IRBuilder<> LoopIRB(Loop);
-    insertSharedBogusJunk(LoopIRB, ConstTable, XIndex, YIndex, Crypto);
-    Value *KeepLooping = CreatePredicate(LoopIRB);
-    if (Crypto.getRandom32() & 1)
-      LoopIRB.CreateCondBr(KeepLooping, Tail, Loop);
-    else
-      LoopIRB.CreateCondBr(KeepLooping, Loop, Tail);
-    return;
-  }
-  }
-}
-
-bool addSharedBogusFlow(BasicBlock &BB, SharedConstTable &ConstTable,
-                        unsigned XIndex, unsigned YIndex, uint32_t XSeed,
-                        uint32_t YSeed, CryptoUtils &Crypto) {
-  Instruction *Term = BB.getTerminator();
-  if (!Term || !canSplitForSharedBogusFlow(BB))
-    return false;
-
-  Function *F = BB.getParent();
-  LLVMContext &Ctx = F->getContext();
-
-  BasicBlock *Tail = BB.splitBasicBlock(Term->getIterator(), "vllvm.bcf.tail");
-  BasicBlock *Fake =
-      BasicBlock::Create(Ctx, "vllvm.bcf.fake", F, Tail->getNextNode());
-
-  BB.getTerminator()->eraseFromParent();
-
-  IRBuilder<> RealIRB(&BB);
-  bool PredicateIsTrue = true;
-  Value *Predicate =
-      createSharedOpaquePredicate(RealIRB, ConstTable, XIndex, YIndex, XSeed,
-                                  YSeed, Crypto, PredicateIsTrue);
-  BasicBlock *TrueBB = PredicateIsTrue ? Tail : Fake;
-  BasicBlock *FalseBB = PredicateIsTrue ? Fake : Tail;
-  RealIRB.CreateCondBr(Predicate, TrueBB, FalseBB);
-
-  terminateSharedFakePath(Fake, Tail, ConstTable, XIndex, YIndex, XSeed, YSeed,
-                          Crypto);
-  return true;
-}
-
-bool applySharedBogusControlFlow(Function &F, SharedConstTable &ConstTable,
-                                 CryptoUtils &Crypto) {
-  if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
-    return false;
-
-  SmallVector<BasicBlock *, 32> Candidates;
-  SmallVector<BasicBlock *, 32> Targets;
-  unsigned Probability = SharedBogusMinProbability +
-                         (Crypto.getRandom32() % SharedBogusProbabilityRange);
-  // 不再 100% 覆盖所有块；随机命中能减少“每块一根横线”的图形指纹。
-  for (unsigned Loop = 0; Loop < SharedBogusLoops; ++Loop) {
-    for (BasicBlock &BB : F) {
-      if (!canSplitForSharedBogusFlow(BB))
-        continue;
-      Candidates.push_back(&BB);
-      if (Crypto.getRandom32() % 100 < Probability)
-        Targets.push_back(&BB);
-    }
-  }
-  // 小函数也至少命中一个可拆基本块，避免显式启用 bcf 却完全无变化。
-  if (Targets.empty() && !Candidates.empty())
-    Targets.push_back(Candidates[Crypto.getRandom32() % Candidates.size()]);
-  if (Targets.empty())
-    return false;
-
-  uint32_t XSeed = Crypto.getRandom32();
-  uint32_t YSeed = Crypto.getRandom32();
-  unsigned XIndex = ConstTable.add(XSeed);
-  unsigned YIndex = ConstTable.add(YSeed);
-
-  bool Changed = false;
-  for (BasicBlock *BB : Targets)
-    if (BB->getParent() == &F)
-      Changed |= addSharedBogusFlow(*BB, ConstTable, XIndex, YIndex, XSeed,
-                                    YSeed, Crypto);
-
-  if (Changed)
-    fixStackForFlatten(&F);
-  return Changed;
-}
+// vmfla 模式下不再有共享 BCF；保留的常量表访问都来自 flatten/lvars。
 
 // 给 dispatch 树选择带随机扰动的切分点，避免每次都形成完全平衡的固定形态。
 unsigned chooseDispatchSplit(unsigned Begin, unsigned End, CryptoUtils &Crypto) {
@@ -761,7 +491,6 @@ void removeVLLVMAttributes(Function &F) {
 // 剥掉，否则 phase 2 会对新创建的 impl 再次触发 vmfla，产生多层嵌套。
 void removeVLLVMPendingAttrs(Function &F) {
   F.removeFnAttr("vllvm.vmfla.pending");
-  F.removeFnAttr("vllvm.vmfla.pending.bcf");
 }
 
 void collectParamAttrsWithTable(Function &F,
@@ -1441,19 +1170,23 @@ bool moveTablesToImplParams(Function &F) {
 PreservedAnalyses VMFlattenFuncPass::run(Function &F,
                                          FunctionAnalysisManager &FAM) {
   llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
-  Config.registerPassLevels("vmfla", 1, 3);
+  Config.registerPassLevels("vmfla", 1, 2);
   if (!Config.isEnabled("vmfla"))
     return PreservedAnalyses::all();
-  bool Changed = runVMFlattenFunc(F, FAM);
+  bool Changed = runVMFlattenFunc(F, FAM, Config.getLevel("vmfla"));
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
 
+// level 设置混淆强度：1=bb2func+merge+平坦化；2=再开启局部变量结构化。
 bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
-                                         FunctionAnalysisManager &FAM) {
+                                         FunctionAnalysisManager &FAM,
+                                         unsigned Level) {
   if (F.empty() || F.isDeclaration() || F.getFunctionType()->isVarArg())
     return false;
 
-  // 与 enstr/fla 共用 PHI 降级，必须早于 BCF 和 flatten 的 CFG 改写。
+  const bool RunLocalVars = Level >= 2;
+
+  // 与 enstr 共用 PHI 降级，必须早于 flatten 的 CFG 改写。
   PHILoweringResult PHIs = lowerPHINodes(F);
   if (PHIs == PHILoweringResult::Unsupported)
     return false;
@@ -1461,22 +1194,13 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
   CryptoUtils Crypto(F.getParent());
   bool Changed = PHIs == PHILoweringResult::Lowered;
 
-  if (RunBogusControlFlow) {
-    errs() << "[vllvm] BogusControlFlowPass:" << F.getName() << "\n";
-    // 第一轮 BCF 先扩展原始 CFG，再交给 flatten/icall/lvars 继续处理。
-    Changed |= applySharedBogusControlFlow(F, ConstTable, Crypto);
-    if (F.hasFnAttribute("vllvm.bcf")) {
-      F.removeFnAttr("vllvm.bcf");
-      Changed = true;
-    }
-  }
-
   errs() << "[vllvm] VMFlattenFuncPass:" << F.getName() << "\n";
 
   FlattenPlan FPlan = planFlatten(F, FAM, Crypto, ConstTable);
 
   if (!FPlan.Enabled) {
-    LocalVarPlan LPlan = planLocalVars(F, ConstTable);
+    LocalVarPlan LPlan = RunLocalVars ? planLocalVars(F, ConstTable)
+                                      : LocalVarPlan();
     if (!LPlan.Enabled && ConstTable.empty())
       return Changed;
 
@@ -1487,11 +1211,6 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
     Changed = true;
     if (LPlan.Enabled)
       Changed |= applyLocalVars(*Impl, LPlan, ConstTable);
-
-    if (RunBogusControlFlow) {
-      // 第二轮 BCF 作用在最终 impl 上，用来打散后续混淆重新形成的模板骨架。
-      Changed |= applySharedBogusControlFlow(*Impl, ConstTable, Crypto);
-    }
 
     shuffleFunctionBlocks(*Impl, Crypto);
 
@@ -1511,18 +1230,14 @@ bool VMFlattenFuncPass::runVMFlattenFunc(Function &F,
     ensureFlattenRuntimeIndex(*Impl, FPlan,
                               Type::getInt32Ty(Impl->getContext()));
 
-  LocalVarPlan LPlan = planLocalVars(*Impl, ConstTable);
+  LocalVarPlan LPlan = RunLocalVars ? planLocalVars(*Impl, ConstTable)
+                                    : LocalVarPlan();
   if (LPlan.Enabled)
     Changed |= applyLocalVars(*Impl, LPlan, ConstTable,
                               FPlan.Enabled ? &FPlan : nullptr);
 
   if (FPlan.Enabled)
     Changed |= applyFlatten(*Impl, FAM, FPlan, ConstTable, Crypto);
-
-  if (RunBogusControlFlow) {
-    // 第二轮 BCF 作用在最终 impl 上，用来打散 flatten 后重新形成的模板骨架。
-    Changed |= applySharedBogusControlFlow(*Impl, ConstTable, Crypto);
-  }
 
   shuffleFunctionBlocks(*Impl, Crypto);
 

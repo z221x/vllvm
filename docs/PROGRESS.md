@@ -7,7 +7,7 @@
 
 ```text
 src/
-├── Pass/          Pass 实现（fla/vmfla/ibr/icall/bcf/enstr/bb2func/merge/vmp）
+├── Pass/          Pass 实现（vmfla/ibr/icall/enstr/bb2func/merge/vmp）
 ├── attribute/     注解 → 函数属性/VLLVMOptions 的解析（VLLVMAttribute）
 ├── common/        公共工具（Utils、CryptoUtils 随机源）
 ├── config/        全局混淆等级配置（VLLVMConfig）
@@ -25,29 +25,40 @@ src/
 | Pass | 注解 | 功能 | 状态 | 等级语义 |
 |------|------|------|------|----------|
 | EncryptoStr | `vllvm:enstr` | 字符串/常量加密（匿名内存池 + 下标访问） | ✅ 可用 | 0-2：1=字符串，2=再加密常量 |
-| FlattenFunc | `vllvm:fla` | 控制流平坦化（switch + 常量表参数化） | ✅ 可用 | 0-3，≥1 等价（待差异化） |
 | IndirectBranch | `vllvm:ibr` | 间接跳转 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
+| BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（栈 seed + 已知密文 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
 | IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密与 fake 诱饵下标 |
-| BogusControlFlow | `vllvm:bcf` | 虚假控制流（不透明谓词 + fake 路径） | ✅ 可用 | 0-3 全梯度（轮数+覆盖率） |
-| BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
-| Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 0-3，≥1 等价（待差异化） |
-| VMFlattenFunc | `vllvm:vmfla` | VM 化平坦化（bb2func+merge+vmfla 三段链） | ✅ 可用 | 0-3，≥1 等价（待差异化） |
+| BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
+| Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
+| VMFlattenFunc | `vllvm:vmfla` | VM 化平坦化（bb2func+merge+vmfla 三段链），内置平坦化与 lvars | ✅ 可用 | 0-2：1=bb2func+merge+平坦化，2=+局部变量结构化 |
 | Vmp | `vllvm:vmp` | 函数虚拟化（VM 字节码 + 解释器运行时） | ✅ 可用（仅 AArch64） | 0-3，≥1 等价（待差异化） |
 
+独立的 FlattenFuncPass（`vllvm:fla`）已删除：平坦化由 VMFlattenFuncPass
+内置提供，`fla` 标注（含 IR 中遗留的 `vllvm.fla` 属性）归并进 vmfla 链路。
+BogusControlFlowPass 保持独立（栈 seed 新算法），`vllvm:bcf` 单独标注。
+
 等级语义列指 `VLLVMConfig`（见下节）：每个 Pass 自己 `registerPassLevels`
-声明区间并解释含义；enstr/icall/bcf 已实现完整梯度，其余 Pass ≥1 等价于
-原行为，后续按 Pass 逐个补齐差异化。
+声明区间并解释含义；enstr/icall/bcf/vmfla 已实现完整梯度，其余 Pass ≥1
+等价于原行为，后续按 Pass 逐个补齐差异化。
 
 ## 三、全局混淆等级配置（新）
 
 - 实现：`src/config/VLLVMConfig.{h,cpp}`，进程级单例。
 - 命令行：`clang -mllvm -vllvm-config=<pass>=<level>[,...]`，
-  例如 `-mllvm -vllvm-config=bcf=3,icall=2`；`0` 表示全局关闭对应 Pass。
+  例如 `-mllvm -vllvm-config=vmfla=3,icall=2`；`0` 表示全局关闭对应 Pass。
 - Pass 侧约定：`run()` 入口调用 `registerPassLevels(name, default, max)`
   自声明区间，`getLevel(name)` 取生效等级，`isEnabled(name)` 做关闭闸门。
 - 命令行解析发生在 Pass 注册之前：未注册的名字先记录，注册时收敛；
   越界等级钳制到 `[0, max]` 并打印 `[vllvm] VLLVMConfig:*: level clamped` 告警。
-- bcf 参考实现：1=单轮随机覆盖（55%~90%），2=两轮，3=三轮且全量覆盖。
+- vmfla：level 0=整条链路（bb2func+merge+vmfla）关闭；1=bb2func+merge+
+  平坦化混淆；2=再开启局部变量结构化（lvars）。
+- bcf（独立 pass）：运算统一 uint16（i16 回绕）；seed 以槽位地址经
+  `x + (x ^ -1)` 恒等归一后压栈（运行时恒为 0xFFFF、静态不可求解，
+  明文常量会被反编译器沿栈槽折叠掉），
+  各分支点 volatile 读 seed 经随机运算链加密（加密后值已知），创建永假
+  `icmp eq` 虚假分支，假边随机落入真实块或虚假块；虚假块链接成链并
+  锚定在至少一条永假边后继上，保证进入后端发射与反编译视图；
+  level 1/2/3 覆盖率 60%/85%/全量，虚假块数量递增。
 - enstr：字符串重构为模块级**匿名内存池**，池逻辑（mmap、CAS 抢锁、
   解密、下标访问）改为 C 实现 `src/c_func/enstrpool/enstrpool.c`，按
   解释器 runtime 的方式编成位码（`EnstrPoolBitcode.inc`）由 pass 链入
@@ -62,9 +73,9 @@ src/
   调用点再加可逆参数加密链，且每个调用点写入一条独立随机的
   **fake 诱饵下标**（过同构运算链后 volatile 存入 decoy 全局，
   干扰 nest 下标分析）。
-- 测试：`test/config/test_config.sh` 覆盖 0 关闭、默认档、3 档规模递增、
-  运行结果一致、钳制与非法片段告警；`test_enstr*.sh` 覆盖池形态、
-  下标访问、并发冷启动、OOM trap、i386/aarch64 交叉目标；
+- 测试：`test/config/test_config.sh` 覆盖 vmfla 0/1/2 档（lvars 逐级
+  开启）与 bcf 独立等级、运行结果一致、钳制与非法片段告警；`test_enstr*.sh`
+  覆盖池形态、下标访问、并发冷启动、OOM trap、i386/aarch64 交叉目标；
   `test_indirectcall.sh` 分别断言 level 1 无 crypt/decoy、level 2 皆有。
 
 ## 四、构建与测试状态（Windows x64 实测，2026-09-28）

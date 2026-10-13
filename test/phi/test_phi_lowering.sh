@@ -40,15 +40,11 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
       show && !skip && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
         > "$OUT_DIR/$mode.after-lowering.log"
       # The enstr dispatch is a no-op for fla/vmfla-only input.
-      if [[ $mode == fla ]]; then
-        awk '/^; \*\*\* IR Dump After/ { show = /VLLVMFunctionDispatchPass/ }
-          show && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
-          > "$OUT_DIR/$mode.after-lowering.log"
-      elif [[ $mode == vmfla ]]; then
-        # vmfla 链路 = bb2func + merge + vmfla：vmfla 移到链路末端的
-        # VLLVMVMFlattenLateDispatchPass 执行；merge dispatcher 和 bb2func
-        # helper 是链路的结构性产物（内联可能引入合法 PHI），检查 PHI
-        # 合约时排除。
+      if [[ $mode == vmfla || $mode == fla ]]; then
+        # fla 已并入 vmfla 链路 = bb2func + merge + vmfla：vmfla 移到链路
+        # 末端的 VLLVMVMFlattenLateDispatchPass 执行；merge dispatcher 和
+        # bb2func helper 是链路的结构性产物（内联可能引入合法 PHI），检查
+        # PHI 合约时排除。
         awk '/^; \*\*\* IR Dump After/ { show = /VLLVMVMFlattenLateDispatchPass/ }
           /^define / { skip = ($0 ~ /@vllvm\.(merge|bb2f)\./) }
           show && !skip && !/^\[vllvm\]/ { print }' \
@@ -63,14 +59,14 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
     fi
     case "$mode" in
       *enstr*)
-        grep -q 'vllvm.enstr.cache' "$ir"
+        # enstr 已改为匿名内存池 + __vllvm_enstr_get 下标访问。
+        grep -q '__vllvm_enstr' "$ir"
         if grep -Eq 'c"(left|right)\\00"' "$ir"; then
           echo "$mode left a plaintext string" >&2; exit 1
         fi ;;
     esac
-    if [[ $mode == fla || $mode == enstr_fla ]]; then
-      grep -q 'vllvm.fla.const.table' "$ir"
-    elif [[ $mode == *vmfla ]]; then
+    # fla 已并入 vmfla 链路：所有 fla/vmfla 模式都产出同一张 vmfla 常量表。
+    if [[ $mode == fla || $mode == *vmfla ]]; then
       grep -q 'vllvm.vmfla.const.table' "$ir"
     fi
     # Compile the original fixture, never feed transformed IR through VLLVM twice.
@@ -86,7 +82,8 @@ ir="$OUT_DIR/funclet-enstr-supported.ll"
   -Xclang -llvm-verify-each -O0 -S -emit-llvm \
   "$ROOT/test/phi/test_phi_funclet_enstr.ll" -o "$ir"
 "$LLVM_AS" "$ir" -o /dev/null
-test "$(grep -c 'call ptr @_decrypto.*\[ "funclet"(token %cp) \]' "$ir")" -eq 2
+# enstr 池化解密入口是 __vllvm_enstr_get；funclet 上下文经 operand bundle 保留。
+test "$(grep -c 'call ptr @__vllvm_enstr_get.*\[ "funclet"(token %cp) \]' "$ir")" -eq 2
 grep -q 'text.reg2mem' "$ir"
 if grep -Eq 'c"(left|right)\\00"|%text = phi ' "$ir"; then
   echo "enstr did not lower/encrypt funclet PHI" >&2; exit 1
@@ -107,7 +104,7 @@ for fixture in callbr funclet; do
     grep -q 'PHI lowering skipped' "$OUT_DIR/$fixture-$mode.log"
     grep -q ' = phi ' "$ir"
     grep -q 'c"fallback\\00"' "$ir"
-    if grep -Eq 'vllvm\.(enstr\.cache|fla\.const|vmfla\.const)|_decrypto' "$ir"; then
+    if grep -Eq 'vllvm\.(enstr\.|fla\.const|vmfla\.const)|__vllvm_enstr|_decrypto' "$ir"; then
       echo "$fixture/$mode fallback partially transformed the function/string" >&2
       exit 1
     fi
