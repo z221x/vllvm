@@ -221,6 +221,46 @@ sorting ..."、"reconstructing block ..." 等）全部消失，替代为
 （字面量、`static const char[]`）；外部可见目标保持明文（跨 TU 引用无法改写）。
 level 2（`enstr=2`）额外加密函数体内的大整数常量（密文表 + volatile 查表）。
 
+## 2026-10-12 复测：独立 BCF 新算法 + vmfla 两级等级
+
+工具链变化（其余方法与本报告一致）：独立 `FlattenFuncPass` 删除（`fla`
+标注归并进 vmfla 链路，效果等同 vmfla level 1）；`BogusControlFlowPass`
+以新算法独立重做（栈 seed + 随机运算链加密 + 单后继分支永假谓词，真实块/
+虚假块随机作虚假后继）；vmfla 收缩为两级（1=bb2func+merge+平坦化，
+2=+局部变量结构化），本轮默认 level 1（不含 lvars/BCF）。
+原始数据：`tmp/perfbench/full-v2/results.json`。
+
+### 运行时（vs base）
+
+| Pass | bzip2 | zlib | lua | sqlite | 几何平均 |
+| --- | --- | --- | --- | --- | --- |
+| fla（=vmfla L1） | 7.85x | 17.55x | ❌ | 31.33x | 16.28x |
+| bcf（新算法） | 3.01x | 4.85x | 3.75x | 2.87x | **3.54x** |
+| ibr | 5.72x | 9.52x | 8.58x | 6.56x | 7.44x |
+| icall | 3.02x | 4.96x | 4.83x | 6.19x | 4.60x |
+| vmfla | 19.34x | 17.23x | ❌ | 31.45x | 21.88x |
+| enstr | 1.09x | 1.00x | 0.98x | 1.09x | 1.04x |
+| bb2func | 2.87x | 6.52x | 4.11x | 3.24x | 3.97x |
+| merge | 2.80x | 4.16x | 1.38x | 2.73x | 2.57x |
+| vmp | 1.07x | 0.99x | 1.53x | 4.36x | 1.63x |
+| combo/combo2 | ❌ | ❌ | ❌ | ❌（combo2 sqlite 编译 >1800s 超时） | - |
+
+### 要点
+
+- **新 BCF 比旧版全局更轻**：运行时 2.9~4.9x（旧 3.7~6.0x），体积
+  几何平均 2.38x（旧 7~15x）——旧版每个命中块都复制整段 fake 分支与
+  不透明谓词全局，新版只在单后继分支前插一条密文链 + 永假比较，虚假块
+  仅含随机 junk 指令。
+- **fla 与 vmfla 数据完全一致**（体积逐字节相同），验证别名归并生效；
+  lua/fla 与 lua/vmfla 同样命中既有 `luaV_execute` 崩溃（fla 现在就是
+  vmfla 链路，两行实为同一配置）。
+- **vmfla level 1 相比旧默认（lvars 常开）**：bzip2 19.3x（旧 12.9x，
+  但旧值含 lvars 的 malloc/解密开销）、sqlite 31.5x（旧 56.3x）——
+  lvars 移出默认档后 sqlite 明显回落；bzip2 波动来自本轮 RNG 与块序
+  差异。
+- combo 组合仍失败（既有 ibr+vmfla 组合问题）；sqlite 上全 pass 叠加
+  编译超 30 分钟被超时记录，属编译开销而非正确性。
+
 ## 沿革（三轮数据对照）
 
 | 轮次 | 变化 | 结果 |
