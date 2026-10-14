@@ -45,6 +45,9 @@ CONFIGS = {
     "bb2func": ["vllvm.bb2func"],
     "merge": ["vllvm.merge"],
     "vmp": ["vllvm.vmp"],
+    # bcf 与 vmfla 叠加：调度上 bcf 作用于 bb2func+merge 之后的 wrapper，
+    # vmfla 在链路末端平坦化含虚假分支的 CFG。
+    "bcfvmfla": ["vllvm.bcf", "vllvm.vmfla"],
     "combo": ["vllvm.fla", "vllvm.bcf", "vllvm.ibr", "vllvm.icall",
               "vllvm.vmfla"],
     # icall 跨 TU 调用存在正确性缺陷，另测不含 icall 的组合
