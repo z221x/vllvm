@@ -43,5 +43,8 @@ void fixStackForFlatten(Function *F);
 CallBase *fixEH(CallBase *CB);
 void insertFreeOnFunctionExits(Function &F, Value *Ptr);
 void LowerConstantExpr(Function &F);
+// 随机调整基本块物理顺序（入口固定首位），降低反编译器按块顺序布局
+// 时的规整感。
+void shuffleFunctionBlocks(Function &F, CryptoUtils &Crypto);
 bool expandConstantExpr(Function &F);
 #endif

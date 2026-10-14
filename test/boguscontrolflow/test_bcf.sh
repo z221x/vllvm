@@ -70,3 +70,21 @@ if grep -Eq "store volatile i(16|32) [0-9-]+, ptr %vllvm\.bcf\.seed" "$OUT_DIR/b
 fi
 # 虚假块必须被至少一条永假分支引用（锚定），否则不可达块不进后端。
 grep -q "label %vllvm.bcf.fake" "$OUT_DIR/bcf.ll"
+
+# 前置处理 1：大块切割产生数字后缀碎片块（entry 的尾段）。
+grep -Eq "^entry[0-9]+:" "$OUT_DIR/bcf.ll"
+# 加密链只用 add/sub/xor，不允许出现乘法。
+if grep -Eq "mul i16 %vllvm\.bcf\.|vllvm\.bcf\.enc\.mul" "$OUT_DIR/bcf.ll"; then
+  echo "encryption chain must not use multiplication" >&2
+  exit 1
+fi
+# 前置处理 3：全块重排——虚假块不聚集在函数尾部（未重排时连续相邻）。
+FAKE_POS=($(grep -n "^vllvm\.bcf\.fake\." "$OUT_DIR/bcf.ll" | cut -d: -f1))
+ADJACENT=1
+for ((i=1; i<${#FAKE_POS[@]}; i++)); do
+  if (( FAKE_POS[i] - FAKE_POS[i-1] > 1 )); then ADJACENT=0; break; fi
+done
+if [ "$ADJACENT" = "1" ]; then
+  echo "junk blocks must be shuffled among real blocks" >&2
+  exit 1
+fi

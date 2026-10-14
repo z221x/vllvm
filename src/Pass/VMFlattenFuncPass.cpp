@@ -450,29 +450,6 @@ BasicBlock *buildDispatchTree(Function &F, BasicBlock *InsertBefore,
   return Node;
 }
 
-// 随机调整基本块物理顺序，降低反编译器按块顺序布局时的规整感。
-void shuffleFunctionBlocks(Function &F, CryptoUtils &Crypto) {
-  if (F.size() <= 2)
-    return;
-
-  SmallVector<BasicBlock *, 64> Blocks;
-  BasicBlock *Entry = &F.getEntryBlock();
-  for (BasicBlock &BB : F)
-    if (&BB != Entry)
-      Blocks.push_back(&BB);
-
-  std::default_random_engine ShuffleEngine(Crypto.getRandom32());
-  std::shuffle(Blocks.begin(), Blocks.end(), ShuffleEngine);
-
-  BasicBlock *InsertAfter = Entry;
-  for (BasicBlock *BB : Blocks) {
-    if (BB == InsertAfter)
-      continue;
-    BB->moveAfter(InsertAfter);
-    InsertAfter = BB;
-  }
-}
-
 void removeVLLVMAttributes(Function &F) {
   F.removeFnAttr("vllvm.obfuscate");
   F.removeFnAttr("vllvm.enstr");
