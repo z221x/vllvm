@@ -9,3 +9,4 @@ out
 *app/
 *android/
 tmp/
+__pycache__/
