@@ -15,8 +15,8 @@ index 2f6d4c414..ba71ae473 100644
    for (const auto &PassCallback : CodeGenOpts.PassBuilderCallbacks)
      PassCallback(PB);
 +  PB.registerPipelineStartEPCallback(
-+      [](ModulePassManager &MPM, OptimizationLevel) {
-+        llvm::vllvm::addVLLVMPasses(MPM);
++      [](ModulePassManager &MPM, OptimizationLevel Level) {
++        llvm::vllvm::addVLLVMPasses(MPM, Level);
 +      });
  #define HANDLE_EXTENSION(Ext)                                                  \
    get##Ext##PluginInfo().RegisterPassBuilderCallbacks(PB);

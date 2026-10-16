@@ -30,7 +30,7 @@ def build(stage1_dir, workdir, attrs, only_tu):
             shutil.copyfile(os.path.join(stage1, f) if False else
                             os.path.join(stage1_dir, f), ll)
         obj = os.path.join(workdir, tu + ".o")
-        r = subprocess.run([CLANG, "-isysroot", SDK, "-O2", "-g0", "-c", ll,
+        r = subprocess.run([CLANG, "-isysroot", SDK, "-O0", "-g0", "-c", ll,
                             "-o", obj], capture_output=True, text=True)
         if r.returncode != 0:
             return None, tu, r.stderr[-500:]

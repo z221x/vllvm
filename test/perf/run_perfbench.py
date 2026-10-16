@@ -6,7 +6,7 @@
      编译每个 TU 得到原始 IR（等价于源码直编时 pipeline-start 时点看到的 IR）。
   2. 用 inject_vllvm_attrs.py 在 IR 的每个 define 上注入 "vllvm.<kind>"
      函数属性（等价于源码 annotate）。
-  3. stage2: clang -O2 -g0 -c 编译注入后的 IR（VLLVM pass 在 pipeline
+  3. stage2: clang -O0 -g0 -c 编译注入后的 IR（混淆不允许开优化，VLLVM
      start 运行），链接、strip。
   4. 以基线产物为参照做正确性校验，然后计时运行负载（1 次预热 + N 次取中位）。
 
@@ -234,7 +234,7 @@ def build_config(clang, sdk, app, spec, config, attrs, lls, workdir, jobs,
         t0 = time.perf_counter()
         try:
             p = subprocess.run([clang] + sdk + config_args +
-                               ["-O2", "-g0", "-c", ll, "-o", obj],
+                               ["-O0", "-g0", "-c", ll, "-o", obj],
                                capture_output=True, text=True,
                                timeout=tu_timeout)
         except subprocess.TimeoutExpired:

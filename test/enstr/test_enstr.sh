@@ -10,7 +10,7 @@ mkdir -p "$OUT_DIR"
 args=(-Xclang -llvm-verify-each)
 if [[ $(uname -s) == Darwin ]]; then args+=(-isysroot "$(xcrun --show-sdk-path)"); fi
 # Cover direct literals and both levels of global pointer indirection.
-for opt in 0 2; do
+for opt in 0; do
   "$CLANG" "${args[@]}" -O"$opt" "$ROOT/test/enstr/test_enstr.c" \
     -o "$OUT_DIR/baseline_O$opt"
   "$CLANG" "${args[@]}" -O"$opt" -DVLLVM_TEST_ENSTR=1 \

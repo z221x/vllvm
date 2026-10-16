@@ -113,7 +113,7 @@ check_dynamic_index() {
 
 }
 
-for opt in 0 2; do
+for opt in 0; do
   base="$OUT_DIR/test_indirectbr_base_O$opt"
   transformed="$OUT_DIR/test_indirectbr_O$opt"
   ll="$OUT_DIR/test_indirectbr_O$opt.ll"

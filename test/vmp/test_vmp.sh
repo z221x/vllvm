@@ -20,7 +20,7 @@ if [ "$(uname -s)" = Darwin ] && command -v xcrun >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUT_DIR"
-for opt in 0 2; do
+for opt in 0; do
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O"$opt" "$SRC" \
     -pthread -o "$OUT_DIR/native_O$opt"
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O"$opt" -DVLLVM_TEST_VMP=1 \
@@ -78,9 +78,9 @@ done
 
 # processed 标记必须让完整 LTO 管线保持幂等，且 linkonce_odr 运行时只能
 # 合并为一份可链接实现。
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O2 -flto "$SRC" -pthread \
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -flto "$SRC" -pthread \
   -o "$OUT_DIR/native_lto"
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O2 -flto -DVLLVM_TEST_VMP=1 \
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -flto -DVLLVM_TEST_VMP=1 \
   "$SRC" -pthread -o "$OUT_DIR/vmp_lto"
 native_lto_output=$("$OUT_DIR/native_lto")
 vmp_lto_output=$("$OUT_DIR/vmp_lto")

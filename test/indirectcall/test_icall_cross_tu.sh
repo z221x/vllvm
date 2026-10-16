@@ -50,7 +50,7 @@ fn_has_crypt() {
   return 1
 }
 
-for opt in 0 2; do
+for opt in 0; do
   # 两个 TU 分开编译再链接：被调方 TU 带标注，调用方 TU 保持明文直调。
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -O$opt -g0 -S -emit-llvm \
     -fno-discard-value-names -mllvm -vllvm-config=icall=2 \

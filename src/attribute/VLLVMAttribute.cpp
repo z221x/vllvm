@@ -211,6 +211,32 @@ bool materializeAnnotationAttributes(Module &M) {
   return Changed;
 }
 
+// 模块内是否存在任何 vllvm 标注（函数或全局对象）。用于"混淆不允许
+// 与编译优化同用"的硬性检查：只探测，不物化属性。
+bool moduleHasVLLVMAnnotations(Module &M) {
+  GlobalVariable *Annotations = M.getGlobalVariable("llvm.global.annotations");
+  if (!Annotations || !Annotations->hasInitializer())
+    return false;
+
+  auto *CA = dyn_cast<ConstantArray>(Annotations->getInitializer());
+  if (!CA)
+    return false;
+
+  for (Value *Op : CA->operands()) {
+    auto *CS = dyn_cast<ConstantStruct>(Op);
+    if (!CS || CS->getNumOperands() < 2)
+      continue;
+    auto *Target = dyn_cast<Constant>(CS->getOperand(0));
+    GlobalVariable *TextGV = getStringGlobal(dyn_cast<Constant>(CS->getOperand(1)));
+    StringRef Text = getGlobalString(TextGV);
+    if (!Target || Text.empty())
+      continue;
+    if (parseOptionList(Text).any())
+      return true;
+  }
+  return false;
+}
+
 bool hasVLLVMAttribute(Function &F, StringRef Kind) {
   Kind = normalizeKind(Kind);
 

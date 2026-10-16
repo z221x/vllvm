@@ -99,7 +99,7 @@ grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
 
 # Verify intermediate IR with debug info: the generated wrapper must not share
 # the moved body's DISubprogram or contain an inlinable call without a location.
-for opt in 0 2; do
+for opt in 0; do
   "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g -O"$opt" -S -emit-llvm \
     ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
     -o "$OUT_DIR/test_lvars_debug_O$opt.ll"

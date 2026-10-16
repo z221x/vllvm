@@ -245,7 +245,7 @@ def build_pair(project, tu_name, fn, driver_key, runs, cflags, workdir):
                                capture_output=True, text=True)
             assert r.returncode == 0, r.stderr
         obj = os.path.join(workdir, name + ".o")
-        r = subprocess.run([CLANG, "-isysroot", SDK, "-O2", "-g0", "-c",
+        r = subprocess.run([CLANG, "-isysroot", SDK, "-O0", "-g0", "-c",
                             src_ll, "-o", obj],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stderr[-500:]
@@ -268,7 +268,7 @@ def build_pair(project, tu_name, fn, driver_key, runs, cflags, workdir):
                                    os.path.splitext(tu_name)[0] + ".o")
             src_ll = os.path.join(
                 stage1, os.path.splitext(tu_name)[0] + ".ll")
-            r = subprocess.run([CLANG, "-isysroot", SDK, "-O2", "-g0", "-c",
+            r = subprocess.run([CLANG, "-isysroot", SDK, "-O0", "-g0", "-c",
                                 src_ll, "-o", tu_base],
                                capture_output=True, text=True)
             assert r.returncode == 0, r.stderr[-500:]

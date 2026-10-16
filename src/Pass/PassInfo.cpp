@@ -33,8 +33,22 @@ void protectFromLaterOptimization(Function &F) {
 }
 
 class VLLVMAnnotationPass : public PassInfoMixin<VLLVMAnnotationPass> {
+  bool OptEnabled;
+
 public:
+  VLLVMAnnotationPass(bool OptEnabled) : OptEnabled(OptEnabled) {}
+
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &) {
+    // 混淆不允许与编译优化同用：优化管线（IPSCCP/GlobalOpt 等）会把
+    // 混淆形态改回可直接分析的形态（表参数折叠回全局、常量传播等），
+    // 因此检测到 vllvm 标注且优化级别高于 -O0 时直接报错，拒绝产出
+    // 形态失真的混淆二进制。无标注的普通编译不受影响。
+    if (OptEnabled && moduleHasVLLVMAnnotations(M)) {
+      M.getContext().emitError(
+          "vllvm obfuscation cannot be combined with optimization: rebuild "
+          "the annotated translation unit with -O0");
+      return PreservedAnalyses::all();
+    }
     return materializeAnnotationAttributes(M) ? PreservedAnalyses::none()
                                               : PreservedAnalyses::all();
   }
@@ -144,8 +158,8 @@ public:
 };
 } // namespace
 
-void addVLLVMPasses(ModulePassManager &MPM) {
-  MPM.addPass(VLLVMAnnotationPass());
+void addVLLVMPasses(ModulePassManager &MPM, OptimizationLevel Level) {
+  MPM.addPass(VLLVMAnnotationPass(/*OptEnabled=*/Level.getSpeedupLevel() > 0));
   MPM.addPass(VLLVMEncryptoStrDispatchPass());
   // icall 需要先看完整 Module，统一去重、随机注册所有内部调用目标。
   MPM.addPass(IndirectCallPass());

@@ -9,6 +9,7 @@
 namespace llvm::vllvm {
 
 bool materializeAnnotationAttributes(Module &M);
+bool moduleHasVLLVMAnnotations(Module &M);
 bool hasVLLVMAttribute(Function &F, StringRef Kind);
 VLLVMOptions getFunctionVLLVMOptions(Function &F);
 bool moduleRequestsStringEncryption(Module &M);
