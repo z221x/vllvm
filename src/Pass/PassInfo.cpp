@@ -91,9 +91,10 @@ public:
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };
 
     if (FunctionOptions.VMFlattenFunc) {
-      // vmfla 链路改为 bb2func + merge + vmfla：这里先切出 helper 并打
-      // merge 标记，vmfla 延迟到模块级 MergePass 之后执行。
-      RunPass(BB2FuncPass(/*ChainToMerge=*/true));
+      // vmfla 链路当前只保留平坦化本体：不再先切 bb2func helper + merge
+      // 融合，直接挂 pending 延迟执行。bb2func/merge 作为保留方案仍可
+      // 通过独立标注 vllvm:bb2func / vllvm:merge 使用；恢复链路时在此处
+      // 加回 RunPass(BB2FuncPass(/*ChainToMerge=*/true))。
       F.addFnAttr(VmFlattenPendingAttr);
       FunctionOptions.VMFlattenFunc = false;
     }

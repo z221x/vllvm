@@ -393,61 +393,86 @@ Instruction *getInsertionPointForUse(Use &U) {
 
 // vmfla 模式下不再有共享 BCF；保留的常量表访问都来自 flatten/lvars。
 
-// 给 dispatch 树选择带随机扰动的切分点，避免每次都形成完全平衡的固定形态。
-unsigned chooseDispatchSplit(unsigned Begin, unsigned End, CryptoUtils &Crypto) {
-  unsigned Count = End - Begin;
-  if (Count <= 2)
-    return Begin + 1;
-
-  unsigned Base = Count / 2;
-  unsigned Window = std::max(1U, Count / 4);
-  unsigned Jitter = Crypto.getRandom32() % (Window * 2 + 1);
-  int SignedSplit = static_cast<int>(Begin + Base) +
-                    static_cast<int>(Jitter) - static_cast<int>(Window);
-  unsigned Split = static_cast<unsigned>(
-      std::clamp(SignedSplit, static_cast<int>(Begin + 1),
-                 static_cast<int>(End - 1)));
-  return Split;
-}
-
-// 将 flatten 的线性 case 链改成随机切分的二叉路由树，避免 CFG 被排成规则阶梯。
-BasicBlock *buildDispatchTree(Function &F, BasicBlock *InsertBefore,
-                              Value *StateTableIndex, Value *CaseValue,
-                              Type *Int32Ty, const FlattenPlan &Plan,
-                              SharedConstTable &ConstTable, unsigned Begin,
-                              unsigned End, BasicBlock *DefaultBB,
-                              CryptoUtils &Crypto) {
+// 两级分桶路由：状态 ordinal 旋转分桶 + 桶内等值比较链。
+// 原二叉树对状态下标整树二分，深度 log2(N)（luaV_execute 820 case 约
+// 10 级），且遍历路径随 case 序列随机变化——分支预测失败是 dispatcher
+// 的主要运行时开销。分桶后桶选择是 (ordinal+随机旋转)&mask 的纯运算 +
+// switch，后端对小 switch（实测 <=8 项）会退化成比较链而非跳转表，
+// 因此桶数下限取 16 并按 ordinal 轮转分配保证 100% 密度，N>=16 时必然
+// 生成跳转表（单个间接跳转，热点转移可被 BTB 学习）；桶均 ~4 个成员的
+// 等值链期望只走 2~3 级比较。混淆形态不弱化：旋转量与桶映射逐构建随机，
+// 桶内成员匹配仍是加密值比较，状态与块的映射依旧不可静态还原。
+BasicBlock *buildBucketDispatch(Function &F, BasicBlock *InsertBefore,
+                                Value *CaseValue, Value *StateOrdinal,
+                                Type *Int32Ty, const FlattenPlan &Plan,
+                                SharedConstTable &ConstTable,
+                                BasicBlock *DefaultBB, CryptoUtils &Crypto,
+                                SmallPtrSetImpl<BasicBlock *> &Generated) {
   LLVMContext &Ctx = F.getContext();
-  BasicBlock *Node = BasicBlock::Create(
-      Ctx, End - Begin == 1 ? "caseDispatch" : "caseRoute", &F, InsertBefore);
-  IRBuilder<> IRB(Node);
+  unsigned CaseCount = Plan.FlattenBBs.size();
+  // 桶号旋转量：逐构建随机，运行时与 switch case 值保持同一双射。
+  unsigned Rotation = Crypto.getRandom32();
 
-  if (End - Begin == 1) {
-    Value *CaseConst =
-        ConstTable.load(IRB, Plan.CaseConstIndexes[Begin], "loadCaseConst");
-    Value *CaseMatch = IRB.CreateICmpEQ(CaseValue, CaseConst, "caseConstMatch");
-    IRB.CreateCondBr(CaseMatch, Plan.FlattenBBs[Begin], DefaultBB);
-    return Node;
+  // 桶数取 >= CaseCount/4 的最小 2 的幂；N>=16 时下限 16，保证后端
+  // 走跳转表而不是比较链。
+  unsigned BucketCount = 4;
+  while (BucketCount < CaseCount / 4 && BucketCount < 4096)
+    BucketCount <<= 1;
+  if (CaseCount >= 16)
+    BucketCount = std::max(BucketCount, 16u);
+  unsigned BucketMask = BucketCount - 1;
+
+  // 桶归属按 ordinal 轮转（i % BucketCount）：N>=BucketCount 时每个桶
+  // 都非空，switch 全密度。
+  SmallVector<SmallVector<unsigned, 4>> Buckets(BucketCount);
+  for (unsigned I = 0; I < CaseCount; ++I)
+    Buckets[I % BucketCount].push_back(I);
+
+  SmallVector<BasicBlock *, 16> BucketHeads(BucketCount, nullptr);
+  for (unsigned B = 0; B < BucketCount; ++B) {
+    if (Buckets[B].empty())
+      continue;
+
+    // 桶内成员顺序打乱，链头不集中在低 ordinal。
+    std::shuffle(Buckets[B].begin(), Buckets[B].end(),
+                 std::default_random_engine(Crypto.getRandom32()));
+
+    // 逆序生成比较链：每块匹配则进 case，否则落到下一成员，链尾回
+    // DefaultBB。
+    BasicBlock *NextTarget = DefaultBB;
+    for (unsigned K = Buckets[B].size(); K-- > 0;) {
+      unsigned CaseNo = Buckets[B][K];
+      BasicBlock *Chain = BasicBlock::Create(Ctx, "bucketChain", &F,
+                                             InsertBefore);
+      Generated.insert(Chain);
+      IRBuilder<> CB(Chain);
+      Value *MemberConst = ConstTable.load(
+          CB, Plan.CaseConstIndexes[CaseNo], "loadMemberConst");
+      Value *Match = CB.CreateICmpEQ(CaseValue, MemberConst, "bucketMatch");
+      CB.CreateCondBr(Match, Plan.FlattenBBs[CaseNo], NextTarget);
+      NextTarget = Chain;
+    }
+    BucketHeads[B] = NextTarget;
   }
 
-  unsigned Split = chooseDispatchSplit(Begin, End, Crypto);
-  BasicBlock *Left = buildDispatchTree(F, InsertBefore, StateTableIndex,
-                                       CaseValue, Int32Ty, Plan, ConstTable,
-                                       Begin, Split, DefaultBB, Crypto);
-  BasicBlock *Right = buildDispatchTree(F, InsertBefore, StateTableIndex,
-                                        CaseValue, Int32Ty, Plan, ConstTable,
-                                        Split, End, DefaultBB, Crypto);
-  Value *Threshold = ConstantInt::get(Int32Ty, Plan.CaseConstIndexes[Split]);
-  if (Crypto.getRandom32() & 1) {
-    Value *GoLeft =
-        IRB.CreateICmpULT(StateTableIndex, Threshold, "dispatch.left");
-    IRB.CreateCondBr(GoLeft, Left, Right);
-  } else {
-    Value *GoRight =
-        IRB.CreateICmpUGE(StateTableIndex, Threshold, "dispatch.right");
-    IRB.CreateCondBr(GoRight, Right, Left);
-  }
-  return Node;
+  BasicBlock *Head =
+      BasicBlock::Create(Ctx, "bucketDispatch", &F, InsertBefore);
+  Generated.insert(Head);
+  IRBuilder<> IRB(Head);
+  auto *I32Ty = cast<IntegerType>(Int32Ty);
+  // 桶号 = (ordinal + 随机旋转) & mask：模 2^k 上的双射，桶序与 ordinal
+  // 序脱钩。
+  Value *Rotated = IRB.CreateAdd(
+      StateOrdinal, ConstantInt::get(I32Ty, Rotation), "bucketRotate");
+  Value *BucketIdx =
+      IRB.CreateAnd(Rotated, ConstantInt::get(I32Ty, BucketMask), "bucketIdx");
+  SwitchInst *Sw = IRB.CreateSwitch(BucketIdx, DefaultBB, BucketCount);
+  for (unsigned B = 0; B < BucketCount; ++B)
+    if (BucketHeads[B])
+      Sw->addCase(
+          ConstantInt::get(I32Ty, (B + Rotation) & BucketMask),
+          BucketHeads[B]);
+  return Head;
 }
 
 void removeVLLVMAttributes(Function &F) {
@@ -579,9 +604,17 @@ Function *moveBodyToTableParamImpl(Function &F, SharedConstTable &ConstTable) {
     Args.push_back(&Arg);
   Args.push_back(ConstTable.getGlobal());
 
-  // 带 volatile 守卫的伪调用点：阻止 -O2 过程间常量传播把表参数折叠
-  // 回全局引用。
-  buildGuardedImplCall(F, *Impl, Args, ConstTable.getGlobal());
+  // 直连调用点（伪调用点方案已移除）。取舍：单调用点固定传入表全局时，
+  // -O2 的 IPSCCP/GlobalOpt 可能把 impl 的表参数折叠回全局引用（删参），
+  // 表参数化的反编译形态随之弱化；语义不受影响。
+  BasicBlock *Entry = BasicBlock::Create(Ctx, "entry", &F);
+  IRBuilder<> EB(Entry);
+  CallInst *Call = EB.CreateCall(Impl, Args);
+  Call->setCallingConv(Impl->getCallingConv());
+  if (Impl->getReturnType()->isVoidTy())
+    EB.CreateRetVoid();
+  else
+    EB.CreateRet(Call);
 
   removeVLLVMAttributes(F);
 
@@ -701,10 +734,17 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
 
   IRB.SetInsertPoint(SwitchDispatchEntry);
   Value *CaseValue = ConstTable.load(IRB, StateTableIndex, "loadCaseValue");
-  // 从 dispatcher 进入随机路由树，而不是顺序扫描每一个 case。
-  BasicBlock *DispatchRoot = buildDispatchTree(
-      F, SwDefault, StateTableIndex, CaseValue, Int32Ty, Plan, ConstTable, 0,
-      Plan.FlattenBBs.size(), SwDefault, Crypto);
+  // 调度器自身生成块的集合：区分从 dispatch 结构进入 case 的合法边与
+  // indirectbr/孤岛块的非常规直连边。
+  SmallPtrSet<BasicBlock *, 32> DispatchBlocks;
+  DispatchBlocks.insert(SwitchLoopEntry);
+  DispatchBlocks.insert(SwitchDispatchEntry);
+  DispatchBlocks.insert(SwitchLoopEnd);
+  DispatchBlocks.insert(SwDefault);
+  // 从 dispatcher 进入旋转分桶 + 桶内比较链的路由结构。
+  BasicBlock *DispatchRoot =
+      buildBucketDispatch(F, SwDefault, CaseValue, StateOrdinal, Int32Ty,
+                          Plan, ConstTable, SwDefault, Crypto, DispatchBlocks);
   IRB.CreateBr(DispatchRoot);
 
   for (BasicBlock *BB : Plan.FlattenBBs)
@@ -805,9 +845,33 @@ bool applyFlatten(Function &F, FunctionAnalysisManager &FAM,
     }
   }
 
+  // 状态更新是"当前下标 + 常量增量"的相对编码，依赖不变式"进入 case 时
+  // 运行时下标 == 该 case 的表下标"。indirectbr（computed goto，如解释器
+  // dispatch 表）与孤岛块到 case 的直连边绕过 dispatcher，运行时下标仍是
+  // 旧值，增量算出错误状态：dispatcher 按 case 值匹配失败落入死循环，或
+  // 恰好命中错误 case。在仍有非常规前驱的 case 头部写回自身下标重建
+  // 不变式；lvars 的 loadConstViaFlattenIndex 锚定读取同样依赖它。
+  for (unsigned BBNo = 0; BBNo < Plan.FlattenBBs.size(); ++BBNo) {
+    BasicBlock *BB = Plan.FlattenBBs[BBNo];
+    bool HasIrregularPred = false;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (!DispatchBlocks.count(Pred)) {
+        HasIrregularPred = true;
+        break;
+      }
+    }
+    if (!HasIrregularPred)
+      continue;
+
+    IRBuilder<> HeadIRB(BB, BB->getFirstInsertionPt());
+    storeFlattenRuntimeIndex(
+        HeadIRB, SwitchVar,
+        ConstantInt::get(Int32Ty, Plan.CaseConstIndexes[BBNo]));
+  }
+
   fixStackForFlatten(&F);
-  LowerSwitchPass LowerSwitch;
-  LowerSwitch.run(F, FAM);
+  // 注意：此处不能再跑 LowerSwitch——用户的 switch 已在 planFlatten 入口
+  // 统一降级，再跑会把分桶路由的 switch 展开回比较树，跳转表失效。
   return true;
 }
 

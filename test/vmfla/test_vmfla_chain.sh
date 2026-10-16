@@ -42,21 +42,25 @@ fi
 
 LL="$OUT_DIR/test_vmfla_chain.ll"
 
-# 断言第一段：bb2func 提取的 helper 存在（noinline 在 attribute group 中）。
-grep -Eq 'define internal[^@]*@vllvm\.bb2f\.' "$LL"
-grep -Eq '^attributes #[0-9]+ = \{[^}]*noinline' "$LL"
+# 断言第一段：vmfla 链路当前只跑平坦化本体，不接 bb2func/merge 前段
+# （两 pass 作为保留方案独立标注使用），产物中不得出现两者的痕迹。
+if grep -Eq '@vllvm\.bb2f\.|@vllvm\.merge\.' "$LL"; then
+  echo "vmfla chain must not emit bb2func/merge artifacts" >&2
+  exit 1
+fi
 
-# 断言第二段：merge dispatcher 存在；vmfla 不再内嵌间接调用，
-# 调用点保持对 dispatcher 的直接调用。
-grep -Eq 'define internal[^@]*@vllvm\.merge\.' "$LL"
-grep -Eq 'call [^@]*@vllvm\.merge\.' "$LL"
+# 断言第二段：vmfla 常量表和 impl 拆分仍在，wrapper 是直连调用点
+# （无伪调用守卫）。
+grep -q 'vllvm\.vmfla\.const\.table' "$LL"
+grep -Eq 'define [^@]*@[A-Za-z0-9_]+\.vllvm\.impl\(' "$LL"
+grep -Eq 'call [^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*vllvm\.vmfla\.const\.table' "$LL"
+if grep -q "vllvm.tablesink" "$LL"; then
+  echo "vmfla entry must be a single direct call" >&2
+  exit 1
+fi
 if grep -q 'func_table' "$LL"; then
   echo "vmfla chain must not emit a func_table" >&2
   exit 1
 fi
-
-# 断言第三段：vmfla 常量表和 impl 拆分仍在，说明 vmfla 在链路末尾执行。
-grep -q 'vllvm\.vmfla\.const\.table' "$LL"
-grep -q 'vllvm\.impl' "$LL"
 
 echo "test_vmfla_chain passed"

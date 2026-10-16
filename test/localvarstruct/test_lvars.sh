@@ -65,7 +65,7 @@ grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
 # 结构化结构体类型名是结构化生效的直接证据。
 grep -q "vllvm.localvars\." "$OUT_DIR/test_lvars.ll"
 
-# 常量表改为参数传递：impl 带表参数，wrapper 经守卫伪调用点传表；
+# 常量表改为参数传递：impl 带表参数，wrapper 调用时传表全局；
 # 表全局不允许再被解密访问模式直接引用。
 grep -Eq 'define private [^@]*@[A-Za-z0-9_]+\.vllvm\.impl\([^)]*ptr %' \
   "$OUT_DIR/test_lvars.ll"
@@ -76,12 +76,6 @@ if grep -Eq '(getelementptr \[[0-9]+ x i32\], ptr|load volatile i32, ptr) @vllvm
   echo "vmfla constant table must be passed as a parameter, not GEP-referenced" >&2
   exit 1
 fi
-
-# 防传播伪调用点：volatile 守卫全局 + 偏移表指针的第二调用点必须存在
-# （伪调用点块名不保留在输出 IR 中，用偏移 GEP 特征断言）。
-grep -q "vllvm.tablesink" "$OUT_DIR/test_lvars.ll"
-grep -Eq 'getelementptr .i8, ptr @vllvm\.[A-Za-z0-9_.]+, i64' \
-  "$OUT_DIR/test_lvars.ll"
 
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
   -o "$OUT_DIR/test_lvars_base"
