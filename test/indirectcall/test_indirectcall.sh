@@ -49,13 +49,9 @@ grep -q "create_func_pool" "$OUT_DIR/icall.ll"
 grep -Eq "i32 0, ptr @__vllvm_icall\..*\.register_funcs" "$OUT_DIR/icall.ll"
 
 # —— level 1（默认）：仅专属跳板间接化（icallcc/nest/w19/ret x19 查表），
-# 不启用参数加密与诱饵假下标。
+# 不启用参数加密。
 if grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"; then
   echo "level 1 must not enable argument encryption" >&2
-  exit 1
-fi
-if grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall.ll"; then
-  echo "level 1 must not enable decoy fake logic" >&2
   exit 1
 fi
 if grep -Eq "call [^@]*@(add_bias|mix_double|sum_nine|ptr_mix|quad_shift)\(" "$OUT_DIR/icall.ll"; then
@@ -69,12 +65,16 @@ if [ "$REGISTER_CALLS" -ne 5 ]; then
   exit 1
 fi
 
-# —— level 2：参数加密（仅 add/sub/xor）+ fake 诱饵下标 + 入口左值解密。
+# —— level 2：参数加密（仅 add/sub/xor）+ 入口左值解密。
 "$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -emit-llvm -fno-discard-value-names \
   -mllvm -vllvm-config=icall=2 \
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall_l2.ll"
 grep -q "vllvm.icall.crypt" "$OUT_DIR/icall_l2.ll"
-grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall_l2.ll"
+# decoy 诱饵下标机制已移除，任何等级都不得再生成。
+if grep -Eq '__vllvm_icall.[0-9a-fA-F]+.decoy' "$OUT_DIR/icall_l2.ll"; then
+  echo "decoy fake logic must stay removed" >&2
+  exit 1
+fi
 # 加密常量在跳板汇编里经字面池读入（asm printer 把 =imm 物化为 Ltmp）。
 "$VLLVM_CLANG" "${TARGET_ARGS[@]}" -O0 -S -mllvm -vllvm-config=icall=2 \
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall_l2.s"

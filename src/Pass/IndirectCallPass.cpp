@@ -52,9 +52,6 @@ struct ICallRuntime {
   Function *RegisterFunc = nullptr;
   // 跳板 naked 汇编查表的池数据全局（ptr -> groups）。
   GlobalVariable *PoolData = nullptr;
-  // level 2 诱饵下标缓冲：调用点额外写入一条过加密链的假下标，
-  // 让真实 nest 下标淹没在同构噪声里。
-  GlobalVariable *Decoy = nullptr;
 };
 
 // —— 参数加密：每个改写调用点有专属跳板函数（签名与被调函数一致），
@@ -324,8 +321,7 @@ Function *createRegisterFunction(Module &M, StringRef Name,
 }
 
 ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
-                           uint32_t GroupLength, StringRef Suffix,
-                           bool WithDecoy) {
+                           uint32_t GroupLength, StringRef Suffix) {
   LLVMContext &Ctx = M.getContext();
   Type *I32Ty = Type::getInt32Ty(Ctx);
   Type *PtrTy = PointerType::getUnqual(Ctx);
@@ -370,12 +366,6 @@ ICallRuntime createRuntime(Module &M, uint32_t GroupCount,
   Runtime.RegisterFunc = createRegisterFunction(
       M, Prefix + ".register_func", GroupTy, GroupsTy, Groups);
   Runtime.PoolData = PoolData;
-  if (WithDecoy) {
-    Runtime.Decoy = new GlobalVariable(
-        M, I32Ty, false, GlobalValue::InternalLinkage, Zero,
-        Prefix + ".decoy");
-    appendToCompilerUsed(M, {Runtime.Decoy});
-  }
   return Runtime;
 }
 
@@ -438,42 +428,12 @@ getPooledIndex(CallInst &Call, const DenseMap<Function *, uint32_t> &Pool) {
   return It == Pool.end() ? nullptr : &It->second;
 }
 
-// 按生成顺序应用加密链（仅 add/sub/xor）：诱饵下标与历史参数链共用。
-Value *emitCryptForward(IRBuilder<> &B, Value *V, ArrayRef<CryptOp> Ops) {
-  for (const CryptOp &Op : Ops) {
-    Constant *Cst = ConstantInt::get(V->getType(), Op.C);
-    switch (Op.K) {
-    case CryptOp::Add:
-      V = B.CreateAdd(V, Cst, "vllvm.icall.decoy.crypt");
-      break;
-    case CryptOp::Sub:
-      V = B.CreateSub(V, Cst, "vllvm.icall.decoy.crypt");
-      break;
-    case CryptOp::Xor:
-      V = B.CreateXor(V, Cst, "vllvm.icall.decoy.crypt");
-      break;
-    }
-  }
-  return V;
-}
-
-void rewriteCall(Function &Trampoline, const ICallRuntime &Runtime,
-                 uint32_t PackedIndex, CallInst *OldCall,
-                 ArrayRef<CryptOp> DecoyOps, uint32_t DecoyBase) {
+void rewriteCall(Function &Trampoline, uint32_t PackedIndex, CallInst *OldCall) {
   // 调用点退化为对专属跳板的直调：明文实参、无加密运算，调用者函数体
   // 保持干净。调用号（group_id<<16|index）作为调用点常量经尾部 i32 nest
   // 参数送入 w19（icallcc 约定），跳板据此解码查表。调用约定 icallcc：
   // 参数/返回沿用标准 ABI 位置，后端 CSR 掩码把 x19 视为调用方保存。
   IRBuilder<> B(OldCall);
-  // fake 逻辑：先写一条与真实下标同宽、同样过可逆链的诱饵下标，
-  // 基值独立随机，静态分析难以区分哪条运算链真正汇入 nest 参数。
-  if (Runtime.Decoy && !DecoyOps.empty()) {
-    Value *Decoy = ConstantInt::get(
-        Type::getInt32Ty(OldCall->getContext()), DecoyBase);
-    Decoy = emitCryptForward(B, Decoy, DecoyOps);
-    StoreInst *Store = B.CreateStore(Decoy, Runtime.Decoy);
-    Store->setVolatile(true);
-  }
 
   // 参与加密的参数先过正向运算链，再送进 icallcc 跳板。
   SmallVector<Value *, 8> Args;
@@ -591,8 +551,7 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
                                         ModuleAnalysisManager &MAM) {
   (void)MAM;
   llvm::vllvm::VLLVMConfig &Config = llvm::vllvm::VLLVMConfig::get();
-  // icall 等级（Pass 自定语义）：1=只间接调用；2=再混入参数加密与
-  // fake 诱饵下标逻辑。
+  // icall 等级（Pass 自定语义）：1=只间接调用；2=再混入参数加密。
   Config.registerPassLevels("icall", 1, 2);
   unsigned Level = Config.getLevel("icall");
   if (Level == 0)
@@ -672,20 +631,7 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
   }
 
   ICallRuntime Runtime =
-      createRuntime(M, GroupCount, GroupLength, Suffix, UseCrypt);
-  // 诱饵运算链整模块共享一条（仅 add/sub/xor），基值逐调用点随机。
-  SmallVector<CryptOp, 4> DecoyOps;
-  if (UseCrypt) {
-    std::uniform_int_distribution<unsigned> PickKind(0, 2);
-    std::uniform_int_distribution<uint64_t> PickConst(0, ~0ULL);
-    for (unsigned I = 0, E = 2 + PickKind(Engine) % 3; I < E; ++I) {
-      CryptOp Op;
-      Op.K = static_cast<CryptOp::Kind>(PickKind(Engine));
-      Op.C = PickConst(Engine);
-      DecoyOps.push_back(Op);
-    }
-  }
-  std::uniform_int_distribution<uint32_t> PickDecoyBase(0, ~0u);
+      createRuntime(M, GroupCount, GroupLength, Suffix);
   // 第三步：在 init_array 中注册所有目标，池槽直接登记原函数地址。
   createRegistrationCtor(M, Runtime, Targets, Locations, GroupCount,
                          GroupLength, Suffix);
@@ -726,8 +672,7 @@ PreservedAnalyses IndirectCallPass::run(Module &M,
           It == CryptPlans.end() ? ArrayRef<ArgCryptPlan>()
                                  : ArrayRef(It->second),
           Runtime.PoolData, Suffix, SiteCounter++);
-      rewriteCall(*Tramp, Runtime, P.Packed, P.Call, DecoyOps,
-                  PickDecoyBase(Engine));
+      rewriteCall(*Tramp, P.Packed, P.Call);
     }
   }
 

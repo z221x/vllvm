@@ -72,13 +72,12 @@ BogusControlFlowPass 保持独立（栈 seed 新算法），`vllvm:bcf` 单独�
   level 1=字符串入池；level 2=再把作用域内标量整数常量（|v|≥256）
   换成 `trunc(volatile load 密文表 ^ K)`。
 - icall：level 1=只做池化间接调用（icallcc 跳板）；level 2=目标入口/
-  调用点再加可逆参数加密链，且每个调用点写入一条独立随机的
-  **fake 诱饵下标**（过同构运算链后 volatile 存入 decoy 全局，
-  干扰 nest 下标分析）。
+  调用点再加可逆参数加密链（2026-10 移除 decoy 诱饵下标机制）。
 - 测试：`test/config/test_config.sh` 覆盖 vmfla 0/1/2 档（lvars 逐级
   开启）与 bcf 独立等级、运行结果一致、钳制与非法片段告警；`test_enstr*.sh`
   覆盖池形态、下标访问、并发冷启动、OOM trap、i386/aarch64 交叉目标；
-  `test_indirectcall.sh` 分别断言 level 1 无 crypt/decoy、level 2 皆有。
+  `test_indirectcall.sh` 分别断言 level 1 无 crypt、level 2 有 crypt，
+  且任何等级不再生成 decoy。
 
 ## 四、构建与测试状态（Windows x64 实测，2026-09-28）
 
