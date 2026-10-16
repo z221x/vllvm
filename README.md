@@ -20,24 +20,23 @@ VLLVM 将 OLLVM 风格和实验性 VMP 混淆 Pass 集成进 LLVM/Clang 源码�
 
 ## vmfla 链路
 
-`vllvm:vmfla` 不再单独执行平坦化，而是按固定顺序运行三段：
+`vllvm:vmfla` 当前只执行**平坦化本体**：
 
 ```text
-bb2func（切出 helper 并打 merge 标记） -> merge（helper 融进 keyed dispatcher） -> vmfla（平坦化）
+vmfla（入口直连 wrapper -> 带 table 参数的私有 impl -> 分桶 dispatcher 状态机）
 ```
 
-前两段在第一段函数级处理里把原函数打散成若干 helper 并融合进分发器，
-原函数的调用点变为携带 key 常量的 dispatcher 调用；vmfla 在模块级
-MergePass 之后的第二段函数级处理里执行，对包含 dispatcher 调用的函数做
-最终平坦化（调用点保持直接调用，不做间接化）。单独标注
-`vllvm:bb2func` 只执行提取，单独标注 `vllvm:merge` 只把该函数并入共享
-dispatcher 组。bb2func/merge 遇到 EH、动态栈状态、musttail、自定义调用
-约定等不支持场景时保持原函数不变。
+bb2func 与 merge 两段已从链路中摘除，作为**保留方案**仍可独立标注
+使用：`vllvm:bb2func` 只做基本块提取，`vllvm:merge` 只把函数并入共享
+keyed dispatcher 组；恢复完整链路（提取 -> 融合 -> 平坦化）时在
+`src/Pass/PassInfo.cpp` 的 vmfla 分支加回 `BB2FuncPass(ChainToMerge)`。
+两者遇到 EH、动态栈状态、musttail、自定义调用约定等不支持场景时保持
+原函数不变。
 
 等级语义（`-mllvm -vllvm-config=vmfla=<n>`，默认 1）：
 
-- 0：整条链路（含 bb2func/merge）全局关闭。
-- 1：bb2func + merge + 平坦化混淆。
+- 0：vmfla 全局关闭。
+- 1：平坦化混淆。
 - 2：再开启局部变量结构化（lvars）。
 
 ## 构建依赖
@@ -81,9 +80,68 @@ Windows：
 
 如果本地没有 `llvm-project-21.1.0/`，不要设置 `NO_CLONE=1`，脚本会尝试自动 clone 对应 LLVM tag。
 
+## 推荐用法：-O0 编译 + 混淆
+
+项目的确定用法是**不开编译优化**（`-O0`）编译混淆目标，且已做成编译器
+硬性约束：模块内存在任何 `vllvm:` 标注而优化级别高于 -O0 时，编译直接
+报错并拒绝产出二进制（管线起点检查；无标注的普通 -O1/-O2 编译不受
+影响）。所有 VLLVM pass 以 `isRequired()` 挂在管线里，`-O0` 下照常执行，
+无需额外开关；测试套件全部按 `-O0` 口径运行。
+
+源码标注（精确到函数，逗号分隔可叠加）：
+
+```c
+__attribute__((annotate("vllvm:vmfla,bcf")))
+static unsigned crypto_core(unsigned x) { /* ... */ }
+```
+
+编译与链接：
+
+```bash
+# 编译：-O0 -g0（-g0 去掉调试信息，混淆产物不携带源码行号）
+./build/llvm-macos/bin/clang -O0 -g0 -c secret.c -o secret.o
+
+# 等级配置法（整个标记类别调强度，可省去逐函数标注）：
+./build/llvm-macos/bin/clang -O0 -g0 -mllvm -vllvm-config=vmfla=2 \
+    -c secret.c -o secret.o
+
+# 链接后 strip 掉符号（-O0 会保留 static 函数名于符号表）
+./build/llvm-macos/bin/clang -O0 -g0 *.o -o app && strip app
+```
+
+为什么禁止 `-O1/-O2`：
+
+- 过程间常量传播（IPSCCP/GlobalOpt）会把混淆形态改回去——例如 vmfla
+  的常量表参数被折叠回固定全局引用，反编译视图重新拿到表地址。与其
+  产出形态失真的混淆二进制，不如在编译期拒绝。
+- 实测混淆产物在 `-O2` 下几乎没有额外提速（±30%，产物本身已是
+  reg2mem + volatile 的低可优化形态），优化收益极小而形态变差。
+- 同级（-O0）基线的函数级开销参考：AES-128-CBC / MD5 / SHA-256 标注
+  顶层函数时 vmfla 约 1.7x / 5.3x / 1.8x，bcf+vmfla 约 12.9x /
+  11.8x / 7.4x，数据与口径见 `docs/PASS_PERF_REPORT.md`。
+
 ## 测试
 
-构建完成后运行对应 shell 测试。常用回归入口：
+标准测试流程见 `docs/TEST_PROCESS.md`（分层：约束检查 → 回归 →
+算法基准 → 应用基准 → 手动重型），提交前各层必须全绿。
+
+算法基准覆盖 AES/DES/SM4/RC4/MD5/SHA-256/CRC32：
+
+```bash
+python3 test/perf/algo_fn_bench.py --runs 3
+```
+
+应用基准覆盖 zlib/bzip2/lua/sqlite 与 CPython：
+
+```bash
+python3 test/perf/run_perfbench.py --apps zlib,bzip2,lua,sqlite \
+    --configs base,vmfla,bcfvmfla --runs 6
+python3 test/perf/run_python_bench.py --runs 6
+```
+
+Firefox 为手动重型层（mach/Rust 工具链，流程见 `docs/TEST_PROCESS.md`）。
+
+构建完成后运行对应 shell 回归测试。常用入口：
 
 ```bash
 ./test/enstr/test_enstr.sh

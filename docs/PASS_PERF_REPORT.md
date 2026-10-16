@@ -11,10 +11,10 @@
 
 | 维度 | 结论 |
 | --- | --- |
-| 运行时开销 | `enstr` ≈ **1.0x**（近零）；`merge` **1.4~4.3x**；`bb2func` **2.8~6.1x**；`bcf` **3.7~6.0x**；`icall` **2.8~6.5x**（L1/L2 持平）；`ibr` **5.4~8.8x**；`fla` **13.2~30.3x**；`vmfla` **12.9~56.3x**（最重） |
-| 二进制体积 | `bcf`/`vmfla` 最大（**7~15x**）；`fla`/`ibr` 约 **3~5x**；`icall` **1.4~2.1x**；`enstr`/`vmp` ≈ 1.0~1.4x |
+| 运行时开销 | `enstr` ≈ **1.0x**（近零）；`merge` **1.4~4.3x**；`bb2func` **2.8~6.1x**；`bcf` **3.7~6.0x**；`icall` **2.8~6.5x**（L1/L2 持平）；`ibr` **5.4~8.8x**；`fla` **13.2~30.3x**；`vmfla` **6.7~20.1x**（2026-10-16 分桶路由 v2 后；二叉树时代 19.5~30.3x）；`bcf+vmfla` 组合 **17.9~35.7x** |
+| 二进制体积 | `bcf` 最大（**8~10x**）；`vmfla` **3.1~5.5x**（分桶路由后；二叉树时代 7~15x）；`fla`/`ibr` 约 **3~5x**；`icall` **1.4~2.1x**；`enstr`/`vmp` ≈ 1.0~1.4x |
 | 编译耗时 | 除 `vmp`（sqlite **156s ≈ 46x**）外均在基线 3 倍以内 |
-| 功能正确性 | 累计发现 **5 个缺陷**，其中 2 个已修复（icall 跨 TU、enstr 跨 TU，均为「module pass 密文化外部可见目标 + 其他 TU 明文引用」同构问题）；**仍遗留 2 个**：ibr+vmfla 组合静默失败、vmfla 崩溃于 `luaV_execute` |
+| 功能正确性 | 累计发现 **5 个缺陷**，其中 3 个已修复（icall 跨 TU、enstr 跨 TU、vmfla 崩溃于 `luaV_execute`）；**仍遗留 2 个**：ibr+vmfla 组合静默失败、VMP 问题清单 |
 | vmp 实际效果 | 全程序标注下热点基本回退：bzip2/zlib 仅冷函数/薄包装被虚拟化（≈1.0x）；sqlite 虚拟化 174 个中层函数（4.0x）；lua 全回退但仍 1.5x（回退路径阻塞优化） |
 
 **工程选型顺序**（开销从低到高）：enstr < merge < bb2func ≈ bcf < icall < ibr < fla < vmfla。
@@ -154,7 +154,7 @@
 | 1 | icall：跨 TU 调用参数加密错乱（崩溃/静默错数据） | module pass 只能改写本模块调用点；被调方 external linkage 时其他 TU 明文直调命中解密入口 | ✅ 已修复（非 local linkage 不加密，仅入池） |
 | 2 | enstr：zlib 崩溃/SIGBUS 堆破坏 | zlib `deflate.h` 把 `_tr_tally` 做成内联宏，deflate.c 跨 TU 直接读被密文化的 `@_dist_code`（external linkage）→ `d_code()` 返回密文乱值 → `dyn_dtree[乱值].Freq++` 越界写坏堆（`desc->dyn_tree` 指针被加 `0x2_0000_0000`） | ✅ 已修复（同 #1 思路：非 local linkage 不进池） |
 | 3 | ibr + vmfla 组合：进程启动即静默退出（argv 破坏征兆） | 未定位（两两组合中仅此一对失败，单 pass 均正常） | ❌ 遗留 |
-| 4 | vmfla 崩溃于 `luaV_execute`（lua 解释器主循环，数千行巨型函数；lvm.c 其余 31 函数正常） | 未定位（与超大函数 + 密集分支形态相关） | ❌ 遗留 |
+| 4 | vmfla 崩溃于 `luaV_execute`（lua 解释器主循环，数千行巨型函数；lvm.c 其余 31 函数正常） | computed goto 的 `indirectbr` 直连边绕过 dispatcher，破坏增量状态机的"进入 case 时下标 == 该 case 表下标"不变式 | ✅ 已修复（非常规前驱的 case 头部写回自身表下标；回归 `test/vmfla/test_vmfla_indirectbr.sh`，详见 2026-10-16 节） |
 | 5 | VMP 的 6 个问题（递归崩溃、CRC 形态 VM 断言、哈希类不可表达等） | 见 `docs/VMP_ISSUES.md` | ❌ 遗留（记录在案） |
 
 ### 缺陷 2 详录（enstr 跨 TU，2026-10-10 反汇编逆向定位）
@@ -370,6 +370,262 @@ bb2func+merge，bcf 作用于切分后的 wrapper，vmfla 在链路末端平坦�
 （每点省 2~5 条冗余运算；克隆指令比纯随机链更短）；全局 seed 与栈槽
 开销相当（同为一次 volatile 访存）。
 
+## 2026-10-15 对比测试：amice（开源 LLVM Pass 插件）控制流平坦化开销
+
+被测对象：[amice](https://github.com/fuqiuluo/amice) v0.1.5-beta.3 预编译
+插件（`libamice-llvm21-macos-arm64.dylib`）+ Homebrew 原版 LLVM 21 clang，
+`-fpass-plugin` 接入，`AMICE_FLATTEN=true` 全局开启（等价我们的"全程序
+标注"口径），basic / dominator 两模式；同一套 4 应用与负载、同机同轮。
+原始数据 `/tmp/amice-bench/out/results.json`（Runner 在 `/tmp/amice-bench/run_amice.py`，
+复用本仓库 test/perf 的应用定义）。
+
+### 运行时与体积（vs 同编译器 base）
+
+| 应用 | amice basic | amice dominator | 体积 basic/dom | VLLVM vmfla L1（对照） |
+| --- | --- | --- | --- | --- |
+| bzip2 | 5.83x | 9.16x | 2.1x / 5.4x | 19.5x |
+| zlib | 6.87x | 11.62x | 2.5x / 6.3x | 27.6x |
+| lua | 14.35x | 21.29x | 2.2x / 4.5x | 28.9x（2026-10-16 修复后） |
+| sqlite | 8.84x | 57.60x | 2.9x / 9.1x | 30.3x |
+| 几何平均 | **8.44x** | **19.01x** | - | 26.2x（4 应用；lua 修复前为 25.4x/3 应用） |
+
+amice 全部 12 个组合输出与基线一致。编译耗时：sqlite 上 basic 190s /
+dominator 207s（amice 插件较慢）；bzip2 3.7s/7.4s。
+
+### 结论
+
+- amice basic 模式约 8.4x，明显轻于 VLLVM vmfla（26.2x）——vmfla 是
+  bb2func+merge+平坦化三段链且带常量表/防传播机制，单"平坦化"维度
+  上 amice basic 与其体积比（2~3x vs 5x）都更保守。
+- amice dominator（19.0x）与 vmfla 同量级：sqlite 上 57.6x 略高于
+  vmfla 的 30.3x。
+- lua 上两者均可完整跑通（VLLVM vmfla 的 luaV_execute 崩溃已于
+  2026-10-16 修复，见下节）。
+- 跨工具对比含编译器差异（原版 LLVM 21 vs VLLVM 21.1），比值均以
+  各自同编译器 base 为参照，方向性结论可信。
+
+## 2026-10-16 修复：vmfla 崩溃于 luaV_execute（indirectbr 破坏状态机不变式）
+
+### 根因
+
+`luaV_execute` 是 computed goto 解释器：静态表 `disptab` 存 83 个
+`blockaddress`，dispatch 块以 `indirectbr` 直连各 opcode case 块。vmfla
+平坦化把 case 间跳转改写成**增量状态机**（`新下标 = 当前下标 + 常量增量`，
+再回 dispatcher 按 case 值路由），依赖不变式"进入 case 时运行时下标 ==
+该 case 的表下标"。`indirectbr` 块被排除在状态机外（终结符不可重写），
+其直连边**绕过 dispatcher** 进入 case：运行时下标仍是旧值，增量算出
+错误状态——dispatcher 按 case 值匹配失败落入 `switchDefault` 死循环
+（full-v3 观察到的 run-timeout/100% CPU），或恰好命中错误 case 破坏
+数据（SIGSEGV）。单独标注 `luaV_execute` 即可复现。
+
+### 修复
+
+`applyFlatten` 在终结符重写后检测仍有"非常规前驱"（非调度器生成块：
+`indirectbr`、EH 孤岛等）的 case，在 case 头部写回自身表下标
+（volatile store），重建不变式；lvars 的 `loadConstViaFlattenIndex`
+锚定下标读取同样依赖该不变式。函数体/表参数化等其他机制无需改动
+（`moveTablesToImplParams` 对 indirectbr 本就整体回退）。
+回归：`./test/vmfla/test_vmfla_indirectbr.sh`（computed goto fixture，
+修复前死循环、修复后通过，含 IR 断言）。
+
+### 结果（lua，33 TU 全标注）
+
+| 配置 | 运行中位 (s) | vs base | 体积 (strip) | __text | 状态 |
+| --- | --- | --- | --- | --- | --- |
+| base | 1.196 | 1.00x | 242792 | 196608 | ✅ |
+| vmfla L1 | 34.505 | **28.9x** | 1286280 | 1196032（6.1x） | ✅ 6/6 轮，输出与 base 逐字节一致 |
+
+vmfla 四应用几何平均更新为 **26.21x**（bzip2 19.5x / zlib 27.6x /
+lua 28.9x / sqlite 30.3x）。与 amice（lua basic 14.35x / dominator
+21.29x）同量级偏重：解释器 dispatch 循环平坦化后每条 VM 指令多一次
+dispatcher 往返 + 旁路入口的索引写回。combo 中 ibr+vmfla 组合缺陷
+（缺陷 3）不受影响，仍遗留。
+
+## 2026-10-16 优化：dispatcher 分桶路由（跳转表 + 桶内比较链）
+
+### 动机与设计
+
+原 dispatcher 对状态下标整树做**二叉路由**（`buildDispatchTree`），
+深度 log2(N)（luaV_execute 820 case ≈ 10 级），且遍历路径随 case 序列
+随机变化，无法被分支预测器学习——预测失败是 dispatcher 的主要运行时
+开销。改为两级分桶：
+
+1. 桶选择：`bucketIdx = CaseValue & (桶数-1)` 纯掩码运算 + `switch`
+   （后端跳转表，**单个间接跳转**，热点转移可被 BTB 学习）；桶数取
+   ≥N/4 的最小 2 的幂，桶均 ~4 个成员。
+2. 桶内解析：等值比较链（匹配则进 case，否则下一成员，链尾回
+   default），期望 2~3 级。
+
+混淆形态不弱化：switch 判据是加密表 volatile 取出的 CaseValue 掩码
+（静态不可折叠），桶内仍是逐值比较，状态与块的映射依旧不可静态还原。
+附带收益：路由结构从 ~2N 块（树内节点+叶）降为 N 块（比较链），二进制
+体积近乎减半。注意 `applyFlatten` 末尾的 LowerSwitch 必须移除（用户的
+switch 已在 planFlatten 入口统一降级），否则分桶 switch 会被展开回
+比较树。
+
+### 结果（vs base，6 轮中位，全部输出一致；v1=值掩码分桶）
+
+| 应用 | 二叉树（旧） | 分桶 v1 | 分桶 v2（密度修复后） | 体积 v2 |
+| --- | --- | --- | --- | --- |
+| bzip2 | 19.52x | 13.27x | **6.66x** | 3.1x |
+| zlib | 27.61x | 18.06x | **19.32x** | 4.7x |
+| lua | 28.86x | 19.51x | **20.09x** | 5.0x |
+| sqlite | 30.32x | 17.96x | **17.63x** | 5.5x |
+| 几何平均 | 26.21x | 17.03x | **14.61x** | - |
+
+（二叉树基线：lua 为同日修复轮数据，其余三应用为 full-v3 轮数据。）
+
+### 追加修复：小 N 桶退化（v2，2026-10-16 下午）
+
+v1 的桶数取 max(4, pow2(N/4))：N≤32 的函数桶数只有 4~8，实测 ARM64
+后端对 ≤8 项的 switch **不生成跳转表**、退化为逐值比较链（bzip2 的
+`BZ2_compressBlock` 约 30 case 正中此坑，压缩段比理论慢 ~4x；bcf 组合
+反而"更快"的假象即源于此——BCF 切块把 case 数翻倍、意外推过跳转表
+阈值）。v2 修复：桶数下限 16（N≥16 时），桶归属按 ordinal 轮转
+（i % 桶数，N≥桶数时 100% 密度，必然生成跳转表），桶号以
+`(ordinal + 逐构建随机旋转) & mask` 计算保持桶序与 ordinal 序脱钩。
+bzip2 vmfla 13.27x → **6.66x**，四应用几何 17.03x → **14.61x**。
+
+asm 验证：`bucketDispatch` 处生成 `ldrh w11,[x9,x8,lsl#1]; add x10,
+x10,w11,lsl#2; br x10` 的 16 位偏移跳转表（luaV_execute 820 case / 249
+桶生效）。回归 9 项全过（chain/indirectbr/lvars/complex/config/bcf/
+phi/vmp）。与 amice 对照更新：vmfla 14.6x 落在其 basic 8.4x 与
+dominator 19.0x 之间。
+
+### 附带发现：构建非确定性
+
+`CryptoUtils` 用 `Module::createRNG`，而 LLVM 的 RNG 默认**每进程随机
+种子**（除非显式传 `-mllvm -rng-seed=`）——case 值/桶分配/块序逐构建
+随机。同一配置两次编译产物不同（bzip2 vmfla 三次重编 compress 段
+27.7~31s，±10% 构建间波动）。跨轮对比只看方向；同轮内比值才精确。
+如需可复现构建，应固定 `-rng-seed`。
+
+## 2026-10-16 组合复测：bcf + vmfla（分桶 v2，同轮四配置）
+
+调度链上 bcf 在 bb2func 之后、merge/flatten 之前执行：切块与虚假块
+进入 flatten 的 case 集。同轮测 base/bcf/vmfla/bcfvmfla，叠加比
+（combo ÷ vmfla）为同轮比值：
+
+| 应用 | bcf | vmfla | bcfvmfla | 叠加比 | 体积 combo |
+| --- | --- | --- | --- | --- | --- |
+| bzip2 | 4.15x | 6.66x | 18.27x | 2.74 | 4.5x |
+| zlib | 8.84x | 19.32x | 17.92x | 0.93 | 6.4x |
+| lua | 7.85x | 20.09x | **35.70x** | 1.78 | 7.2x |
+| sqlite | 4.38x | 17.63x | 24.75x | 1.40 | 7.6x |
+| 几何平均 | 5.96x | 14.61x | **23.19x** | **1.59** | - |
+
+- lua 组合首次可跑（旧轮 run-timeout；luaV_execute 修复 + 分桶 v2
+  后 35.70x、输出一致）——解释器 dispatch 循环同时吃 BCF 切块碎片
+  与平坦化往返，叠加最重。
+- 上轮 bzip2 出现的"combo 反而快于 vmfla"（叠加比 0.48）是 vmfla-only
+  小 N dispatcher 退化假象（见上文 v2 修复），修复后恢复正常叠加。
+- 叠加远低于相乘（5.96×14.61≈87x）：BCF 永假谓词的虚假边与真实边在
+  flatten 后共享 dispatcher，只算一次路由成本，虚拟块链永不执行；
+  逐应用叠加比在 0.9~2.7 间浮动，与热点函数的 case 规模/切块密度相关。
+
+## 2026-10-16 常见算法开销：AES / MD5 / SHA-256 × vmfla、bcf+vmfla
+
+函数级基准（`test/perf/workloads/algo_bench.c` + `test/perf/
+algo_fn_bench.py`）：AES-128-CBC（T 表实现）、MD5、SHA-256 标准实现，
+标注各算法顶层处理函数（整段 1MB 缓冲管线，压缩/轮函数内联其中），
+-O2 直编，二进制内逐轮计时（150/60/60 轮取中位 × 3 次执行中位），
+启动校验 FIPS-197 / RFC1321 / FIPS-180 官方向量，跨配置摘要必须一致：
+
+| 算法 | vmfla | bcf | bcf+vmfla | bcf 叠加系数 |
+| --- | --- | --- | --- | --- |
+| AES-128-CBC | 4.60x | 4.89x | **4.54x** | ≈0（完全吸收） |
+| MD5 | 7.10x | 2.87x | **7.68x** | +8% |
+| SHA-256 | 10.79x | 6.43x | **11.15x** | +3% |
+
+- **组合 ≈ 纯 vmfla**：BCF 的永假谓词边与真实边共享平坦化 dispatcher，
+  虚拟块链永不执行，在这类"单函数大循环"形态上叠加成本接近零。
+- 开销与**基本块转移密度**成正比：AES T 表轮函数近乎直线码（每 16B
+  约 2~3 次转移）只有 4.6x；SHA-256 每块分支最多 10.8x。整程序基准
+  的 vmfla 14.6x（几何）对应更碎的分支型业务代码。
+- 三个函数均通过完整链路（bb2func 提取 5/16/16 + impl 拆分 + 分桶
+  平坦化），日志与 IR 已核对。
+
+### 追加复测：vmfla 链路精简后（同日）
+
+vmfla 链路去掉 bb2func/merge 前段（保留方案，独立标注可用）、入口
+伪调用点移除后，同一基准复测（分桶 v2、-O2、3 次执行中位）：
+
+| 算法 | vmfla（旧链） | vmfla（纯平坦化） | bcf | bcf+vmfla（旧链） | bcf+vmfla（纯平坦化） |
+| --- | --- | --- | --- | --- | --- |
+| AES-128-CBC | 4.30x | **3.63x** | 5.20x | 4.84x | **23.75x** |
+| MD5 | 7.35x | **6.72x** | 3.02x | 7.56x | **14.39x** |
+| SHA-256 | 10.06x | **7.74x** | 6.81x | 11.31x | **27.40x** |
+
+- 纯 vmfla 一致变轻（去 merge 分发层 + 无伪调用开销）。
+- **组合从"被吸收"变为接近两者相乘**（AES 23.75 ≈ 5.20×3.63×1.26）。
+  旧链的吸收是结构假象：bb2func 先把热点块提取成 helper（经 merge
+  分发、不进状态机），BCF 切割只作用于剩余主体；新链 BCF 的切块
+  碎片全部成为平坦化 case，每条碎片边都付一次 dispatcher 往返，
+  开销 = 切块数 × 单次路由。AES 轮函数被切成最多碎片，叠加最重。
+- 若要恢复"组合近零叠加"，可把 bcf 的切割阈值与平坦化联动（切割
+  碎片直接融合为单 case），或按需恢复 bb2func 前段（保留方案）。
+
+### 追加复测：算法扩展到 7 项（同日晚，-O0 口径定为标准）
+
+fixture 扩展 DES（FIPS-46 教科书位置换实现）、SM4（GB/T 32907）、
+RC4、CRC32（IEEE/zlib），全部过官方向量（DES 85e813540f0ab405 /
+SM4 681edf34...4246 / RC4 bbf316e8...ad3 / CRC32 cbf43926）。
+runner 解析改为按行名动态发现算法。**-O0 口径定为项目标准**
+（混淆×优化已在编译期强制互斥，见「推荐用法」）：
+
+| 算法 | vmfla | bcf | bcf+vmfla |
+| --- | --- | --- | --- |
+| AES-128-CBC | 1.71x | 2.47x | **12.11x** |
+| DES | 2.48x | 1.28x | **3.15x** |
+| SM4 | 1.40x | 1.10x | **3.38x** |
+| RC4 | 2.50x | 2.57x | **14.84x** |
+| MD5 | 5.18x | 2.15x | **11.97x** |
+| SHA-256 | 1.82x | 1.56x | **7.24x** |
+| CRC32 | 2.56x | 1.96x | **6.09x** |
+
+分组看：块密码（AES/DES/SM4，直线轮函数）vmfla 1.4~2.5x、组合
+3~12x；流/摘要（RC4/MD5/SHA/CRC，分支与循环转移密集）vmfla
+1.8~5.2x、组合 6~15x。MD5 在 -O0 下基线本身几乎不吃亏（O0/O2 仅
+1.5x），比值偏高；DES 位置换实现基线极慢（0.22s/MB），比值被稀释。
+
+## 2026-10-16 测试流程定版 + CPython 应用基准
+
+标准测试流程见 `docs/TEST_PROCESS.md`（约束 → 回归 → 算法 7 项 →
+应用 → 手动重型）。新增 CPython 3.12.8 应用基准（`test/perf/
+run_python_bench.py`）：configure + CC 记录器做一次基线构建并捕获
+全部编译/链接命令，混淆配置按命令表重放两段式注入，静态库按 `ar t`
+成员清单从镜像对象重建，混淆 exe 放回源码树内保证 stdlib 探测一致；
+负载为确定性校验和脚本（数值/字符串/表/JSON）：
+
+| 配置 | 中位 | vs base |
+| --- | --- | --- |
+| base | 0.185s | 1.00x |
+| vmfla | 0.760s | **4.10x** |
+| bcf+vmfla | 1.386s | **7.48x** |
+
+全程序标注口径（约 330 个 C TU 全部混淆），输出跨配置一致。
+Firefox 列入应用清单的重型手动层（mach/Rust 工具链，流程定义在
+TEST_PROCESS.md，未在本机执行）。
+
+### 追加复测：-O1 / -O0 口径（同日）
+
+`algo_fn_bench.py` 增加 `--opt` 参数逐级编译（默认 O0）。
+-O1 与 -O2 比值几乎一致（混淆后 IR 已是低可优化形态，后端优化
+对分子分母影响趋同）；**-O0 比值显著更低**：分母换成未优化基线
+（比 -O2 慢 1.5~5.6x），而混淆产物在 O0/O2 下速度接近（本身即
+reg2mem+volatile 形态），得到的是变换的"结构内禀开销"：
+
+| 算法 | vmfla O0 | bcf O0 | bcf+vmfla O0 | vmfla O1 | bcf+vmfla O1 |
+| --- | --- | --- | --- | --- | --- |
+| AES-128-CBC | **1.70x** | 2.48x | 12.87x | 3.61x | 22.96x |
+| MD5 | 5.34x | 2.15x | 11.84x | 6.73x | 14.20x |
+| SHA-256 | **1.82x** | 1.57x | 7.36x | 7.53x | 26.30x |
+
+各基线绝对中位（O0→O2）：AES 4.5→2.0ms、MD5 4.2→2.8ms、
+SHA-256 13.1→2.3ms；混淆产物 O0→O2 仅 ±30%。两端优化级别需一致
+才有工程意义——对攻击者同样用 -O0 观察时，AES/SHA 平坦化的内禀
+开销约 1.7~1.8x。
+
 ## 沿革（三轮数据对照）
 
 | 轮次 | 变化 | 结果 |
@@ -407,4 +663,4 @@ python3 test/perf/vmp_fn_bench.py
 - 两段式构建与源码直编有约 7% 基线偏差；横向比值不受影响。
 - macOS arm64 单机测试；icall 的 x19/icallcc 约定、vmp 准入条件在其他目标可能不同。
 - `ld64.lld` 与 macOS 27 SDK tbd 不兼容是环境问题（见「测试方法」第 4 条）。
-- 遗留缺陷（ibr+vmfla、lua/vmfla、VMP 问题清单）修复后重跑上述命令即可复测对比。
+- 遗留缺陷（ibr+vmfla 组合、VMP 问题清单）修复后重跑上述命令即可复测对比；lua/vmfla 已于 2026-10-16 修复。
