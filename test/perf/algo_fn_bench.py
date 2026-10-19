@@ -57,6 +57,10 @@ def main():
                 sys.exit("compile failed %s -%s: %s"
                          % (name, level, p.stderr[-1500:]))
 
+            # 样本统一 strip 后再计时：-O0 会把 static 函数名留在符号
+            # 表，与 run_perfbench/run_python_bench 的发布形态口径一致。
+            subprocess.run(["strip", exe], capture_output=True)
+
             # 每配置跑 runs 次，取轮中位的中位（轮内已带漂移校验）。
             algo_medians = {}
             for _ in range(max(1, args.runs)):

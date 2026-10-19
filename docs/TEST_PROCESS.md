@@ -48,7 +48,8 @@ for t in $(find test -name '*.sh' -not -path '*/perf/*' \
   向量（FIPS-197 / FIPS-46 / GB/T 32907 / RFC6229-ish / RFC1321 /
   FIPS-180 / CRC32 "123456789"），标注各算法顶层处理函数，
   `OBF_MODE` 选择配置（0 base / 1 vmfla / 2 bcf / 3 bcf+vmfla）。
-- 运行：`python3 test/perf/algo_fn_bench.py --runs 3 [--opt O0]`
+- 运行：`python3 test/perf/algo_fn_bench.py --runs 3 [--opt O0]`，
+  样本链接后统一 strip 再计时（-O0 会保留 static 函数名于符号表）。
 - 正确性门槛：向量全过、轮间摘要无漂移、四配置摘要逐一相等，
   任一失败脚本非零退出。
 - 产出：`tmp/perfbench/algo-vmfla/results_O0.json`（中位数与比值）。
