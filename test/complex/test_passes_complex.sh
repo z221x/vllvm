@@ -145,8 +145,9 @@ run_case() {
     fi
     ;;
   bcf)
-    # 独立 BCF：栈 seed（地址不透明归一）、随机指令虚假块（锚定在永假
-    # 分支后继上）、永假 icmp eq 谓词；不得触发 vmfla 链路产物。
+    # 独立 BCF：导出全局 seed（函数内不初始化）、随机指令虚假块（锚定
+    # 在永假分支后继上）、与 seed 取值无关的永假 icmp eq 谓词；不得触发
+    # vmfla 链路产物。
     grep -q "vllvm.bcf.seed" "$ll"
     grep -Eq "^vllvm\.bcf\.fake\." "$ll"
     grep -q "label %vllvm.bcf.fake" "$ll"

@@ -26,12 +26,6 @@ constexpr llvm::StringRef BogusBlockPrefix = "vllvm.bcf.fake.";
 constexpr unsigned Level1Probability = 60;
 constexpr unsigned Level2Probability = 85;
 
-// seed 的已知运行时值：运算统一用 uint16（i16 回绕），x + (x ^ -1)
-// 在 i16 上恒等于 0xFFFF。选用 add 形态：SelectionDAG 会对 xor/or 形态
-// 做 known-bits 折叠，add 带进位不会被折，Hex-Rays 类反编译器同样不做
-// 该代数化简。
-constexpr uint32_t KnownSeedValue = 0xFFFFu;
-
 bool isGeneratedBlock(BasicBlock &BB) {
   return BB.hasName() && BB.getName().starts_with(BogusBlockPrefix);
 }
@@ -61,37 +55,18 @@ void addEdgeFixPhi(BasicBlock *From, BasicBlock *To) {
       PN.addIncoming(UndefValue::get(PN.getType()), From);
 }
 
-// seed 保存为每函数私有全局变量：值不能是明文常量，否则反编译器能顺
-// 着变量把密文折叠掉、永假谓词直接消失。入口以全局自身地址（PIE 下含
-// ASLR 基址，静态不可知）为不透明源，经恒等式 add(x, xor(x,-1)) 归一成
-// 已知值 0xFFFF 后 volatile 写入：运行时恒为 KnownSeedValue，编译期与
-// 反编译期均不可求解。初始化器为 0，不携带明文。
-GlobalVariable *createSeedGlobal(Function &F,
-                                 SmallVectorImpl<Instruction *> &Chain) {
+// seed 保存为每函数导出全局变量（external linkage + 默认可见性）：外部
+// 库可按符号名引用并在函数执行前任意初始化。函数内不再做任何初始化
+// ——运行时取值（静态 0 或外部写入）编译期与反编译期均不可求解，也
+// 不存在可折叠的明文推导链。初始化器为 0，不携带明文。
+GlobalVariable *createSeedGlobal(Function &F) {
   Module *M = F.getParent();
   Type *I16Ty = Type::getInt16Ty(F.getContext());
   auto *GV = new GlobalVariable(
-      *M, I16Ty, /*isConstant=*/false, GlobalValue::PrivateLinkage,
+      *M, I16Ty, /*isConstant=*/false, GlobalValue::ExternalLinkage,
       ConstantInt::get(I16Ty, 0),
       (Twine("vllvm.bcf.seed.") + F.getName()).str());
   GV->setAlignment(Align(2));
-
-  BasicBlock *Entry = &F.getEntryBlock();
-  IRBuilder<> IRB(Entry->getTerminator());
-  // 显式创建 PtrToInt 指令：全局变量是 Constant，走 CreatePtrToInt 会
-  // 被立即折叠成 ConstantExpr，推导不再是指令（且无法压栈跟踪回滚）。
-  auto *Addr = new PtrToIntInst(GV, Type::getInt64Ty(F.getContext()));
-  IRB.Insert(Addr);
-  Addr->setName("vllvm.bcf.seed.addr");
-  Value *X = IRB.CreateTrunc(Addr, I16Ty, "vllvm.bcf.seed.x");
-  Value *NotX = IRB.CreateXor(X, ConstantInt::get(I16Ty, -1),
-                              "vllvm.bcf.seed.not");
-  Value *Norm = IRB.CreateAdd(X, NotX, "vllvm.bcf.seed.norm");
-  StoreInst *Store = IRB.CreateStore(Norm, GV, "vllvm.bcf.seed.init");
-  Store->setVolatile(true);
-
-  for (Value *V : {cast<Value>(Addr), X, NotX, Norm, cast<Value>(Store)})
-    Chain.push_back(cast<Instruction>(V));
   return GV;
 }
 
@@ -102,33 +77,24 @@ LoadInst *loadSeedVolatile(IRBuilder<> &IRB, Value *SeedPtr) {
   return Load;
 }
 
-// 随机算法运算加密：每个改写点对 seed 只做一次 add/sub/xor（无乘法、
-// 不叠加多轮）。指令与镜像计算同步，加密后的值在编译期已知；全部
-// 运算在 uint16（i16 回绕）上进行。
-Value *applyEncryptionOp(IRBuilder<> &IRB, Value *Seed, uint32_t SeedValue,
-                         CryptoUtils &Crypto, uint32_t &Encrypted) {
+// 随机算法运算加密：对传入值只做一次非零 add/sub/xor（无乘法、不叠加
+// 多轮），全部运算在 uint16（i16 回绕）上。K 非零保证结果必不等于原值
+// （uint16 上 x±K/x^K == x 当且仅当 K==0），改写点谓词的永假性由此
+// 保证，与 seed 运行时取值无关。
+Value *applyEncryptionOp(IRBuilder<> &IRB, Value *Seed, CryptoUtils &Crypto) {
   Type *I16Ty = Type::getInt16Ty(IRB.getContext());
-  uint32_t Expected = SeedValue & 0xFFFF;
-  uint32_t K = Crypto.getRandom32() & 0xFFFF;
-  Value *V = nullptr;
-
+  uint32_t K;
+  do {
+    K = Crypto.getRandom32() & 0xFFFF;
+  } while (K == 0);
   switch (Crypto.getRandom32() % 3) {
   case 0:
-    V = IRB.CreateAdd(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.add");
-    Expected = (Expected + K) & 0xFFFF;
-    break;
+    return IRB.CreateAdd(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.add");
   case 1:
-    V = IRB.CreateSub(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.sub");
-    Expected = (Expected - K) & 0xFFFF;
-    break;
+    return IRB.CreateSub(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.sub");
   default:
-    V = IRB.CreateXor(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.xor");
-    Expected ^= K;
-    break;
+    return IRB.CreateXor(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.xor");
   }
-
-  Encrypted = Expected;
-  return V;
 }
 
 // 可克隆进虚假块的指令：排除终结指令/PHI（依附于前驱结构）、alloca
@@ -176,8 +142,7 @@ BasicBlock *createJunkBlockBody(
   Value *V = loadSeedVolatile(IRB, SeedPtr);
   if (CloneSources.empty()) {
     // 没有可克隆指令（极小函数）时退回单次随机运算。
-    uint32_t Discarded;
-    V = applyEncryptionOp(IRB, V, KnownSeedValue, Crypto, Discarded);
+    V = applyEncryptionOp(IRB, V, Crypto);
   } else {
     const SmallVectorImpl<Instruction *> &Src =
         CloneSources[Crypto.getRandom32() % CloneSources.size()];
@@ -200,11 +165,6 @@ BasicBlock *createJunkBlockBody(
   StoreInst *Store = IRB.CreateStore(V, SeedPtr, "vllvm.bcf.junk.store");
   Store->setVolatile(true);
   return BB;
-}
-
-void eraseSeedChain(MutableArrayRef<Instruction *> Chain) {
-  for (Instruction *I : llvm::reverse(Chain))
-    I->eraseFromParent();
 }
 
 // 前置处理 1：真实块大块切割。>= MinCutSize 条有效指令的块切成
@@ -276,7 +236,8 @@ bool cutLargeBlocks(Function &F, CryptoUtils &Crypto) {
 bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
   if (F.empty() || F.isDeclaration() || F.hasFnAttribute(Attribute::Naked))
     return false;
-  // seed 初始化要插在入口终结指令前，musttail 尾块不允许插任何指令。
+  // PHIs 降级与栈化会在入口块插入 alloca/store，musttail 入口块
+  // （call 紧邻 ret）不允许插入任何指令。
   if (hasMustTailReturn(F.getEntryBlock()))
     return false;
 
@@ -309,21 +270,19 @@ bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
   if (Sites.empty())
     Sites.push_back(Branches[Crypto.getRandom32() % Branches.size()]);
 
-  SmallVector<Instruction *, 8> SeedChain;
   SmallVector<BasicBlock *, 8> Junks;
   GlobalVariable *SeedGV = nullptr;
   auto Cleanup = [&]() {
     for (BasicBlock *BB : Junks)
       BB->eraseFromParent();
-    eraseSeedChain(SeedChain);
     if (SeedGV)
       SeedGV->eraseFromParent();
   };
 
-  SeedGV = createSeedGlobal(F, SeedChain);
+  SeedGV = createSeedGlobal(F);
 
   // 前置处理 2：生成虚假块，指令以真实块为参考克隆。此刻真实块只含
-  // 原程序指令与入口 seed 推导（谓词链在改写阶段才插入）。
+  // 原程序指令（seed 全局不在函数内初始化，谓词链在改写阶段才插入）。
   SmallVector<SmallVector<Instruction *, 8>, 32> CloneSources;
   for (BasicBlock &BB : F) {
     if (isGeneratedBlock(BB))
@@ -405,22 +364,18 @@ bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
     BasicBlock *SourceBB = R.Br->getParent();
     BasicBlock *RealSucc = R.Br->getSuccessor(0);
 
-    // 单后继分支创建虚假分支：加密值链在分支前计算，比较值是
-    // 不等于加密值的随机数，条件 icmp eq 永不为真——真边走真实
-    // 后继，假边随机落进任意块。
+    // 单后继分支创建虚假分支：谓词与 seed 具体取值无关——同一全局
+    // 两次 volatile 读（不可合并、无代数关系，优化器与反编译器都
+    // 无法求解），其一过一次非零加密运算，uint16 上必不等于原值，
+    // icmp eq 永不为真。seed 已导出且函数内不初始化，外部库在执行
+    // 前写入任意值都不破坏永假性——真实流走假值边回原后继，真值边
+    // 指向随机虚假后继且永不可达。
     IRBuilder<> IRB(R.Br);
     Value *SeedValue = loadSeedVolatile(IRB, SeedGV);
-    uint32_t Encrypted;
-    Value *EncryptedV =
-        applyEncryptionOp(IRB, SeedValue, KnownSeedValue, Crypto, Encrypted);
-    uint32_t Compare;
-    do {
-      Compare = Crypto.getRandom32() & 0xFFFF;
-    } while (Compare == Encrypted);
-    Value *Predicate = IRB.CreateICmpEQ(
-        EncryptedV,
-        ConstantInt::get(Type::getInt16Ty(F.getContext()), Compare),
-        "vllvm.bcf.cmp");
+    Value *SeedAgain = loadSeedVolatile(IRB, SeedGV);
+    Value *EncryptedV = applyEncryptionOp(IRB, SeedAgain, Crypto);
+    Value *Predicate = IRB.CreateICmpEQ(SeedValue, EncryptedV,
+                                        "vllvm.bcf.cmp");
     IRB.CreateCondBr(Predicate, R.Target, RealSucc);
     R.Br->eraseFromParent();
 

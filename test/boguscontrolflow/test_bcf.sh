@@ -46,9 +46,10 @@ if [ "$BCF_STATUS" -ne "$BASE_STATUS" ]; then
   exit 1
 fi
 
-# 独立 BCF：栈 seed + 已知密文 + 单后继分支伪造；随机指令虚假块存在，
-# 谓词 icmp eq（加密值 vs 不等随机数）永假，真边回原后继。bcf 独立于
-# vmfla，不允许触发 vmfla 常量表。
+# 独立 BCF：导出全局 seed（函数内不初始化）+ 单后继分支伪造；随机指令
+# 虚假块存在，谓词 icmp eq（两次 volatile 读，其一过非零运算）与 seed
+# 取值无关、永假，真边回原后继。bcf 独立于 vmfla，不允许触发 vmfla
+# 常量表。
 grep -q "vllvm.bcf.seed" "$OUT_DIR/bcf.ll"
 grep -Eq "^vllvm\.bcf\.fake\." "$OUT_DIR/bcf.ll"
 grep -q "vllvm.bcf.cmp" "$OUT_DIR/bcf.ll"
@@ -58,13 +59,19 @@ if grep -q "vllvm.vmfla.const.table" "$OUT_DIR/bcf.ll"; then
   exit 1
 fi
 
-# seed 不能是明文常量：由槽位地址经 i16 上的 x + (x ^ -1) 归一（恒为
-# 0xFFFF）后 volatile 压栈；全部运算走 uint16 回绕，反编译器无法折叠
-# 密文链，永假谓词与虚假块必须留在反编译视图里。
-grep -q "%vllvm.bcf.seed.addr = ptrtoint" "$OUT_DIR/bcf.ll"
-grep -Eq "add i16 %vllvm\.bcf\.seed\.x, %vllvm\.bcf\.seed\.not" "$OUT_DIR/bcf.ll"
+# seed 是导出全局（external linkage：IR 定义行不带 internal/private
+# 前缀，外部库可按符号名引用初始化），且函数内不再初始化——不存在
+# ptrtoint 归一推导链；改写点谓词是两次 volatile 读 + 一次非零运算的
+# icmp eq，与 seed 取值无关，反编译器无法折叠密文链，永假谓词与虚假
+# 块必须留在反编译视图里。
+grep -Eq '^@vllvm\.bcf\.seed\.[^ ]+ = global i16 0' "$OUT_DIR/bcf.ll"
+if grep -Eq 'vllvm\.bcf\.seed\.(addr|init|x|not|norm)' "$OUT_DIR/bcf.ll"; then
+  echo "seed must not be initialized inside the function" >&2
+  exit 1
+fi
+grep -q "load volatile i16, ptr @vllvm.bcf.seed" "$OUT_DIR/bcf.ll"
 grep -q "icmp eq i16" "$OUT_DIR/bcf.ll"
-if grep -Eq "store volatile i(16|32) [0-9-]+, ptr %vllvm\.bcf\.seed" "$OUT_DIR/bcf.ll"; then
+if grep -Eq "store volatile i(16|32) [0-9-]+, ptr @vllvm\.bcf\.seed" "$OUT_DIR/bcf.ll"; then
   echo "seed must be derived opaquely, not stored as a constant" >&2
   exit 1
 fi

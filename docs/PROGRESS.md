@@ -26,7 +26,7 @@ src/
 |------|------|------|------|----------|
 | EncryptoStr | `vllvm:enstr` | 字符串/常量加密（匿名内存池 + 下标访问） | ✅ 可用 | 0-2：1=字符串，2=再加密常量 |
 | IndirectBranch | `vllvm:ibr` | 间接跳转 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
-| BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（栈 seed + 已知密文 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
+| BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（导出全局 seed、函数内不初始化 + 取值无关永假谓词 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
 | IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密与 fake 诱饵下标 |
 | BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
 | Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
@@ -35,7 +35,7 @@ src/
 
 独立的 FlattenFuncPass（`vllvm:fla`）已删除：平坦化由 VMFlattenFuncPass
 内置提供，`fla` 标注（含 IR 中遗留的 `vllvm.fla` 属性）归并进 vmfla 链路。
-BogusControlFlowPass 保持独立（栈 seed 新算法），`vllvm:bcf` 单独标注。
+BogusControlFlowPass 保持独立（导出全局 seed 算法），`vllvm:bcf` 单独标注。
 
 等级语义列指 `VLLVMConfig`（见下节）：每个 Pass 自己 `registerPassLevels`
 声明区间并解释含义；enstr/icall/bcf/vmfla 已实现完整梯度，其余 Pass ≥1
@@ -54,11 +54,11 @@ BogusControlFlowPass 保持独立（栈 seed 新算法），`vllvm:bcf` 单独�
   平坦化混淆；2=再开启局部变量结构化（lvars）。
 - bcf（独立 pass）：前置处理 = 真实块大块切割（≥8 条指令切 4~6 条
   碎片（每段至少 4 条），避开 PHIs/入口前导 alloca/EH pad/musttail）+ 真实块指令克隆虚假块（保留
-  值名/调试信息，跨块操作数替换） + 全块重排；运算统一 uint16（i16 回绕）；seed 保存为每函数私有全局变量（初始化器 0），
-  入口以全局地址经 `x + (x ^ -1)` 恒等归一后 volatile 写入（运行时恒为
-  0xFFFF、静态不可求解，明文常量会被反编译器沿变量折叠掉），
-  各分支点 volatile 读 seed 做单次 add/sub/xor 运算（无乘法，加密后值已知），创建永假
-  `icmp eq` 虚假分支，假边随机落入真实块或虚假块；虚假块链接成链并
+  值名/调试信息，跨块操作数替换） + 全块重排；运算统一 uint16（i16 回绕）；seed 保存为每函数
+  **导出**全局变量（external linkage，符号名 `vllvm.bcf.seed.<函数名>`，外部库可引用初始化），
+  **函数内不再初始化**（运行时取值静态 0 或外部写入，静态不可求解），
+  各分支点两次 volatile 读 seed，其一做单次**非零** add/sub/xor 运算（无乘法），创建永假
+  `icmp eq` 虚假分支——谓词与 seed 取值无关，假边随机落入真实块或虚假块；虚假块链接成链并
   锚定在至少一条永假边后继上，保证进入后端发射与反编译视图；
   level 1/2/3 覆盖率 60%/85%/全量，虚假块数量递增。
 - enstr：字符串重构为模块级**匿名内存池**，池逻辑（mmap、CAS 抢锁、
