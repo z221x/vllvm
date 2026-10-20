@@ -26,7 +26,7 @@ src/
 |------|------|------|------|----------|
 | EncryptoStr | `vllvm:enstr` | 字符串/常量加密（匿名内存池 + 下标访问） | ✅ 可用 | 0-2：1=字符串，2=再加密常量 |
 | IndirectBranch | `vllvm:ibr` | 间接跳转 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
-| BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（导出全局 seed、函数内不初始化 + 取值无关永假谓词 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
+| BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（模块级共享导出 seed、函数内不初始化 + 对常量比较的恒定谓词 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
 | IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密与 fake 诱饵下标 |
 | BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
 | Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
@@ -54,19 +54,25 @@ BogusControlFlowPass 保持独立（导出全局 seed 算法），`vllvm:bcf` �
   平坦化混淆；2=再开启局部变量结构化（lvars）。
 - bcf（独立 pass）：前置处理 = 真实块大块切割（≥8 条指令切 4~6 条
   碎片（每段至少 4 条），避开 PHIs/入口前导 alloca/EH pad/musttail）+ 真实块指令克隆虚假块（保留
-  值名/调试信息，跨块操作数替换） + 全块重排；运算统一 uint16（i16 回绕）；seed 保存为每函数
-  **导出**全局变量（external linkage，符号名 `vllvm.bcf.seed.<函数名>`，外部库可引用初始化），
-  **函数内不再初始化**（运行时取值静态 0 或外部写入，静态不可求解），
-  各分支点两次 volatile 读 seed，其一做单次**非零** add/sub/xor 运算（无乘法），创建永假
-  `icmp eq` 虚假分支——谓词与 seed 取值无关，假边随机落入真实块或虚假块；虚假块链接成链并
-  锚定在至少一条永假边后继上，保证进入后端发射与反编译视图；
+  值名/调试信息，跨块操作数替换） + 全块重排；运算统一 uint16（i16 回绕）；seed 为模块级单一
+  **导出**全局变量（WeakAnyLinkage，符号名 `export_write`（不带 vllvm 前缀，避免自曝混淆器特征），所有 bcf 函数共享——首个 bcf
+  函数创建、后续复用；多 TU 各自弱定义、链接器合并为全程序同一变量；外部库可按符号引用读取），
+  **函数内不再初始化**（默认运行时值即初始化器 0），
+  各分支点 volatile 读 seed 过单次**非零** add/sub/xor 运算（无乘法）后与随机常量比较，
+  常量避开默认值 0 过同一运算的期望结果，创建极性恒定的虚假分支（`(seed op K) == C` 恒假
+  / `!= C` 恒真按点随机，真假边排布对调）——恒定性以 seed 保持默认 0 为前提，外部库运行期
+  改写可能翻转虚假边（约定只读），假边随机落入真实块或虚假块；虚假块链接成链并
+  锚定在至少一条永不可达边后继上，保证进入后端发射与反编译视图；
   level 1/2/3 覆盖率 60%/85%/全量，虚假块数量递增。
-- enstr：字符串重构为模块级**匿名内存池**，池逻辑（mmap、CAS 抢锁、
-  解密、下标访问）改为 C 实现 `src/c_func/enstrpool/enstrpool.c`，按
-  解释器 runtime 的方式编成位码（`EnstrPoolBitcode.inc`）由 pass 链入
-  目标模块——pass 只生成描述表（密文指针/下标/长度/密钥）与平台常量。
-  调用点经 `__vllvm_enstr_get(i64 下标)` 取 基址+下标，不再出现明文
-  绝对地址；密钥经 volatile 读取，O2 也不会把解密折叠成明文常量。
+- enstr：字符串重构为模块级**匿名内存池**，池逻辑（mmap、解密、下标
+  访问）改为 C 实现 `src/c_func/enstrpool/enstrpool.c`，按解释器
+  runtime 的方式编成位码（`EnstrPoolBitcode.inc`）由 pass 链入目标
+  模块——pass 只生成描述表（u32 offset/size、8 字节密钥、isdec）与
+  平台常量。2026-10-20 运行时协议改版：`__vllvm_enstr_get(i32 下标)`，
+  密钥流为 key[j&7] 循环异或（pass 侧同步），去除 CAS 抢锁（单线程
+  首次初始化语义，多线程并发首访不再保证恰好一次分配）；`__vllvm_
+  enstr_count/pool_size` 随之收敛为 u32。调用点不再出现明文绝对地址；
+  level 2 常量密钥经 volatile 读取，O2 也不会把解密折叠成明文常量。
   **目标平台优先 Android/ELF**（不再兼容 Windows）；mmap flags 按
   triple 生成（ELF 0x22 / Darwin 0x1002），最终由目标 libc 提供 mmap。
   level 1=字符串入池；level 2=再把作用域内标量整数常量（|v|≥256）

@@ -14,7 +14,7 @@
 | 运行时开销 | `enstr` ≈ **1.0x**（近零）；`merge` **1.4~4.3x**；`bb2func` **2.8~6.1x**；`bcf` **3.7~6.0x**；`icall` **2.8~6.5x**（L1/L2 持平）；`ibr` **5.4~8.8x**；`fla` **13.2~30.3x**；`vmfla` **6.7~20.1x**（2026-10-16 分桶路由 v2 后；二叉树时代 19.5~30.3x）；`bcf+vmfla` 组合 **17.9~35.7x** |
 | 二进制体积 | `bcf` 最大（**8~10x**）；`vmfla` **3.1~5.5x**（分桶路由后；二叉树时代 7~15x）；`fla`/`ibr` 约 **3~5x**；`icall` **1.4~2.1x**；`enstr`/`vmp` ≈ 1.0~1.4x |
 | 编译耗时 | 除 `vmp`（sqlite **156s ≈ 46x**）外均在基线 3 倍以内 |
-| 功能正确性 | 累计发现 **5 个缺陷**，其中 3 个已修复（icall 跨 TU、enstr 跨 TU、vmfla 崩溃于 `luaV_execute`）；**仍遗留 2 个**：ibr+vmfla 组合静默失败、VMP 问题清单 |
+| 功能正确性 | 累计发现 **7 个缺陷**，其中 **6 个已修复**（icall 跨 TU、enstr 跨 TU、vmfla 崩溃于 `luaV_execute`、ibr+vmfla 组合反序执行、bcf 多 TU 重定义、vmp 静态函数 ODR）；**仍遗留 1 个**：VMP 问题清单 |
 | vmp 实际效果 | 全程序标注下热点基本回退：bzip2/zlib 仅冷函数/薄包装被虚拟化（≈1.0x）；sqlite 虚拟化 174 个中层函数（4.0x）；lua 全回退但仍 1.5x（回退路径阻塞优化） |
 
 **工程选型顺序**（开销从低到高）：enstr < merge < bb2func ≈ bcf < icall < ibr < fla < vmfla。
@@ -153,9 +153,12 @@
 | --- | --- | --- | --- |
 | 1 | icall：跨 TU 调用参数加密错乱（崩溃/静默错数据） | module pass 只能改写本模块调用点；被调方 external linkage 时其他 TU 明文直调命中解密入口 | ✅ 已修复（非 local linkage 不加密，仅入池） |
 | 2 | enstr：zlib 崩溃/SIGBUS 堆破坏 | zlib `deflate.h` 把 `_tr_tally` 做成内联宏，deflate.c 跨 TU 直接读被密文化的 `@_dist_code`（external linkage）→ `d_code()` 返回密文乱值 → `dyn_dtree[乱值].Freq++` 越界写坏堆（`desc->dyn_tree` 指针被加 `0x2_0000_0000`） | ✅ 已修复（同 #1 思路：非 local linkage 不进池） |
-| 3 | ibr + vmfla 组合：进程启动即静默退出（argv 破坏征兆） | 未定位（两两组合中仅此一对失败，单 pass 均正常） | ❌ 遗留 |
+| 3 | ibr + vmfla 组合：静默错结果（2026-10-10 表现为启动即退出；2026-10-20 最小复现为函数体不执行、原样返回入口值，如 `mix(7)` 直接返回 7） | 旧调度反序执行：ibr 在函数分发早期先改写，vmfla 晚期再面对已被改写成 indirectbr 的 CFG——地址表跳转网络被当孤岛排除在状态机外（case 常量表仅含 return case），而入口终结指令仍被改写为直连 dispatcher，循环/分支体整体不执行 | ✅ 已修复（2026-10-20：同函数两者都标注时 ibr 延迟到晚期分发、紧随 vmfla 执行并作用于 `<fn>.vllvm.impl` 平坦化产物，`PassInfo.cpp` `IbrLateAttr`；回归 `test/complex/test_pair_combos.sh` 逐对冒烟 28/28） |
 | 4 | vmfla 崩溃于 `luaV_execute`（lua 解释器主循环，数千行巨型函数；lvm.c 其余 31 函数正常） | computed goto 的 `indirectbr` 直连边绕过 dispatcher，破坏增量状态机的"进入 case 时下标 == 该 case 表下标"不变式 | ✅ 已修复（非常规前驱的 case 头部写回自身表下标；回归 `test/vmfla/test_vmfla_indirectbr.sh`，详见 2026-10-16 节） |
 | 5 | VMP 的 6 个问题（递归崩溃、CRC 形态 VM 断言、哈希类不可表达等） | 见 `docs/VMP_ISSUES.md` | ❌ 遗留（记录在案） |
+| 6 | bcf：多 TU 各自标注时链接 `duplicate symbol _export_write`（L3 首轮 4 应用 × bcf/bcfvmfla 共 8 配置全部 build-failed） | seed 收敛为模块级共享导出变量后，每个 TU 的模块各自携带强符号定义 | ✅ 已修复（定义改 WeakAnyLinkage，各 TU 弱定义、链接器合并为全程序同一变量；回归 `test/boguscontrolflow/test_bcf_multi_tu.sh`，详见 2026-10-20 节） |
+| 7 | vmp：静态函数被虚拟化后以外部符号链接，与其他 TU 同名函数 `duplicate symbol`（bzip2/vmp：bzlib.c 的 static `myfeas` 对 bzip2.c 的外部 `myfeas`） | `installWrapper` 的 `F.deleteBody()` 把函数转声明时 LLVM 会把 linkage 重置为 External，wrapper 装回后仍为外部链接 | ✅ 已修复（`deleteBody` 前保存、后恢复原 linkage；回归 `test/vmp/test_vmp_static_dup.sh`，详见 2026-10-20 节） |
+| 8 | enstr+icall 组合：应用级 sqlite SIGBUS（输出完整后崩溃，rc=138）；最小复现 = 仅对 shell.c `process_input` 单函数施加 enstr+icall | icallcc 调用方代码生成缺陷：nest 参数写入 X19 与调用方在 X19 上的活跃值（如 Shell 结构体指针）冲突。IR 层两配置完全一致（`call icallcc … i32 nest 0`），icall 单独"通过"是寄存器分配运气（低压力下 RA 不占用 X19 跨调用）；enstr 全模块字符串加密在未标注调用方插入池调用抬高压力后暴露。GlobalIsel 开/关均复现（SelectionDAG 与 GlobalISel 公共路径）。修复方向：nest 改经 X16/X17（IP scratch，天然 caller-saved，天然无冲突）或修正调用方 regmask 使 X19 被视为跨 icallcc 调用破坏 | ❌ 遗留（记录在案；L2 算法级 combo1 未触发（压力不足），应用级 combo1 = 3/4 应用可用，sqlite 受阻） |
 
 ### 缺陷 2 详录（enstr 跨 TU，2026-10-10 反汇编逆向定位）
 
@@ -664,3 +667,153 @@ python3 test/perf/vmp_fn_bench.py
 - macOS arm64 单机测试；icall 的 x19/icallcc 约定、vmp 准入条件在其他目标可能不同。
 - `ld64.lld` 与 macOS 27 SDK tbd 不兼容是环境问题（见「测试方法」第 4 条）。
 - 遗留缺陷（ibr+vmfla 组合、VMP 问题清单）修复后重跑上述命令即可复测对比；lua/vmfla 已于 2026-10-16 修复。
+
+## 2026-10-20 复测：BCF 谓词常量比较 + 模块级共享导出 export_write（weak）
+
+工具链变化（其余方法与本报告一致，本轮全部 `-O0`）：
+
+- 谓词从"两次 volatile 读自比较（`x == x op K`）"改为 **`(seed op K) ==/!= 随机常量 C`**：C 避开默认值 0 过同一运算的期望结果，极性按改写点随机（`==` 恒假 / `!=` 恒真，真假边排布对调）——反编译视图无自比较签名；恒定性以 seed 保持默认 0 为前提（uint16 双射，对常量比较不存在取值无关构造），外部库约定只读。
+- seed 从每函数 `vllvm.bcf.seed.<函数名>` 收敛为模块级共享导出变量 **`export_write`**（WeakAnyLinkage，不带 vllvm 前缀）；函数内不再初始化（含入口归一链删除）。
+- 本轮发现并修复缺陷 #6（多 TU 强定义重定义冲突 → weak 合并），修复后 16/16 配置全过、输出与基线逐字节一致。
+- 原始数据：L2 `tmp/perfbench/algo-vmfla/results_O0.json`；L3 `tmp/perfbench/bcf-export-write-weak/results.json`。
+
+### L2 算法基准（7 算法，vs base）
+
+| 配置 | aes | crc32 | des | md5 | rc4 | sha256 | sm4 | 范围 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bcf | 2.53x | 2.14x | 1.28x | 2.18x | 2.63x | 1.57x | 1.07x | **1.07~2.63x** |
+| vmfla | 1.73x | 2.58x | 2.58x | 5.13x | 2.46x | 1.84x | 1.39x | 1.39~5.13x |
+| bcfvmfla | 12.49x | 5.91x | 2.78x | 11.99x | 14.51x | 7.17x | 3.23x | 2.78~14.51x |
+
+### L3 应用基准（4 应用 × 4 配置，vs base 中位数）
+
+| 配置 | bzip2 | zlib | lua | sqlite |
+| --- | --- | --- | --- | --- |
+| bcf | 1.69x | 2.42x | 2.39x | 1.74x |
+| vmfla | 4.32x | 4.06x | 4.20x | 6.72x |
+| bcfvmfla | 10.08x | 11.74x | 8.64x | 11.02x |
+
+### 要点
+
+- **多 TU 修复**：首轮 L3 的 bcf/bcfvmfla 共 8 配置全部 `duplicate symbol _export_write` 链接失败（强定义）；改 WeakAnyLinkage 后全过。注意 bzip2/zlib 首轮同样失败——此前"每函数唯一符号名"掩盖了多 TU 场景。
+- **bcf 开销较 2026-10-13 节明显回落**（L3 运行时 8.65x → 1.7~2.4x）：该节之后切割粒度已放宽（≥8 条才切、每段至少 4 条，单后继分支改写点大幅减少），本轮再叠加谓词链精简——单次 volatile 读 + 单运算 + 常量比较，函数内无 seed 初始化链；L2 趋势一致（1.07~2.63x）。
+- 正确性门槛全过：L2 官方测试向量 + 四配置摘要逐一相等；L3 每轮 stdout 与 base 逐字节一致；新增 L1 回归 `test/boguscontrolflow/test_bcf_multi_tu.sh`。
+
+### 其余 Pass 全量复测（ibr / icall / enstr / bb2func / merge / vmp）
+
+同轮工具链（`-O0`，含缺陷 #6/#7 修复后编译器），全程序标注、6 轮取中位；
+28/28 配置全过、输出与基线逐字节一致。原始数据
+`tmp/perfbench/allpasses-1020-fixed/results.json`（首轮
+`allpasses-1020` 中 bzip2/vmp 因缺陷 #7 链接失败，仅作过程记录）。
+
+运行时（vs base）：
+
+| Pass | bzip2 | zlib | lua | sqlite |
+| --- | --- | --- | --- | --- |
+| ibr | 2.16x | 2.01x | 1.73x | 2.35x |
+| icall | 1.07x | 1.04x | 1.18x | 2.44x |
+| enstr | 0.99x | 1.01x | 1.03x | 1.00x |
+| bb2func | 1.74x | 1.98x | 1.22x | 1.88x |
+| merge | 1.04x | 1.06x | 1.08x | 1.43x |
+| vmp | 1.02x | 3.47x | 1.54x | 15.18x |
+
+二进制体积（vs base）：ibr **2.1~2.6x**；icall **1.1~1.5x**；enstr
+**1.1~1.2x**；bb2func **1.6~2.0x**；merge **1.1~1.3x**；vmp
+**1.1~1.4x**（bzip2 1.22x / zlib 1.24x / lua 1.43x / sqlite 1.08x）。
+
+要点：
+
+- **缺陷 #7 修复后 vmp 四应用全过**：bzip2/vmp 1.02x（全程序标注下热点
+  回退为主，与既有结论一致）、sqlite/vmp 15.2x（174 个中层函数被虚拟化
+  的既有形态），vmp 编译耗时 sqlite 213s（≈460x base 的 0.5s）仍是
+  编译开销主项。
+- **与「结论速览」（2026-10-10）相比整体比值更低**：该轮为 -O2 时代
+  口径，混淆×优化互斥（`1e355f2`）后一切混淆构建 `-O0`——基线本身
+  变慢、同混淆代码的相对比值相应压缩。同口径纵向对比以本节为准。
+- enstr 恒定 ≈1.0x；icall 仅 sqlite 明显（2.44x，跨 TU 仅入池间接化、
+  热点集中于少数内部函数）；merge/bb2func/ibr 与 10-10 结论方向一致、
+  数值随 -O0 口径回落。
+
+## 2026-10-20 组合测试（策略定版 + 缺陷 #3 修复）
+
+**组合策略定版**：三组组合，不与 bcf 叠加；**不向全部函数施加混淆**——
+应用级组合经 `--annotate-fraction` 选择性注入（每 TU 按函数规模降序取
+前 50%），算法级本就只标注各算法顶层处理函数。
+
+| 配置 | 标注集 |
+| --- | --- |
+| combo1 | enstr + icall + ibr |
+| combo2 | vmfla + ibr |
+| combo3 | enstr + icall + vmfla |
+
+组合测试三层口径：组合性能只在算法级测，应用级组合只做可用性
+（编译成功 + 单次执行输出与基线一致，`--runs 0`）。
+
+### 缺陷 #3 修复：vmfla+ibr 调度顺序（combo2 的前置修复）
+
+旧调度反序执行（ibr 在函数分发早期先改写，vmfla 晚期再面对已被改成
+indirectbr 的 CFG）：地址表跳转网络被当孤岛排除在状态机外、入口边
+错接 dispatcher，函数体整体不执行——最小复现 `mix(7)` 原样返回 7
+（base 244）。修复（`PassInfo.cpp` `IbrLateAttr`）：同函数两者都标注
+时 ibr 延迟到晚期分发**紧随 vmfla** 执行，作用于平坦化产物
+`<fn>.vllvm.impl`；vmfla 回退时作用于原函数。修复后 28 对冒烟全过、
+`test_vmfla_indirectbr`（computed goto 输入场景）无回归、L1 27/27。
+
+### 逐对组合冒烟（L1 新增）
+
+`test/complex/test_pair_combos.sh`：8 个 pass（fla 为 vmfla 别名不重复
+入池）两两组合 × 28 对，编译 + 运行 + 退出码等价，**28/28 全过**。
+
+### 算法级组合性能（vs base，L2，只标注顶层处理函数）
+
+| 配置 | aes | crc32 | des | md5 | rc4 | sha256 | sm4 | 范围 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| combo1（enstr+icall+ibr） | 1.74x | 1.24x | 2.00x | 2.92x | 1.21x | 1.21x | 1.43x | **1.2~2.9x** |
+| combo2（vmfla+ibr） | 3.11x | 6.97x | 4.03x | 20.08x | 5.34x | 4.15x | 2.59x | **2.6~20.1x** |
+| combo3（enstr+icall+vmfla） | 2.18x | 2.45x | 2.49x | 4.99x | 2.20x | 1.78x | 1.73x | **1.7~5.0x** |
+
+要点：combo1 最轻（enstr≈1.0x、icall 热路径近零，开销基本来自 ibr）；
+combo2 最重（vmfla × ibr 相互放大，md5 达 20x）；combo3 居中。历史
+参考：同日旧口径组合（含 bcf、全函数标注）曾测得 10.5~43.9x——
+bcf 参与叠加与全函数标注是当时开销居高的两个因素。
+
+### 应用级组合可用性（L3，--runs 0，--annotate-fraction 0.5）
+
+| 配置 | bzip2 | zlib | lua | sqlite |
+| --- | --- | --- | --- | --- |
+| combo1（enstr+icall+ibr） | ✅ | ✅ | ✅ | ❌ 缺陷 #8（SIGBUS，输出完整后崩溃） |
+| combo2（vmfla+ibr） | ✅ | ✅ | ✅ | ✅ |
+| combo3（enstr+icall+vmfla） | ✅ | ✅ | ✅ | ✅ |
+
+原始数据 `tmp/perfbench/combo-1020-final/results.json`（combo1 sqlite
+失败已定界至单函数：函数级二分收敛到 shell.c `process_input`，仅对该
+函数施加 enstr+icall 即复现；`--annotate-fraction 0.5` 下每 TU 标注
+规模降序前 50%）。注意逐对冒烟（28/28，小 fixture）未触发 #8——该
+缺陷是**寄存器压力敏感**的，小函数不会把活跃值分配到 X19 跨 icallcc
+调用。
+
+### 编译耗时结论（回应"编译卡在哪"）
+
+组合编译**不是瓶颈**：bzip2 全部 8 TU 并行 + 链接共 0.2~0.3s（手动逐
+TU 实测最慢 1s）；此前误读的"20 分钟"实为 1 次预热 + 6 次计时的
+**执行**时间（combo2 单次执行 ≈ 195~302s，与算法级开销一致）。真正
+编译耗时的是 **vmp×sqlite（213s，VMP 字节码编译）**，与本组合策略
+无关（组合不含 vmp）。组合测试轮的墙钟几乎全部由混淆产物的单次
+执行时间构成——这也是组合性能只在算法级测、应用级只做单次可用性
+验证的原因。
+
+### enstr 新运行时应用级验证（协议改版后）
+
+enstrpool.c 协议改版（i32 下标、key[8] 循环异或、无 CAS 单线程首次
+初始化）配套 EncryptoStrPass 后，应用级可用性 4/4 全过（编译成功 +
+单次执行输出与基线逐字节一致，`--runs 0`）：
+
+| 配置 | bzip2 | zlib | lua | sqlite |
+| --- | --- | --- | --- | --- |
+| enstr（全函数标注） | ✅ | ✅ | ✅ | ✅ |
+| combo3（enstr+icall+vmfla，0.5 选择性标注） | ✅ | ✅ | ✅ | ✅ |
+
+过程中修复 L3 之外的 LTO 误编译：vmp+enstr+LTO 下解密循环的
+`key[j & 7]` 被向量化成跨描述符越界读（长度 ≥32 的字符串前 8 字节
+外全部错误），密钥读取加 volatile 阻断（见 `enstrpool.c` 注释）。
+原始数据：`tmp/perfbench/enstr-new-1020{,-combo}/results.json`。
