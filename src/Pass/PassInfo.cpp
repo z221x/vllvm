@@ -17,6 +17,9 @@ constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
 // vmfla 链路标记：bb2func+merge 完成后，vmfla 在第二段函数级处理里执行。
 constexpr StringLiteral VmFlattenPendingAttr = "vllvm.vmfla.pending";
+// vmfla+ibr 同函数组合标记：ibr 必须在 vmfla 平坦化之后再执行，此处
+// 记录延迟到晚期分发（缺陷 #3 的根因是反序执行）。
+constexpr StringLiteral IbrLateAttr = "vllvm.ibr.late";
 
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
   return Options.VMFlattenFunc || Options.IndirectCall ||
@@ -127,8 +130,17 @@ public:
       FunctionOptions.BogusControlFlow = false;
     }
 
-    if (FunctionOptions.IndirectBranch)
-      RunPass(IndirectBranchPass());
+    // ibr 与 vmfla 组合时顺序必须是 vmfla 先平坦化、ibr 再对平坦化产物
+    // 做地址表跳转：反序会让 vmfla 面对已被 ibr 改写成 indirectbr 的
+    // CFG，地址表跳转网络被当孤岛排除在状态机外、入口边错接
+    // dispatcher，函数体整体不执行（缺陷 #3）。同函数两者都标注时把
+    // ibr 延迟到晚期分发紧随 vmfla 执行。
+    if (FunctionOptions.IndirectBranch) {
+      if (F.hasFnAttribute(VmFlattenPendingAttr))
+        F.addFnAttr(IbrLateAttr);
+      else
+        RunPass(IndirectBranchPass());
+    }
 
     // fla/lvars 的常量表改为参数传递：函数体搬到带表参数的私有 impl，
     // 原函数退化为传表包装器；没有表引用或不支持时保持原样。
@@ -153,6 +165,18 @@ public:
 
     PreservedAnalyses PA = PreservedAnalyses::all();
     PA.intersect(VMFlattenFuncPass().run(F, FAM));
+
+    // vmfla+ibr 组合：ibr 在平坦化之后执行。vmfla 把函数体搬进
+    // <fn>.vllvm.impl（带表参数）并让原函数退化为传表包装器时，ibr
+    // 作用于平坦化后的真实函数体；vmfla 整体回退（无 impl）时作用于
+    // 原函数。
+    if (F.hasFnAttribute(IbrLateAttr)) {
+      F.removeFnAttr(IbrLateAttr);
+      Function *Impl = F.getParent()->getFunction(
+          (F.getName() + ".vllvm.impl").str());
+      PA.intersect(
+          IndirectBranchPass().run(Impl ? *Impl : F, FAM));
+    }
     return PA;
   }
 };
