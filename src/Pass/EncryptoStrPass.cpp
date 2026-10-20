@@ -64,16 +64,9 @@ bool isMarkedStringTarget(GlobalVariable &StringGV) {
 } // namespace
 
 namespace {
-// 与 enstrpool.c 的 enstr_key_byte 保持一致：单字节种子做 xorshift8
-// 步进并混入字节位置；密文与运行时解密由同一函数派生密钥流。
-uint8_t enstrKeyByte(uint8_t Key, uint64_t J) {
-  uint8_t K = Key;
-  for (unsigned I = static_cast<unsigned>(J & 7); I; --I) {
-    K ^= static_cast<uint8_t>(K << 1);
-    K ^= static_cast<uint8_t>(K >> 2);
-  }
-  return static_cast<uint8_t>(K ^ static_cast<uint8_t>(J));
-}
+// 与 enstrpool.c 的解密保持一致：8 字节密钥按 key[j & 7] 循环异或；
+// 密文与运行时解密由同一密钥流派生。
+constexpr size_t RuntimeKeySize = 8;
 } // namespace
 
 class EncryptoStrPass::EncryptoStr {
@@ -108,12 +101,13 @@ public:
     strVar->setConstant(false);
   }
 
-  // 运行时密钥流只用首字节种子；其余字节保留给后续扩展。
+  // 运行时密钥流只用前 RuntimeKeySize 字节做循环异步；其余字节保留给
+  // 后续扩展。
   std::string encrypto(StringRef strRef) const {
     std::string result(strRef.begin(), strRef.end());
     for (size_t i = 0; i < result.size(); ++i) {
-      result[i] = static_cast<char>(static_cast<uint8_t>(result[i]) ^
-                                    enstrKeyByte(encKey[0], i));
+      result[i] = static_cast<char>(
+          static_cast<uint8_t>(result[i]) ^ encKey[i % RuntimeKeySize]);
     }
     return result;
   }
@@ -137,7 +131,7 @@ public:
     auto createDecryptedValue = [&](Instruction *Before) -> Value * {
       IRBuilder<> IRB(Before);
       Value *Plain = fixEH(IRB.CreateCall(
-          Accessor, {IRB.getInt64(static_cast<uint64_t>(tableIndex))}));
+          Accessor, {IRB.getInt32(static_cast<uint32_t>(tableIndex))}));
       if (!isDouble)
         return Plain;
       Value *Slot = IRB.CreateAlloca(IRB.getPtrTy(), nullptr);
@@ -159,10 +153,10 @@ public:
 namespace {
 
 // 字符串池：模块内全部密文解密到一块匿名内存，统一按下标访问。
-// 明文只存在于匿名页（不在堆、不在可静态反汇编的数据段），初始化用
-// 原子 CAS 抢锁，并发首次访问也只分配一次。池逻辑（mmap/CAS/解密/
-// 下标访问）由 src/c_func/enstrpool/enstrpool.c 以位码链入，Android/ELF
-// 优先；这里只负责链接运行时并生成描述表。
+// 明文只存在于匿名页（不在堆、不在可静态反汇编的数据段）。池逻辑
+// （mmap/解密/下标访问）由 src/c_func/enstrpool/enstrpool.c 以位码链入，
+// Android/ELF 优先；2026-10-20 起运行时无 CAS 抢锁（单线程首次初始化
+// 语义），密钥为 8 字节循环异或；这里只负责链接运行时并生成描述表。
 
 struct PoolMember {
   GlobalVariable *GV = nullptr;
@@ -212,7 +206,6 @@ Function *linkEnstrPoolRuntime(Module &M) {
 bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
                           uint64_t TotalSize) {
   LLVMContext &Ctx = M.getContext();
-  IntegerType *I64Ty = Type::getInt64Ty(Ctx);
   IntegerType *I32Ty = Type::getInt32Ty(Ctx);
   IntegerType *I8Ty = Type::getInt8Ty(Ctx);
   StructType *DescTy =
@@ -222,11 +215,13 @@ bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
 
   SmallVector<Constant *, 16> Elems;
   for (const PoolMember &Member : Members) {
-    // 密钥流只用首字节种子；isdec 初始为 0（未解密）。
+    // desc 与运行时结构体一致：{i32 offset, i32 size, [8 x i8] key,
+    // i8 isdec}；解密用 key[j & 7] 循环异或，isdec 初始为 0（未解密）。
+    Constant *KeyBytes = ConstantDataArray::get(
+        Ctx, ArrayRef<uint8_t>(Member.Key->data(), RuntimeKeySize));
     Elems.push_back(ConstantStruct::get(
-        DescTy, {ConstantInt::get(I64Ty, Member.Offset),
-                 ConstantInt::get(I32Ty, Member.Cipher.size()),
-                 ConstantInt::get(I8Ty, (*Member.Key)[0]),
+        DescTy, {ConstantInt::get(I32Ty, Member.Offset),
+                 ConstantInt::get(I32Ty, Member.Cipher.size()), KeyBytes,
                  ConstantInt::get(I8Ty, 0)}));
   }
 
@@ -274,10 +269,11 @@ bool materializePoolTable(Module &M, ArrayRef<PoolMember> Members,
     GV->setConstant(true);
     GV->setLinkage(GlobalValue::InternalLinkage);
   };
-  DefineConst("__vllvm_enstr_count", I64Ty,
-              ConstantInt::get(I64Ty, Members.size()));
-  DefineConst("__vllvm_enstr_pool_size", I64Ty,
-              ConstantInt::get(I64Ty, TotalSize));
+  // 运行时按 u32 声明这两个链接期常量（enstrpool.c）。
+  DefineConst("__vllvm_enstr_count", I32Ty,
+              ConstantInt::get(I32Ty, Members.size()));
+  DefineConst("__vllvm_enstr_pool_size", I32Ty,
+              ConstantInt::get(I32Ty, TotalSize));
 
   // MAP_PRIVATE|MAP_ANON：Android/ELF 0x22，Darwin 0x1002；PROT_RW、fd
   // 固定在运行时里。

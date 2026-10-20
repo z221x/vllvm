@@ -28,7 +28,7 @@ for opt in 0; do
   # 调用形态断言只在 O0 做：O2 的后续优化可能内联访问器。
   grep -q 'vllvm_enstr_pool_base' "$OUT_DIR/enstr_O$opt.ll"
   if [[ $opt == 0 ]]; then
-    grep -Eq 'call ptr @__vllvm_enstr_get\(i64 [0-9]+\)' "$OUT_DIR/enstr_O$opt.ll"
+    grep -Eq 'call ptr @__vllvm_enstr_get\(i32 [0-9]+\)' "$OUT_DIR/enstr_O$opt.ll"
   fi
   if grep -q 'vllvm.enstr.const.table' "$OUT_DIR/enstr_O$opt.ll"; then
     echo 'level 1 must not encrypt constants' >&2; exit 1

@@ -17,7 +17,8 @@ for opt in 0 2; do
     "$ROOT/test/enstr/test_enstr_cache.ll" -o "$ir"
   "$LLVM_AS" "$ir" -o /dev/null
   # 整个模块只有一个匿名池：一个 base、一次申请、一次解密发布。
-  # 池逻辑来自链入的 C 运行时；描述表/flags 是 internal 常量，O2 会把
+  # 池逻辑来自链入的 C 运行时（2026-10-20 起无 CAS 抢锁：单线程首次
+  # 初始化语义，无原子操作）；描述表/flags 是 internal 常量，O2 会把
   # 它们折叠进指令，相关断言只在 O0 做。
   [[ $(grep -Ec '^@vllvm_enstr_pool_base = internal global ptr null' "$ir") == 1 ]]
   if [[ $opt == 0 ]]; then
@@ -35,13 +36,14 @@ fi
 grep -q "@__vllvm_enstr_mmap_flags = internal .* constant i32 $MMAP_FLAGS" "$ir"
     [[ $(grep -Ec 'define .*@__vllvm_enstr_get\(' "$ir") == 1 ]]
   fi
-  grep -Eq 'load atomic (ptr|i64).*acquire' "$ir"
-  grep -q 'cmpxchg ptr.*acq_rel acquire' "$ir"
-  grep -Eq 'store atomic (ptr|i64).*release' "$ir"
+  # 新运行时无原子操作：出现 cmpxchg/atomic 即回归旧协议。
+  if grep -Eq 'cmpxchg|load atomic|store atomic' "$ir"; then
+    echo 'pool runtime must be lock-free atomic variant (no CAS)' >&2; exit 1
+  fi
   grep -q 'call void @llvm.trap' "$ir"
-  # 下标访问：直接引用与指针别名都走 get(i64 下标)。O2 内联后看不到调用形态。
+  # 下标访问：直接引用与指针别名都走 get(i32 下标)。O2 内联后看不到调用形态。
   if [[ $opt == 0 ]]; then
-    [[ $(grep -Ec 'call ptr @__vllvm_enstr_get\(i64 [0-9]+\)' "$ir") -ge 3 ]]
+    [[ $(grep -Ec 'call ptr @__vllvm_enstr_get\(i32 [0-9]+\)' "$ir") -ge 3 ]]
   fi
   if grep -Eq 'cache-alpha|cache-beta' "$ir"; then
     echo 'plaintext string survived encryption' >&2; exit 1
@@ -65,8 +67,8 @@ grep -q "@__vllvm_enstr_mmap_flags = internal .* constant i32 $MMAP_FLAGS" "$ir"
     "$ROOT/test/enstr/test_enstr_cache_driver.c" "$OUT_DIR/O$opt.o" \
     -o "$OUT_DIR/O$opt"
   "$OUT_DIR/O$opt" single
-  # Separate processes ensure every concurrent run starts with an empty pool.
-  for run in 1 2 3; do "$OUT_DIR/O$opt" threads; done
+  # 新运行时为单线程首次初始化语义（无 CAS 抢锁），不再做并发竞争
+  # 验证；单进程运行保证从空池开始。
   "$OUT_DIR/O$opt" oom
 done
 
@@ -88,4 +90,4 @@ grep -Eq 'call ptr @mmap\(ptr( noundef)? null, i64' "$OUT_DIR/i386-unknown-linux
 # Android 目标确认 ELF 常量：MAP_PRIVATE|MAP_ANONYMOUS=0x22。
 grep -q '@__vllvm_enstr_mmap_flags = internal .* constant i32 34' "$OUT_DIR/aarch64-linux-android23.ll"
 grep -Eq 'call ptr @mmap\(ptr( noundef)? null, i64' "$OUT_DIR/aarch64-linux-android23.ll"
-echo 'PASS enstr pool: linked C runtime; one anonymous region; index access; races'
+echo 'PASS enstr pool: linked C runtime; one anonymous region; index access'

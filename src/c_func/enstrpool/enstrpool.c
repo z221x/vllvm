@@ -5,8 +5,6 @@
  * 首次被 __vllvm_enstr_get 取用时才在池内解密（isdec 标记），反 dump
  * 只能拿到被访问过的片段。表等链接期常量由 pass 在链接后填充。
  * mmap 只声明不定义，最终链接时由目标平台 libc 提供。 */
-
-#include <stdatomic.h>
 #include <stdint.h>
 
 /* 自行声明 mmap，避免依赖宿主头文件。参数用固定位宽：位码按 LP64
@@ -18,83 +16,49 @@ void *mmap(void *addr, uint64_t length, int prot, int flags, int fd,
  * 位码链入后填充；命名带 __vllvm 前缀避免与用户符号撞名导致链接回退。 */
 uint8_t *__vllvm_enstr_src = 0;
 struct vllvm_enstr_desc {
-  uint64_t offset;    /* 池内/密文源内字节下标 */
-  uint32_t size;      /* 含结尾 NUL 的字节数 */
-  uint8_t key;        /* 单字节密钥种子，按位置派生密钥流 */
+  uint32_t offset;    /* 字符串在池内偏移量 */
+  uint32_t size;      /* 字符串大小 */
+  uint8_t key[8];     /* 密钥 */
   uint8_t isdec;      /* 已解密标记；表因此必须可写 */
 };
 
 extern struct vllvm_enstr_desc *__vllvm_enstr_table;
-extern const uint64_t __vllvm_enstr_count;
-extern const uint64_t __vllvm_enstr_pool_size;
+extern const uint32_t __vllvm_enstr_count;
+extern const uint32_t __vllvm_enstr_pool_size;
 /* MAP_PRIVATE|MAP_ANON 的值随平台不同（Android/ELF 0x22，Darwin 0x1002），
  * 由 pass 按模块 triple 提供；PROT_READ|PROT_WRITE=3、fd=-1 固定。 */
 extern const uint32_t __vllvm_enstr_mmap_flags;
 
-/* 池基址：0=未初始化，1=初始化中，其余=匿名页基址。 */
-#define VLLVM_ENSTR_BUSY ((void *)(uintptr_t)1)
-static _Atomic(void *) vllvm_enstr_pool_base;
-
-/* 由单字节种子做 xorshift8 步进并混入字节位置；pass 侧以同一函数
- * 生成密文。步进次数限制在 8 以内，长串不会退化成 O(n^2)。 */
-static uint8_t enstr_key_byte(const struct vllvm_enstr_desc *d, uint64_t j) {
-  uint8_t k = d->key;
-  for (unsigned i = (unsigned)(j & 7); i; --i) {
-    k ^= (uint8_t)(k << 1);
-    k ^= (uint8_t)(k >> 2);
-  }
-  return (uint8_t)(k ^ j);
-}
+static uint8_t *vllvm_enstr_pool_base = 0x0;
 
 static void __vllvm_enstr_init(void) {
-  void *seen = 0;
-  if (!atomic_compare_exchange_strong_explicit(
-          &vllvm_enstr_pool_base, &seen, VLLVM_ENSTR_BUSY,
-          memory_order_acq_rel, memory_order_acquire)) {
-    /* 抢锁失败：等初始化方发布；看到真实基址则直接返回。 */
-    while (atomic_load_explicit(&vllvm_enstr_pool_base,
-                                memory_order_acquire) == VLLVM_ENSTR_BUSY) {
-    }
-    return;
-  }
+  uint8_t *region = (uint8_t *)mmap(0, __vllvm_enstr_pool_size, 3, __vllvm_enstr_mmap_flags, -1, 0);
 
-  char *region =
-      mmap(0, __vllvm_enstr_pool_size, 3, __vllvm_enstr_mmap_flags, -1, 0);
   if (region == (void *)-1)
-    __builtin_trap(); /* 失败不能发布哨兵，也不能让他人永久等待。 */
-
-  /* 只拷密文：初始化完成后内存里仍没有任何明文。密文源按池布局
-   * 平铺，这里等价于一次整块搬运。 */
-  for (uint64_t i = 0; i < __vllvm_enstr_count; ++i) {
+    __builtin_trap();
+  for (uint32_t i = 0; i < __vllvm_enstr_count; ++i) {
     const struct vllvm_enstr_desc *d = &__vllvm_enstr_table[i];
-    for (uint64_t j = 0; j < d->size; ++j)
+    for (uint32_t j = 0; j < d->size; ++j)
       region[d->offset + j] = __vllvm_enstr_src[d->offset + j];
   }
-  atomic_store_explicit(&vllvm_enstr_pool_base, region, memory_order_release);
+  vllvm_enstr_pool_base = region;
 }
 
-/* index 是描述表下标。解密从密文源重算目标字节（幂等）：并发首访
- * 同一字符串时重复计算结果相同，不会出现原地 XOR 的二次解密损坏。 */
-char *__vllvm_enstr_get(uint64_t index) {
-  void *base =
-      atomic_load_explicit(&vllvm_enstr_pool_base, memory_order_acquire);
-  if (base == 0) {
+uint8_t *__vllvm_enstr_get(uint32_t offset) {
+  if (vllvm_enstr_pool_base == 0) {
     __vllvm_enstr_init();
-    base = atomic_load_explicit(&vllvm_enstr_pool_base, memory_order_acquire);
-  } else if (base == VLLVM_ENSTR_BUSY) {
-    do {
-      base = atomic_load_explicit(&vllvm_enstr_pool_base,
-                                  memory_order_acquire);
-    } while (base == VLLVM_ENSTR_BUSY);
   }
-
-  struct vllvm_enstr_desc *d = &__vllvm_enstr_table[index];
-  if (!__atomic_load_n(&d->isdec, __ATOMIC_ACQUIRE)) {
-    char *region = (char *)base;
-    for (uint64_t j = 0; j < d->size; ++j)
-      region[d->offset + j] =
-          (char)(__vllvm_enstr_src[d->offset + j] ^ enstr_key_byte(d, j));
-    __atomic_store_n(&d->isdec, 1, __ATOMIC_RELEASE);
+  struct vllvm_enstr_desc *d = (struct vllvm_enstr_desc *)(__vllvm_enstr_table + offset);
+  if (!d->isdec) {
+    /* 密钥读取必须 volatile：LTO 后端会把 key[j & 7] 的周期访问
+     * 向量化成从 key 字段起连续 32 字节的加载（越界读到 isdec、
+     * 填充与下一个描述符），长度 >= 32 的字符串除前 8 字节外全部
+     * 解密错误。volatile 阻断该向量化。 */
+    for (uint32_t j = 0; j < d->size; ++j)
+      vllvm_enstr_pool_base[d->offset + j] =
+          (uint8_t)(__vllvm_enstr_src[d->offset + j] ^
+                    *(volatile const uint8_t *)&d->key[j & 7]);
+    d->isdec = 1;
   }
-  return (char *)base + d->offset;
+  return vllvm_enstr_pool_base + d->offset;
 }
