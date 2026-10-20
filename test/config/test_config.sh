@@ -100,7 +100,7 @@ grep -q '\[vllvm\] VLLVMConfig:vmfla: level=2 (default=1 max=2)' "$OUT_DIR/bad.l
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
   -DVLLVM_TEST_BCF=1 -mllvm -vllvm-config=bcf=0 \
   "$BCF_SRC" -S -emit-llvm -o "$OUT_DIR/bcf_off.ll" 2>"$OUT_DIR/bcf_off.log"
-if grep -Eq "vllvm\.bcf\.(seed|fake|cmp)" "$OUT_DIR/bcf_off.ll"; then
+if grep -Eq "@export_write|vllvm\.bcf\.(seed|fake|cmp)" "$OUT_DIR/bcf_off.ll"; then
   echo "bcf=0 unexpectedly transformed the module" >&2
   exit 1
 fi
@@ -109,7 +109,7 @@ grep -q '\[vllvm\] VLLVMConfig:bcf: level=0 (default=1 max=3)' "$OUT_DIR/bcf_off
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
   -DVLLVM_TEST_BCF=1 "$BCF_SRC" -S -emit-llvm -o "$OUT_DIR/bcf_l1.ll" 2>"$OUT_DIR/bcf_l1.log"
 grep -q '\[vllvm\] VLLVMConfig:bcf: level=1 (default=1 max=3)' "$OUT_DIR/bcf_l1.log"
-grep -q "vllvm\.bcf\.seed" "$OUT_DIR/bcf_l1.ll"
+grep -q "@export_write" "$OUT_DIR/bcf_l1.ll"
 [ "$(count_bcf_fake "$OUT_DIR/bcf_l1.ll")" -gt 0 ] || {
   echo "bcf default level produced no bogus flow" >&2
   exit 1

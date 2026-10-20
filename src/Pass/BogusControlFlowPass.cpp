@@ -26,6 +26,13 @@ constexpr llvm::StringRef BogusBlockPrefix = "vllvm.bcf.fake.";
 constexpr unsigned Level1Probability = 60;
 constexpr unsigned Level2Probability = 85;
 
+// seed 导出全局的静态初始化器为 0 且函数内不初始化，默认运行时值即
+// 0。改写点谓词 (seed op K) ==/!= C 以该默认值为镜像基点：C 避开
+// 0 过同一运算的期望结果。uint16 上 add/sub/xor 均为双射，对常量
+// 比较不存在取值无关的永假构造——恒定性以 seed 保持默认 0 为前提，
+// 外部库使用约定为引用读取、运行期不改写。
+constexpr uint32_t DefaultSeedValue = 0;
+
 bool isGeneratedBlock(BasicBlock &BB) {
   return BB.hasName() && BB.getName().starts_with(BogusBlockPrefix);
 }
@@ -55,17 +62,27 @@ void addEdgeFixPhi(BasicBlock *From, BasicBlock *To) {
       PN.addIncoming(UndefValue::get(PN.getType()), From);
 }
 
-// seed 保存为每函数导出全局变量（external linkage + 默认可见性）：外部
-// 库可按符号名引用并在函数执行前任意初始化。函数内不再做任何初始化
-// ——运行时取值（静态 0 或外部写入）编译期与反编译期均不可求解，也
-// 不存在可折叠的明文推导链。初始化器为 0，不携带明文。
-GlobalVariable *createSeedGlobal(Function &F) {
+// seed 是模块级导出全局变量（WeakAnyLinkage + 默认可见性）：
+// 所有 bcf 函数共享同一符号 export_write——符号名刻意不带 vllvm
+// 前缀，避免自曝混淆器特征；首个 bcf 函数创建、后续复用，外部库按
+// 该符号引用读取。取 weak 定义：多个 TU 各自使用 bcf 时，各模块携带
+// 同值（0）弱定义，链接器合并为全程序同一变量，不会重定义冲突。
+// 函数内不再做任何初始化，静态初始
+// 化器为 0——改写点谓词以该默认值为镜像基点（见 DefaultSeedValue），
+// 运行期改写非零值可能翻转虚假边，外部使用约定为不改写。真实执行流
+// 只读 seed（虚假块的写回位于永不可达块），多函数/多线程共享同一
+// 变量不互相干扰；volatile 读取保证不被常量传播折叠。
+GlobalVariable *createOrReuseSeedGlobal(Function &F, bool &Created) {
   Module *M = F.getParent();
+  if (GlobalVariable *Existing = M->getGlobalVariable("export_write")) {
+    Created = false;
+    return Existing;
+  }
+  Created = true;
   Type *I16Ty = Type::getInt16Ty(F.getContext());
   auto *GV = new GlobalVariable(
-      *M, I16Ty, /*isConstant=*/false, GlobalValue::ExternalLinkage,
-      ConstantInt::get(I16Ty, 0),
-      (Twine("vllvm.bcf.seed.") + F.getName()).str());
+      *M, I16Ty, /*isConstant=*/false, GlobalValue::WeakAnyLinkage,
+      ConstantInt::get(I16Ty, 0), "export_write");
   GV->setAlignment(Align(2));
   return GV;
 }
@@ -78,23 +95,36 @@ LoadInst *loadSeedVolatile(IRBuilder<> &IRB, Value *SeedPtr) {
 }
 
 // 随机算法运算加密：对传入值只做一次非零 add/sub/xor（无乘法、不叠加
-// 多轮），全部运算在 uint16（i16 回绕）上。K 非零保证结果必不等于原值
-// （uint16 上 x±K/x^K == x 当且仅当 K==0），改写点谓词的永假性由此
-// 保证，与 seed 运行时取值无关。
-Value *applyEncryptionOp(IRBuilder<> &IRB, Value *Seed, CryptoUtils &Crypto) {
+// 多轮），全部运算在 uint16（i16 回绕）上，并同步镜像计算 SeedValue
+// 经运算后的期望值——调用方据此选择不等于期望值的比较常量，构造
+// (seed op K) ==/!= C 的恒定谓词（seed 默认 0 时 == 恒假 / != 恒真）。
+Value *applyEncryptionOp(IRBuilder<> &IRB, Value *Seed, uint32_t SeedValue,
+                         CryptoUtils &Crypto, uint32_t &Encrypted) {
   Type *I16Ty = Type::getInt16Ty(IRB.getContext());
+  uint32_t Expected = SeedValue & 0xFFFF;
   uint32_t K;
   do {
     K = Crypto.getRandom32() & 0xFFFF;
   } while (K == 0);
+  Value *V = nullptr;
+
   switch (Crypto.getRandom32() % 3) {
   case 0:
-    return IRB.CreateAdd(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.add");
+    V = IRB.CreateAdd(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.add");
+    Expected = (Expected + K) & 0xFFFF;
+    break;
   case 1:
-    return IRB.CreateSub(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.sub");
+    V = IRB.CreateSub(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.sub");
+    Expected = (Expected - K) & 0xFFFF;
+    break;
   default:
-    return IRB.CreateXor(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.xor");
+    V = IRB.CreateXor(Seed, ConstantInt::get(I16Ty, K), "vllvm.bcf.enc.xor");
+    Expected ^= K;
+    break;
   }
+
+  Encrypted = Expected;
+  return V;
 }
 
 // 可克隆进虚假块的指令：排除终结指令/PHI（依附于前驱结构）、alloca
@@ -142,7 +172,8 @@ BasicBlock *createJunkBlockBody(
   Value *V = loadSeedVolatile(IRB, SeedPtr);
   if (CloneSources.empty()) {
     // 没有可克隆指令（极小函数）时退回单次随机运算。
-    V = applyEncryptionOp(IRB, V, Crypto);
+    uint32_t Discarded;
+    V = applyEncryptionOp(IRB, V, DefaultSeedValue, Crypto, Discarded);
   } else {
     const SmallVectorImpl<Instruction *> &Src =
         CloneSources[Crypto.getRandom32() % CloneSources.size()];
@@ -272,14 +303,17 @@ bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
 
   SmallVector<BasicBlock *, 8> Junks;
   GlobalVariable *SeedGV = nullptr;
+  bool SeedCreated = false;
   auto Cleanup = [&]() {
     for (BasicBlock *BB : Junks)
       BB->eraseFromParent();
-    if (SeedGV)
+    // 共享 seed 仅在由本函数新建、且回滚后无任何使用者时删除；
+    // 已被其他 bcf 函数引用时必须保留。
+    if (SeedCreated && SeedGV->use_empty())
       SeedGV->eraseFromParent();
   };
 
-  SeedGV = createSeedGlobal(F);
+  SeedGV = createOrReuseSeedGlobal(F, SeedCreated);
 
   // 前置处理 2：生成虚假块，指令以真实块为参考克隆。此刻真实块只含
   // 原程序指令（seed 全局不在函数内初始化，谓词链在改写阶段才插入）。
@@ -354,7 +388,7 @@ bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
   }
 
   // 锚定：随机选择可能一条虚假块边都抽不到，而未被引用的虚假块不会
-  // 进入后端发射。强制把一条永假边的后继指到虚假块链头。
+  // 进入后端发射。强制把一条永不可达虚假边的后继指到虚假块链头。
   if (none_of(Rewrites, [](const Rewrite &R) {
         return isGeneratedBlock(*R.Target);
       }))
@@ -364,19 +398,34 @@ bool runBogusControlFlow(Function &F, unsigned Level, CryptoUtils &Crypto) {
     BasicBlock *SourceBB = R.Br->getParent();
     BasicBlock *RealSucc = R.Br->getSuccessor(0);
 
-    // 单后继分支创建虚假分支：谓词与 seed 具体取值无关——同一全局
-    // 两次 volatile 读（不可合并、无代数关系，优化器与反编译器都
-    // 无法求解），其一过一次非零加密运算，uint16 上必不等于原值，
-    // icmp eq 永不为真。seed 已导出且函数内不初始化，外部库在执行
-    // 前写入任意值都不破坏永假性——真实流走假值边回原后继，真值边
-    // 指向随机虚假后继且永不可达。
+    // 单后继分支创建虚假分支：谓词形如 (seed op K) ==/!= C——seed
+    // 导出且函数内不初始化，默认运行时值为初始化器 0，镜像计算
+    // 0 op K 的期望结果并选 C != 期望值，谓词在默认值下恒定：
+    // == 恒假（假值边回原后继）、!= 恒真（真值边回原后继），真假
+    // 后继排布随极性对调，指向随机虚假后继的边永不可达。volatile
+    // 读不可折叠，反编译视图呈现为对外部可配置全局的常规常量比较，
+    // 无 x == x + c 自比较签名。外部库在运行期写入毒值（C 反运算
+    // K）会翻转虚假边，使用约定为不改写。
     IRBuilder<> IRB(R.Br);
     Value *SeedValue = loadSeedVolatile(IRB, SeedGV);
-    Value *SeedAgain = loadSeedVolatile(IRB, SeedGV);
-    Value *EncryptedV = applyEncryptionOp(IRB, SeedAgain, Crypto);
-    Value *Predicate = IRB.CreateICmpEQ(SeedValue, EncryptedV,
-                                        "vllvm.bcf.cmp");
-    IRB.CreateCondBr(Predicate, R.Target, RealSucc);
+    uint32_t Encrypted;
+    Value *EncryptedV = applyEncryptionOp(IRB, SeedValue, DefaultSeedValue,
+                                          Crypto, Encrypted);
+    uint32_t Compare;
+    do {
+      Compare = Crypto.getRandom32() & 0xFFFF;
+    } while (Compare == Encrypted);
+    Value *CompareV = ConstantInt::get(Type::getInt16Ty(F.getContext()),
+                                       Compare);
+    if (Crypto.getRandom32() % 2) {
+      Value *Predicate = IRB.CreateICmpNE(EncryptedV, CompareV,
+                                          "vllvm.bcf.cmp");
+      IRB.CreateCondBr(Predicate, RealSucc, R.Target);
+    } else {
+      Value *Predicate = IRB.CreateICmpEQ(EncryptedV, CompareV,
+                                          "vllvm.bcf.cmp");
+      IRB.CreateCondBr(Predicate, R.Target, RealSucc);
+    }
     R.Br->eraseFromParent();
 
     addEdgeFixPhi(SourceBB, R.Target);

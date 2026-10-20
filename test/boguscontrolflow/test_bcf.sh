@@ -46,32 +46,48 @@ if [ "$BCF_STATUS" -ne "$BASE_STATUS" ]; then
   exit 1
 fi
 
-# 独立 BCF：导出全局 seed（函数内不初始化）+ 单后继分支伪造；随机指令
-# 虚假块存在，谓词 icmp eq（两次 volatile 读，其一过非零运算）与 seed
-# 取值无关、永假，真边回原后继。bcf 独立于 vmfla，不允许触发 vmfla
-# 常量表。
-grep -q "vllvm.bcf.seed" "$OUT_DIR/bcf.ll"
+# 独立 BCF：模块级共享导出 seed（所有 bcf 函数共用，函数内不初始化，
+# 符号名 export_write 不带 vllvm 前缀）
+# + 单后继分支伪造；随机指令虚假块存在，谓词 (seed op K) ==/!= 随机
+# 常量（避开默认值 0 过同一运算的期望结果），极性恒定（== 恒假 /
+# != 恒真，真假边排布对调），真边回原后继。bcf 独立于 vmfla，不允许
+# 触发 vmfla 常量表。
+grep -q "@export_write" "$OUT_DIR/bcf.ll"
 grep -Eq "^vllvm\.bcf\.fake\." "$OUT_DIR/bcf.ll"
 grep -q "vllvm.bcf.cmp" "$OUT_DIR/bcf.ll"
-grep -q "icmp eq" "$OUT_DIR/bcf.ll"
+grep -Eq "icmp (eq|ne)" "$OUT_DIR/bcf.ll"
 if grep -q "vllvm.vmfla.const.table" "$OUT_DIR/bcf.ll"; then
   echo "bcf must stay independent of the vmfla chain" >&2
   exit 1
 fi
 
-# seed 是导出全局（external linkage：IR 定义行不带 internal/private
-# 前缀，外部库可按符号名引用初始化），且函数内不再初始化——不存在
-# ptrtoint 归一推导链；改写点谓词是两次 volatile 读 + 一次非零运算的
-# icmp eq，与 seed 取值无关，反编译器无法折叠密文链，永假谓词与虚假
-# 块必须留在反编译视图里。
-grep -Eq '^@vllvm\.bcf\.seed\.[^ ]+ = global i16 0' "$OUT_DIR/bcf.ll"
+# seed 是模块级导出全局 export_write（WeakAnyLinkage：IR 定义行带 weak
+# 且不带 internal/private 前缀，多 TU 各自弱定义、链接器合并为全程序
+# 同一变量；所有 bcf 函数共享同一符号，外部库可按符号名引用），且函数
+# 内不再初始化——不存在 ptrtoint 归一推导链；改写点谓词是
+# (seed op K) ==/!= 随机常量：比较对象为过非零运算的 enc 值与常量
+# （无 x == x + c 自比较签名），常量避开默认值 0 过同一运算的期望
+# 结果，默认值下 == 恒假 / != 恒真；volatile 读保证反编译器无法
+# 折叠，恒定谓词与虚假块必须留在反编译视图里。
+if [ "$(grep -Ec '^@export_write = weak global i16 0' "$OUT_DIR/bcf.ll")" -ne 1 ]; then
+  echo "expected exactly one shared weak seed global" >&2
+  exit 1
+fi
+if grep -q '^@export_write\.' "$OUT_DIR/bcf.ll"; then
+  echo "seed must be a single shared global, no per-function variants" >&2
+  exit 1
+fi
 if grep -Eq 'vllvm\.bcf\.seed\.(addr|init|x|not|norm)' "$OUT_DIR/bcf.ll"; then
   echo "seed must not be initialized inside the function" >&2
   exit 1
 fi
-grep -q "load volatile i16, ptr @vllvm.bcf.seed" "$OUT_DIR/bcf.ll"
-grep -q "icmp eq i16" "$OUT_DIR/bcf.ll"
-if grep -Eq "store volatile i(16|32) [0-9-]+, ptr @vllvm\.bcf\.seed" "$OUT_DIR/bcf.ll"; then
+grep -q "load volatile i16, ptr @export_write" "$OUT_DIR/bcf.ll"
+grep -Eq 'icmp (eq|ne) i16 %vllvm\.bcf\.enc\.(add|sub|xor)[0-9]*, -?[0-9]+' "$OUT_DIR/bcf.ll"
+if grep -Eq 'icmp (eq|ne) i16 %vllvm\.bcf\.seed\.' "$OUT_DIR/bcf.ll"; then
+  echo "predicate must compare the encrypted value against a constant" >&2
+  exit 1
+fi
+if grep -Eq "store volatile i(16|32) [0-9-]+, ptr @export_write" "$OUT_DIR/bcf.ll"; then
   echo "seed must be derived opaquely, not stored as a constant" >&2
   exit 1
 fi

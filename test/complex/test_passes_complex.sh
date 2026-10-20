@@ -145,14 +145,15 @@ run_case() {
     fi
     ;;
   bcf)
-    # 独立 BCF：导出全局 seed（函数内不初始化）、随机指令虚假块（锚定
-    # 在永假分支后继上）、与 seed 取值无关的永假 icmp eq 谓词；不得触发
-    # vmfla 链路产物。
-    grep -q "vllvm.bcf.seed" "$ll"
+    # 独立 BCF：模块级共享导出 seed export_write（函数内不初始化）、
+    # 随机指令虚假块（锚定在永不可达分支后继上）、对随机常量比较的
+    # 恒定谓词（(seed op K) == 恒假 / != 恒真随机）；不得触发 vmfla
+    # 链路产物。
+    grep -q "@export_write" "$ll"
     grep -Eq "^vllvm\.bcf\.fake\." "$ll"
     grep -q "label %vllvm.bcf.fake" "$ll"
     grep -q "vllvm.bcf.cmp" "$ll"
-    grep -q "icmp eq" "$ll"
+    grep -Eq "icmp (eq|ne)" "$ll"
     if grep -q "vllvm.vmfla.const.table" "$ll"; then
       echo "bcf must stay independent of the vmfla chain" >&2
       exit 1

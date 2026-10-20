@@ -38,9 +38,22 @@ static int bcf_target(int seed) {
   return acc - seed;
 }
 
+VLLVM_OBF
+static int bcf_target2(int seed) {
+  int acc = seed - 5;
+  for (int i = 0; i < 11; ++i) {
+    acc += (seed ^ (i + acc)) & 15;
+    if (acc & 4)
+      acc -= i;
+  }
+  return acc * 3 + seed;
+}
+
 int main(void) {
   int result = 0;
-  for (int i = 0; i < 8; ++i)
+  for (int i = 0; i < 8; ++i) {
     result ^= bcf_target(i * 7 + 3);
+    result ^= bcf_target2(i * 3 + 1);
+  }
   return result & 255;
 }
