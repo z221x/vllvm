@@ -1,5 +1,7 @@
-/* 常见算法（AES-128-CBC / MD5 / SHA-256）的 vmfla、bcf+vmfla 函数级
- * 开销基准：OBF_MODE 选择标注（0=base 1=vmfla 2=bcf 3=bcf+vmfla），
+/* 常见算法（AES-128-CBC / MD5 / SHA-256）的 vmfla、bcf+vmfla 与组合
+ * 函数级开销基准：OBF_MODE 选择标注（0=base 1=vmfla 2=bcf 3=bcf+vmfla
+ * 4=combo2 5=combo 6=combo3，组合定义与 run_perfbench 的同名配置
+ * 一致——组合性能只在算法级测，应用级组合仅做可用性），
  * 各算法标注其顶层处理函数。启动先校验官方测试向量（FIPS-197 /
  * RFC1321 / FIPS-180），再对 1MB 确定性缓冲做多轮处理，逐轮计时并
  * 校验轮间摘要一致；摘要同时打印供跨配置比对。 */
@@ -19,6 +21,12 @@
 #define OBF __attribute__((annotate("vllvm:bcf")))
 #elif OBF_MODE == 3
 #define OBF __attribute__((annotate("vllvm:bcf,vmfla")))
+#elif OBF_MODE == 4
+#define OBF __attribute__((annotate("vllvm:enstr,icall,ibr")))
+#elif OBF_MODE == 5
+#define OBF __attribute__((annotate("vllvm:vmfla,ibr")))
+#elif OBF_MODE == 6
+#define OBF __attribute__((annotate("vllvm:enstr,icall,vmfla")))
 #else
 #define OBF
 #endif

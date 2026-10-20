@@ -71,6 +71,25 @@ python3 test/perf/run_perfbench.py \
   `output-mismatch` 并视为失败。
 - 应用源缓存在 `test/perf/apps/`（或 `tmp/perfbench/apps/`）。
 
+**组合策略（2026-10-20 定版）**：三组组合，不与 bcf 叠加，且**不向
+全部函数施加混淆**。组合性能只在 L2 算法级测（`algo_fn_bench.py`
+OBF_MODE 4~6，只标注顶层处理函数）；应用级组合只做可用性——编译
+成功 + 单次执行输出与基线一致（`--runs 0`），配合 `--annotate-fraction`
+选择性注入（每 TU 按函数规模降序取前 N%，组合轮用 0.5）：
+
+| 配置 | 标注集 |
+| --- | --- |
+| combo1 | enstr + icall + ibr |
+| combo2 | vmfla + ibr（依赖 2026-10-20 缺陷 #3 修复：vmfla 先行、ibr 延迟） |
+| combo3 | enstr + icall + vmfla |
+
+```bash
+python3 test/perf/run_perfbench.py \
+  --apps zlib,bzip2,lua,sqlite \
+  --configs base,combo1,combo2,combo3 --runs 0 --annotate-fraction 0.5 \
+  --out tmp/perfbench/<轮次名>
+```
+
 **python**（自动，重型）：`python3 test/perf/run_python_bench.py`
 
 - CPython 3.12.8：configure + CC 记录器做一次基线构建并捕获命令表；

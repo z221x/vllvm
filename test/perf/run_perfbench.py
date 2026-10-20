@@ -16,6 +16,8 @@
 """
 import argparse
 import json
+import math
+import re
 import os
 import shutil
 import statistics
@@ -48,13 +50,22 @@ CONFIGS = {
     # bcf 与 vmfla 叠加：调度上 bcf 作用于 bb2func+merge 之后的 wrapper，
     # vmfla 在链路末端平坦化含虚假分支的 CFG。
     "bcfvmfla": ["vllvm.bcf", "vllvm.vmfla"],
-    "combo": ["vllvm.fla", "vllvm.bcf", "vllvm.ibr", "vllvm.icall",
-              "vllvm.vmfla"],
-    # icall 跨 TU 调用存在正确性缺陷，另测不含 icall 的组合
-    "combo2": ["vllvm.fla", "vllvm.bcf", "vllvm.ibr", "vllvm.vmfla"],
+    # 组合策略（2026-10-20 定版）：三组组合，不与 bcf 叠加；应用级
+    # 组合配合 --annotate-fraction 做选择性标注（不全函数施加混淆）。
+    "combo1": ["vllvm.enstr", "vllvm.icall", "vllvm.ibr"],
+    "combo2": ["vllvm.vmfla", "vllvm.ibr"],
+    "combo3": ["vllvm.enstr", "vllvm.icall", "vllvm.vmfla"],
+    # combo1 定界用二元组合（2026-10-20 sqlite/combo1 output-mismatch）
+    "pair_enstr_icall": ["vllvm.enstr", "vllvm.icall"],
+    "pair_enstr_ibr": ["vllvm.enstr", "vllvm.ibr"],
+    "pair_icall_ibr": ["vllvm.icall", "vllvm.ibr"],
 }
 
 WARMUP = 1
+# 选择性标注：组合策略不向全部函数施加混淆（--annotate-fraction），
+# 每 TU 按函数规模（.ll 文本行数）降序取前 N%，至少 1 个。
+ANNOTATE_FRACTION = 1.0
+DEFINE_RE = re.compile(r"^define\s[^@]*@([-A-Za-z$._][-A-Za-z$._0-9]*)")
 TIMED_RUNS = 5
 LINK_ARGS_CACHE = []
 
@@ -204,6 +215,32 @@ def stage1_compile(clang, sdk, app, spec, outdir, jobs, log):
     return [r[0] for r in results]
 
 
+def function_sizes(ll_path):
+    sizes = {}
+    name = None
+    with open(ll_path) as f:
+        for line in f:
+            if name is None:
+                m = DEFINE_RE.match(line)
+                if m:
+                    name = m.group(1)
+                    sizes[name] = 0
+            elif line.startswith("}"):
+                name = None
+            else:
+                sizes[name] += 1
+    return sizes
+
+
+def select_functions(ll):
+    if ANNOTATE_FRACTION >= 1.0:
+        return None
+    sizes = function_sizes(ll)
+    ranked = sorted(sizes, key=lambda n: sizes[n], reverse=True)
+    keep = max(1, math.ceil(len(ranked) * ANNOTATE_FRACTION))
+    return ranked[:keep]
+
+
 def build_config(clang, sdk, app, spec, config, attrs, lls, workdir, jobs,
                  log, tu_timeout):
     os.makedirs(workdir, exist_ok=True)
@@ -211,10 +248,14 @@ def build_config(clang, sdk, app, spec, config, attrs, lls, workdir, jobs,
     for ll in lls:
         dst = os.path.join(workdir, tu_name(ll) + ".ll")
         if attrs:
-            p = subprocess.run([sys.executable,
-                                os.path.join(HERE, "inject_vllvm_attrs.py"),
-                                ll, dst, "--attrs", ",".join(attrs)],
-                               capture_output=True, text=True, timeout=120)
+            cmd = [sys.executable,
+                   os.path.join(HERE, "inject_vllvm_attrs.py"),
+                   ll, dst, "--attrs", ",".join(attrs)]
+            only = select_functions(ll)
+            if only is not None:
+                cmd += ["--only", ",".join(only)]
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=120)
             if p.returncode != 0:
                 raise BenchError("inject failed %s: %s" % (ll, p.stderr))
         else:
@@ -381,6 +422,16 @@ def bench_app(clang, sdk, name, spec, apps_dir, out_root, jobs, runs,
                 break
             times.append(dt)
         if not times:
+            if runs == 0:
+                # 可用性模式（--runs 0）：编译成功 + 预热那次执行即为
+                # 验证（退出码 0 且输出与基线一致），不计时。
+                results[config] = {
+                    "status": "ok" if ok else "output-mismatch",
+                    "build_s": built["build_s"],
+                    "size_bytes": built["size_bytes"],
+                }
+                log("run %s/%s: usability ok=%s" % (name, config, ok))
+                continue
             results[config] = {"status": "flaky", "rc": p2.returncode}
             continue
 
@@ -407,12 +458,19 @@ def main():
     ap.add_argument("--configs",
                     default="base,fla,bcf,ibr,icall,vmfla,enstr,bb2func,"
                             "merge,vmp,combo")
-    ap.add_argument("--runs", type=int, default=WARMUP + TIMED_RUNS)
+    ap.add_argument("--runs", type=int, default=WARMUP + TIMED_RUNS,
+                    help="计时执行次数；0 = 可用性模式（编译成功 + 单次"
+                         "执行输出与基线一致即通过，不计时）")
     ap.add_argument("--jobs", type=int, default=6)
+    ap.add_argument("--annotate-fraction", type=float, default=1.0,
+                    help="标注函数比例（0<frac<=1）：每 TU 按函数规模降序"
+                         "取前 N%%，组合策略不全函数施加混淆时使用")
     ap.add_argument("--tu-timeout", type=float, default=1800)
     ap.add_argument("--run-timeout", type=float, default=900)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
+    global ANNOTATE_FRACTION
+    ANNOTATE_FRACTION = min(1.0, max(0.01, args.annotate_fraction))
 
     clang = find_clang()
     sdk = sdk_args()
