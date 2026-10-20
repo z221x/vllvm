@@ -676,7 +676,14 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
     Used.push_back(FunctionTable);
   appendToCompilerUsed(M, Used);
 
+  // deleteBody 在把函数转成声明时会把 linkage 重置为 External：静态
+  // （internal/private）函数被虚拟化后会以外部符号参与链接，与其他 TU
+  // 的同名函数构成 ODR 冲突（缺陷 #7：bzip2 的 bzlib.c static myfeof
+  // 对 bzip2.c 外部 myfeas）。wrapper 只被本模块调用，恢复原 linkage
+  // 保持与原函数一致的可见性。
+  GlobalValue::LinkageTypes OriginalLinkage = F.getLinkage();
   F.deleteBody();
+  F.setLinkage(OriginalLinkage);
   removeConflictingAttributes(F);
   BasicBlock *Entry = BasicBlock::Create(Context, "vmp.entry", &F);
   IRBuilder<> Builder(Entry);
