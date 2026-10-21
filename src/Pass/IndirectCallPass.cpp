@@ -39,7 +39,7 @@ constexpr uint32_t MaxPoolFunctions =
     MaxPoolDimension * MaxPoolDimension;
 
 // 池内位置编码：group_id 占 16..23 位，index 占低 8 位，与 call_func
-// 跳板里 ubfx w16, w19, #16, #8 / and w17, w19, #0xff 的取位一致。
+// 跳板里 ubfx w17, w16, #16, #8 / and w16, w16, #0xff 的取位一致。
 struct PoolLocation {
   uint32_t Group = 0;
   uint32_t Index = 0;
@@ -431,8 +431,9 @@ getPooledIndex(CallInst &Call, const DenseMap<Function *, uint32_t> &Pool) {
 void rewriteCall(Function &Trampoline, uint32_t PackedIndex, CallInst *OldCall) {
   // 调用点退化为对专属跳板的直调：明文实参、无加密运算，调用者函数体
   // 保持干净。调用号（group_id<<16|index）作为调用点常量经尾部 i32 nest
-  // 参数送入 w19（icallcc 约定），跳板据此解码查表。调用约定 icallcc：
-  // 参数/返回沿用标准 ABI 位置，后端 CSR 掩码把 x19 视为调用方保存。
+  // 参数送入 w16（icallcc 约定，IP0 天然 caller-saved），跳板据此解码
+  // 查表。调用约定 icallcc：参数/返回沿用标准 ABI 位置，CSR 沿用平台
+  // 标准——nest 不再占用任何 callee-saved 寄存器。
   IRBuilder<> B(OldCall);
 
   // 参与加密的参数先过正向运算链，再送进 icallcc 跳板。
@@ -466,9 +467,11 @@ void rewriteCall(Function &Trampoline, uint32_t PackedIndex, CallInst *OldCall) 
 // 每个改写调用点独有的跳板：naked 函数，签名与被调函数一致。函数体为
 // 按目标随机生成的汇编：先在 x0~x7 上就地应用参数正向运算链（常量经
 // 字面池 ldr 读入 x9/w9），再以编译期常量 (group_id, index) 查池，经
-// ldr x19 / ret x19 跳转到真实目标（目标入口做逆运算）。naked 保证不
-// 动 lr，目标 ret 直接返回原始调用者；x19 由目标按被调约定保存恢复。
-// runtime 属性防止跳板被内联或优化改写。
+// ldr x17 / ret x17 跳转到真实目标（目标入口做逆运算）。naked 保证不
+// 动 lr，目标 ret 直接返回原始调用者。查表只破坏 x9/x16/x17——全部是
+// caller-saved scratch，与调用方任意活值无冲突（这也是 nest 从 x19 迁
+// 到 IP0 的原因：x19 是 AAPCS callee-saved，寄存器压力大时调用方的活
+// 值可能与之相撞）。
 Function *createCallTrampoline(Function &Target,
                                ArrayRef<ArgCryptPlan> Plans,
                                GlobalVariable *PoolData, StringRef Suffix,
@@ -476,8 +479,8 @@ Function *createCallTrampoline(Function &Target,
   Module &M = *Target.getParent();
   LLVMContext &Ctx = M.getContext();
   // 签名 = 目标签名 + 尾部一个 i32 nest：调用号（group_id<<16|index）
-  // 由调用点常量经 icallcc 送入 w19（后端按 CCIfNest 分配 W19），
-  // 跳板运行期从 w19 解码查表。其余参数/返回与目标完全一致。
+  // 由调用点常量经 icallcc 送入 w16（后端按 CCIfNest 分配 W16），
+  // 跳板运行期从 w16 解码查表。其余参数/返回与目标完全一致。
   SmallVector<Type *, 8> Params;
   for (unsigned I = 0; I < Target.arg_size(); ++I)
     Params.push_back(Target.getArg(I)->getType());
@@ -491,9 +494,9 @@ Function *createCallTrampoline(Function &Target,
       M);
   addRuntimeAttrs(*Tramp);
   Tramp->addFnAttr(Attribute::Naked);
-  // icallcc：参数/返回沿用标准 ABI 位置（nest i32 进 w19），但后端 CSR
-  // 掩码把 x19 视为调用方保存——ret x19 查表跳转会破坏 x19，调用方的
-  // 寄存器分配必须知情。
+  // icallcc：参数/返回沿用标准 ABI 位置，nest i32 进 w16（IP0），CSR
+  // 即平台标准集——查表跳转只破坏 x9/x16/x17 等 caller-saved scratch，
+  // 任何调用方的寄存器分配都不会跨调用保持活值在那里。
   Tramp->setCallingConv(CallingConv::ICall);
   Tramp->addParamAttr(Tramp->arg_size() - 1, Attribute::Nest);
 
@@ -524,19 +527,21 @@ Function *createCallTrampoline(Function &Target,
       }
     }
   }
-  // 查表跳转（与 src/funccaller 的 call_func 一致）：从 w19 解码
+  // 查表跳转（与 src/funccaller 的 call_func 一致）：从 w16 解码
   // group_id/index，group 结构 {i32, ptr} 长 16 字节、func_array 在 +8，
-  // 槽位宽 8 字节，取目标地址后 ret x19。
+  // 槽位宽 8 字节，取目标地址后 ret x17。x16/x17 是链接器 veneer 的
+  // scratch：跳板本身是 internal 直调目标，正常规模二进制内 bl 不会
+  // 经过 veneer，nest 值不会被中转破坏。
   if (TT.isOSBinFormatMachO())
     Asm += "adrp x9, " + Sym + "@PAGE\nldr x9, [x9, " + Sym + "@PAGEOFF]\n";
   else
     Asm += "adrp x9, " + Sym + "\nldr x9, [x9, :lo12:" + Sym + "]\n";
-  Asm += "ubfx w16, w19, #16, #8\n";
-  Asm += "and w17, w19, #0xff\n";
-  Asm += "add x9, x9, x16, lsl #4\n";
+  Asm += "ubfx w17, w16, #16, #8\n";
+  Asm += "and w16, w16, #0xff\n";
+  Asm += "add x9, x9, x17, lsl #4\n";
   Asm += "ldr x9, [x9, #8]\n";
-  Asm += "ldr x19, [x9, x17, lsl #3]\n";
-  Asm += "ret x19\n";
+  Asm += "ldr x17, [x9, x16, lsl #3]\n";
+  Asm += "ret x17\n";
 
   IRBuilder<> IRB(BasicBlock::Create(Ctx, "entry", Tramp));
   FunctionType *AsmTy = FunctionType::get(Type::getVoidTy(Ctx), false);

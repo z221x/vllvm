@@ -27,7 +27,7 @@ src/
 | EncryptoStr | `vllvm:enstr` | 字符串/常量加密（匿名内存池 + 下标访问） | ✅ 可用 | 0-2：1=字符串，2=再加密常量 |
 | IndirectBranch | `vllvm:ibr` | 间接跳转 | ✅ 可用 | 0-3，≥1 等价（待差异化） |
 | BogusControlFlow | `vllvm:bcf` | 独立虚假控制流（模块级共享导出 seed、函数内不初始化 + 对常量比较的恒定谓词 + 单后继分支伪造，真实/虚假块均可作虚假后继） | ✅ 可用 | 0-3：覆盖率 60%/85%/全量，虚假块数量递增 |
-| IndirectCall | `vllvm:icall` | 间接调用（icallcc + X19 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密与 fake 诱饵下标 |
+| IndirectCall | `vllvm:icall` | 间接调用（icallcc + X16 nest） | ✅ 可用（仅 AArch64） | 0-2：1=只间接调用，2=再混入参数加密 |
 | BB2Func | `vllvm:vmfla` 链路 | 基本块提取为 helper 函数 | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
 | Merge | `vllvm:vmfla` 链路 | helper 融合为 keyed dispatcher | ✅ 可用 | 随 vmfla 等级（0=整链关闭） |
 | VMFlattenFunc | `vllvm:vmfla` | VM 化平坦化（bb2func+merge+vmfla 三段链），内置平坦化与 lvars | ✅ 可用 | 0-2：1=bb2func+merge+平坦化，2=+局部变量结构化 |

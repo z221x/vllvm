@@ -31,15 +31,16 @@ fi
   -DVLLVM_TEST_ICALL=1 "$SRC" -o "$OUT_DIR/icall.s"
 
 # 跳板为 naked 汇编函数（icallcc 约定）：加密链就地改写 x0~x7；调用号
-# 由调用点常量经 i32 nest 送入 w19，跳板用 ubfx/and 从 w19 解码查池并
-# ret x19 跳转（与 src/funccaller 的 call_func 一致）。
+# 由调用点常量经 i32 nest 送入 w16（IP0，caller-saved，避免与调用方
+# 活值相撞），跳板用 ubfx/and 从 w16 解码查池并 ret x17 跳转（与
+# src/funccaller 的 call_func 一致）。
 grep -Eq "define internal icallcc .*@__vllvm_icall\.[0-9A-F]+\.call\." "$OUT_DIR/icall.ll"
 grep -q "call icallcc" "$OUT_DIR/icall.ll"
 grep -Eq "i32 nest [0-9]+" "$OUT_DIR/icall.ll"
-grep -q "ret x19" "$OUT_DIR/icall.ll"
-grep -Eq "ret[[:space:]]+x19" "$OUT_DIR/icall.s"
-grep -Eq "ubfx[[:space:]]+w16, w19, #16, #8" "$OUT_DIR/icall.s"
-grep -Eq "mov[[:space:]]+w19," "$OUT_DIR/icall.s"
+grep -q "ret x17" "$OUT_DIR/icall.ll"
+grep -Eq "ret[[:space:]]+x17" "$OUT_DIR/icall.s"
+grep -Eq "ubfx[[:space:]]+w17, w16, #16, #8" "$OUT_DIR/icall.s"
+grep -Eq "mov[[:space:]]+w16," "$OUT_DIR/icall.s"
 if grep -q "vllvm.icall.index_array" "$OUT_DIR/icall.ll"; then
   echo "icall packed indexes must be trampoline constants" >&2
   exit 1
@@ -48,7 +49,7 @@ grep -q "register_func" "$OUT_DIR/icall.ll"
 grep -q "create_func_pool" "$OUT_DIR/icall.ll"
 grep -Eq "i32 0, ptr @__vllvm_icall\..*\.register_funcs" "$OUT_DIR/icall.ll"
 
-# —— level 1（默认）：仅专属跳板间接化（icallcc/nest/w19/ret x19 查表），
+# —— level 1（默认）：仅专属跳板间接化（icallcc/nest/w16/ret x17 查表），
 # 不启用参数加密。
 if grep -q "vllvm.icall.crypt" "$OUT_DIR/icall.ll"; then
   echo "level 1 must not enable argument encryption" >&2

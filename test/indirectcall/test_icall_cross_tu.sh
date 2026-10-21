@@ -107,11 +107,11 @@ fn_has_crypt "$CALLEE_LL" internal_target || {
   exit 1
 }
 
-# 加密位置：调用点普通直调专属 naked 跳板，加密链与 ret x19 查表都在
+# 加密位置：调用点普通直调专属 naked 跳板，加密链与 ret x17 查表都在
 # 跳板的汇编里，调用点函数体保持明文。
 grep -Eq "define internal .*@__vllvm_icall\.[0-9A-F]+\.call\.[0-9]+\.internal_target\(" \
   "$CALLEE_LL" || { echo "missing call trampoline for internal target" >&2; exit 1; }
-grep -q "ret x19" "$CALLEE_LL"
+grep -q "ret x17" "$CALLEE_LL"
 grep -Eq "i32 nest [0-9]+" "$CALLEE_LL"
 extract_fn "$CALLEE_LL" cross_tu_entry | \
   grep -Eq "call icallcc [^@]*@__vllvm_icall\.[0-9A-F]+\.call\.[0-9]+\."

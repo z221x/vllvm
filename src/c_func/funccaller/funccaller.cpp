@@ -44,27 +44,27 @@ void register_func(int func_group_id, int func_index, void *func_ptr) {
 // 调用函数
 // index 调用的函数索引
 // index = (func_group_id << 8) + func_index
-// 使用 x19 传参
+// 使用 x16 传参（IP0，caller-saved scratch，与跳板 icallcc 约定一致）
 #if defined(__aarch64__)
 __attribute__((naked)) void call_func(int index) {
 #if defined(__APPLE__)
-  asm volatile("ubfx w16, w19, #16, #8\n"
-               "and w17, w19, #0xff\n"
+  asm volatile("ubfx w17, w16, #16, #8\n"
+               "and w16, w16, #0xff\n"
                "adrp x9, _vllvm_func_pool_data@PAGE\n"
                "ldr x9, [x9, _vllvm_func_pool_data@PAGEOFF]\n"
-               "add x9, x9, x16, lsl #4\n"
+               "add x9, x9, x17, lsl #4\n"
                "ldr x9, [x9, #8]\n"
-               "ldr x19, [x9, x17, lsl #3]\n"
-               "ret x19\n");
+               "ldr x17, [x9, x16, lsl #3]\n"
+               "ret x17\n");
 #else
-  asm volatile("ubfx w16, w19, #16, #8\n"
-               "and w17, w19, #0xff\n"
+  asm volatile("ubfx w17, w16, #16, #8\n"
+               "and w16, w16, #0xff\n"
                "adrp x9, vllvm_func_pool_data\n"
                "ldr x9, [x9, :lo12:vllvm_func_pool_data]\n"
-               "add x9, x9, x16, lsl #4\n"
+               "add x9, x9, x17, lsl #4\n"
                "ldr x9, [x9, #8]\n"
-               "ldr x19, [x9, x17, lsl #3]\n"
-               "ret x19\n");
+               "ldr x17, [x9, x16, lsl #3]\n"
+               "ret x17\n");
 #endif
 }
 #endif

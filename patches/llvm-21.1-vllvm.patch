@@ -63,7 +63,7 @@ index d68491eb5..4f2c16c93 100644
      RISCV_VLSCall_65536 = 123,
 
 +    /// VLLVM indirect-call trampoline convention. Regular arguments use the
-+    /// platform AArch64 PCS; one extra nest integer argument is passed in X19.
++    /// platform AArch64 PCS; one extra nest integer argument is passed in X16.
 +    ICall = 124,
 +
      /// The highest possible ID. Must be some 2^k - 1.
@@ -209,22 +209,22 @@ index 1b5a713bf..86c379deb 100644
 
 +// VLLVM indirect-call trampoline convention. The original call arguments
 +// continue to use the platform PCS; the one extra nest i32 carries the packed
-+// function-pool index in W19.
++// function-pool index in W16 (IP0, caller-saved scratch in every PCS).
 +let Entry = 1 in
 +def CC_AArch64_ICall_AAPCS : CallingConv<[
-+  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W16]>>>,
 +  CCDelegateTo<CC_AArch64_AAPCS>
 +]>;
 +
 +let Entry = 1 in
 +def CC_AArch64_ICall_DarwinPCS : CallingConv<[
-+  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W16]>>>,
 +  CCDelegateTo<CC_AArch64_DarwinPCS>
 +]>;
 +
 +let Entry = 1 in
 +def CC_AArch64_ICall_Win64PCS : CallingConv<[
-+  CCIfNest<CCIfType<[i32], CCAssignToReg<[W19]>>>,
++  CCIfNest<CCIfType<[i32], CCAssignToReg<[W16]>>>,
 +  CCDelegateTo<CC_AArch64_Win64PCS>
 +]>;
 +
@@ -235,8 +235,8 @@ index 1b5a713bf..86c379deb 100644
                                             D8,  D9,  D10, D11,
                                             D12, D13, D14, D15)>;
 
-+// call_func consumes X19 and overwrites it with the resolved target address.
-+def CSR_AArch64_ICall : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X19)>;
++// The ICall nest rides in IP0/W16, so the standard CSR set applies.
++def CSR_AArch64_ICall : CalleeSavedRegs<(add CSR_AArch64_AAPCS)>;
 +
  // A variant for treating X18 as callee saved, when interfacing with
  // code that needs X18 to be preserved.
@@ -246,7 +246,7 @@ index 1b5a713bf..86c379deb 100644
                                                 D12, D13, D14, D15)>;
 
 +def CSR_Win_AArch64_ICall
-+    : CalleeSavedRegs<(sub CSR_Win_AArch64_AAPCS, X19)>;
++    : CalleeSavedRegs<(add CSR_Win_AArch64_AAPCS)>;
 +
  def CSR_Win_AArch64_AAPCS_SwiftError
      : CalleeSavedRegs<(sub CSR_Win_AArch64_AAPCS, X21)>;
@@ -256,7 +256,7 @@ index 1b5a713bf..86c379deb 100644
                                                  D12, D13, D14, D15)>;
 
 +def CSR_Darwin_AArch64_ICall
-+    : CalleeSavedRegs<(sub CSR_Darwin_AArch64_AAPCS, X19)>;
++    : CalleeSavedRegs<(add CSR_Darwin_AArch64_AAPCS)>;
 +
  def CSR_Darwin_AArch64_AAVPCS : CalleeSavedRegs<(add LR, FP, X19, X20, X21,
                                                   X22, X23, X24, X25, X26, X27,

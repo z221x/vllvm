@@ -142,7 +142,7 @@
 ## icall 等级语义
 
 `-mllvm -vllvm-config=icall=<n>`：0 关闭；**1（默认）**仅专属跳板间接化
-（icallcc + `mov w19,#调用号` + naked 跳板内 `ubfx/and` 解码查池 `ret x19`）；
+（icallcc + `mov w16,#调用号` + naked 跳板内 `ubfx/and` 解码查池 `ret x17`）；
 **2** 再叠加参数加密（x0~x7 上的 32/64 位整数与指针，仅 add/sub/xor 可逆链，
 入口左值解密）与 fake 诱饵下标。**L1 与 L2 开销基本持平**（2.8~6.5x；
 加密链在跳板汇编内执行，对热路径增量有限）——默认开 L2 即可。
@@ -158,7 +158,7 @@
 | 5 | VMP 的 6 个问题（递归崩溃、CRC 形态 VM 断言、哈希类不可表达等） | 见 `docs/VMP_ISSUES.md` | ❌ 遗留（记录在案） |
 | 6 | bcf：多 TU 各自标注时链接 `duplicate symbol _export_write`（L3 首轮 4 应用 × bcf/bcfvmfla 共 8 配置全部 build-failed） | seed 收敛为模块级共享导出变量后，每个 TU 的模块各自携带强符号定义 | ✅ 已修复（定义改 WeakAnyLinkage，各 TU 弱定义、链接器合并为全程序同一变量；回归 `test/boguscontrolflow/test_bcf_multi_tu.sh`，详见 2026-10-20 节） |
 | 7 | vmp：静态函数被虚拟化后以外部符号链接，与其他 TU 同名函数 `duplicate symbol`（bzip2/vmp：bzlib.c 的 static `myfeas` 对 bzip2.c 的外部 `myfeas`） | `installWrapper` 的 `F.deleteBody()` 把函数转声明时 LLVM 会把 linkage 重置为 External，wrapper 装回后仍为外部链接 | ✅ 已修复（`deleteBody` 前保存、后恢复原 linkage；回归 `test/vmp/test_vmp_static_dup.sh`，详见 2026-10-20 节） |
-| 8 | enstr+icall 组合：应用级 sqlite SIGBUS（输出完整后崩溃，rc=138）；最小复现 = 仅对 shell.c `process_input` 单函数施加 enstr+icall | icallcc 调用方代码生成缺陷：nest 参数写入 X19 与调用方在 X19 上的活跃值（如 Shell 结构体指针）冲突。IR 层两配置完全一致（`call icallcc … i32 nest 0`），icall 单独"通过"是寄存器分配运气（低压力下 RA 不占用 X19 跨调用）；enstr 全模块字符串加密在未标注调用方插入池调用抬高压力后暴露。GlobalIsel 开/关均复现（SelectionDAG 与 GlobalISel 公共路径）。修复方向：nest 改经 X16/X17（IP scratch，天然 caller-saved，天然无冲突）或修正调用方 regmask 使 X19 被视为跨 icallcc 调用破坏 | ❌ 遗留（记录在案；L2 算法级 combo1 未触发（压力不足），应用级 combo1 = 3/4 应用可用，sqlite 受阻） |
+| 8 | enstr+icall 组合：应用级 sqlite SIGBUS（输出完整后崩溃，rc=138）；最小复现 = 仅对 shell.c `process_input` 单函数施加 enstr+icall | icallcc 调用方代码生成缺陷：nest 参数写入 X19 与调用方在 X19 上的活跃值（如 Shell 结构体指针）冲突。IR 层两配置完全一致（`call icallcc … i32 nest 0`），icall 单独"通过"是寄存器分配运气（低压力下 RA 不占用 X19 跨调用）；enstr 全模块字符串加密在未标注调用方插入池调用抬高压力后暴露。GlobalIsel 开/关均复现（SelectionDAG 与 GlobalISel 公共路径） | ✅ 已修复（2026-10-20：nest 通道 X19→W16（IP0，一切 PCS 下均 caller-saved，结构上不可能与调用方活值相撞），CSR_*_ICall 不再从基集扣除 X19；跳板/funccaller 查表改 `ubfx w17,w16`/`and w16`/`ldr x17`/`ret x17`。最小复现 rc=0 输出一致；L1 全量 28/28；L3 combo1 4/4 可用，sqlite 转绿，详见 2026-10-20 节） |
 
 ### 缺陷 2 详录（enstr 跨 TU，2026-10-10 反汇编逆向定位）
 
@@ -664,7 +664,7 @@ python3 test/perf/vmp_fn_bench.py
 
 - 测的是**全程序标注**的最坏情形；实际只标注少量敏感函数时，开销按所涉热点占比缩放。
 - 两段式构建与源码直编有约 7% 基线偏差；横向比值不受影响。
-- macOS arm64 单机测试；icall 的 x19/icallcc 约定、vmp 准入条件在其他目标可能不同。
+- macOS arm64 单机测试；icall 的 x16/icallcc 约定、vmp 准入条件在其他目标可能不同。
 - `ld64.lld` 与 macOS 27 SDK tbd 不兼容是环境问题（见「测试方法」第 4 条）。
 - 遗留缺陷（ibr+vmfla 组合、VMP 问题清单）修复后重跑上述命令即可复测对比；lua/vmfla 已于 2026-10-16 修复。
 
@@ -768,7 +768,7 @@ indirectbr 的 CFG）：地址表跳转网络被当孤岛排除在状态机外�
 
 | 配置 | aes | crc32 | des | md5 | rc4 | sha256 | sm4 | 范围 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| combo1（enstr+icall+ibr） | 1.74x | 1.24x | 2.00x | 2.92x | 1.21x | 1.21x | 1.43x | **1.2~2.9x** |
+| combo1（enstr+icall+ibr） | 1.76x | 1.38x | 2.13x | 3.07x | 1.28x | 1.28x | 1.52x | **1.3~3.1x**（缺陷 #8 修复后复跑；修复前 1.2~2.9x） |
 | combo2（vmfla+ibr） | 3.11x | 6.97x | 4.03x | 20.08x | 5.34x | 4.15x | 2.59x | **2.6~20.1x** |
 | combo3（enstr+icall+vmfla） | 2.18x | 2.45x | 2.49x | 4.99x | 2.20x | 1.78x | 1.73x | **1.7~5.0x** |
 
@@ -781,7 +781,7 @@ bcf 参与叠加与全函数标注是当时开销居高的两个因素。
 
 | 配置 | bzip2 | zlib | lua | sqlite |
 | --- | --- | --- | --- | --- |
-| combo1（enstr+icall+ibr） | ✅ | ✅ | ✅ | ❌ 缺陷 #8（SIGBUS，输出完整后崩溃） |
+| combo1（enstr+icall+ibr） | ✅ | ✅ | ✅ | ✅（缺陷 #8 修复前为 ❌ SIGBUS） |
 | combo2（vmfla+ibr） | ✅ | ✅ | ✅ | ✅ |
 | combo3（enstr+icall+vmfla） | ✅ | ✅ | ✅ | ✅ |
 
@@ -790,7 +790,33 @@ bcf 参与叠加与全函数标注是当时开销居高的两个因素。
 函数施加 enstr+icall 即复现；`--annotate-fraction 0.5` 下每 TU 标注
 规模降序前 50%）。注意逐对冒烟（28/28，小 fixture）未触发 #8——该
 缺陷是**寄存器压力敏感**的，小函数不会把活跃值分配到 X19 跨 icallcc
-调用。
+调用（nest 迁至 X16 后该敏感性消除；修复后同口径复测 combo1 4/4 可用，
+数据 `test/perf/out/results.json`）。
+
+### 缺陷 #8 修复：icallcc nest 通道 X19→X16（combo1 sqlite 的前置修复）
+
+- 根因：nest 走 X19（AAPCS callee-saved）。调用方寄存器压力高时（enstr
+  在未标注调用方插入池访问抬高压力），RA 把跨 icallcc 调用的活值留在
+  X19，与调用点 nest 写入（`mov x19, x8`）相撞，调用后按旧值寻址
+  （`str w0, [x19, #0x1974]`）→ SIGBUS。
+- 修复（补丁 `patches/llvm-21.1-vllvm.patch` + `IndirectCallPass.cpp` +
+  `funccaller.cpp` 同步）：`CCIfNest` 分配寄存器 W19→W16（IP0，一切
+  PCS 下都是 caller-saved scratch，任何调用方都不会跨调用保持活值，
+  结构上消除冲突面）；`CSR_*_ICall` 不再从基集扣除 X19——跳板查表
+  只破坏 x9/x16/x17，全为 caller-saved，CSR 即平台标准集，X19 恢复
+  正常被调保存；跳板/funccaller 解码查表改为
+  `ubfx w17,w16,#16,#8` / `and w16,w16,#0xff` / `ldr x17,[x9,x16,lsl #3]` /
+  `ret x17`。
+- 注意：x16/x17 同时是链接器 veneer 的 scratch；跳板是 internal 直调
+  目标，正常规模二进制内 `bl` 不经 veneer 中转，nest 值不会被破坏
+  （超 128MB 布局的巨型二进制理论上有 veneer 风险，代码注释已记录）。
+- 验证：最小复现（sqlite `process_input` 单函数 enstr+icall）rc=0、
+  输出 20015 行与基线一致（修前 rc=138）；icall L1 三件套 + 逐对冒烟
+  28/28 + 全量 L1 28/28；L3 combo1（`--runs 0 --annotate-fraction 0.5`）
+  bzip2/zlib/lua/sqlite 全部 usability ok，代码生成确认 5 处调用点全部
+  `mov w16` 传号、跳板 `ret x17` 跳转；L2 全模式（含向量校验）复跑
+  通过，combo1 开销 1.3~3.1x，与修复前 1.2~2.9x 同量级——nest 寄存器
+  通道变化无性能影响。
 
 ### 编译耗时结论（回应"编译卡在哪"）
 

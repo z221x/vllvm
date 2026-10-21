@@ -93,7 +93,7 @@ run_case() {
   icall)
     grep -q "register_func" "$ll"
     grep -Eq "i32 nest [0-9]+" "$ll"
-    grep -q "ret x19" "$ll"
+    grep -q "ret x17" "$ll"
     if grep -q "vllvm.icall.index_array" "$ll"; then
       echo "icall packed indexes must be call-site constants" >&2
       exit 1
