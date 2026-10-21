@@ -44,10 +44,12 @@ for t in $(find test -name '*.sh' -not -path '*/perf/*' \
 
 覆盖 **AES-128-CBC、DES、SM4、RC4、MD5、SHA-256、CRC32**：
 
-- fixture：`test/perf/workloads/algo_bench.c`——标准实现 + 官方测试
-  向量（FIPS-197 / FIPS-46 / GB/T 32907 / RFC6229-ish / RFC1321 /
-  FIPS-180 / CRC32 "123456789"），标注各算法顶层处理函数，
-  `OBF_MODE` 选择配置（0 base / 1 vmfla / 2 bcf / 3 bcf+vmfla）。
+- fixture：`test/perf/workloads/algo/`——**每个算法一个独立源文件/
+  可执行文件**（`<algo>_bench.c`，公共设施在 `algo_common.h`），只含
+  单一算法与其官方测试向量（FIPS-197 / FIPS-46 / GB/T 32907 /
+  RFC6229-ish / RFC1321 / FIPS-180 / CRC32 "123456789"），避免跨算法
+  干扰；标注该算法顶层处理函数，`OBF_MODE` 选择配置（0 base /
+  1 vmfla / 2 bcf / 3 bcf+vmfla / 4-6 combo1-3）。
 - 运行：`python3 test/perf/algo_fn_bench.py --runs 3 [--opt O0]`，
   样本链接后统一 strip 再计时（-O0 会保留 static 函数名于符号表）。
 - 正确性门槛：向量全过、轮间摘要无漂移、四配置摘要逐一相等，

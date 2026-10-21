@@ -528,7 +528,7 @@ dominator 19.0x 之间。
 
 ## 2026-10-16 常见算法开销：AES / MD5 / SHA-256 × vmfla、bcf+vmfla
 
-函数级基准（`test/perf/workloads/algo_bench.c` + `test/perf/
+函数级基准（`test/perf/workloads/algo_bench.c`【2026-10-20 起拆分为 workloads/algo/ 每算法独立可执行】 + `test/perf/
 algo_fn_bench.py`）：AES-128-CBC（T 表实现）、MD5、SHA-256 标准实现，
 标注各算法顶层处理函数（整段 1MB 缓冲管线，压缩/轮函数内联其中），
 -O2 直编，二进制内逐轮计时（150/60/60 轮取中位 × 3 次执行中位），
@@ -768,9 +768,15 @@ indirectbr 的 CFG）：地址表跳转网络被当孤岛排除在状态机外�
 
 | 配置 | aes | crc32 | des | md5 | rc4 | sha256 | sm4 | 范围 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| combo1（enstr+icall+ibr） | 1.76x | 1.38x | 2.13x | 3.07x | 1.28x | 1.28x | 1.52x | **1.3~3.1x**（缺陷 #8 修复后复跑；修复前 1.2~2.9x） |
-| combo2（vmfla+ibr） | 3.11x | 6.97x | 4.03x | 20.08x | 5.34x | 4.15x | 2.59x | **2.6~20.1x** |
-| combo3（enstr+icall+vmfla） | 2.18x | 2.45x | 2.49x | 4.99x | 2.20x | 1.78x | 1.73x | **1.7~5.0x** |
+| combo1（enstr+icall+ibr） | 1.68x | 1.36x | 2.04x | 2.07x | 1.24x | 1.24x | 1.41x | **1.2~2.1x** |
+| combo2（vmfla+ibr） | 3.37x | 7.02x | 4.10x | 18.36x | 6.63x | 4.47x | 2.82x | **2.8~18.4x** |
+| combo3（enstr+icall+vmfla） | 2.10x | 2.61x | 2.63x | 5.29x | 2.44x | 1.81x | 1.74x | **1.7~5.3x** |
+
+口径：2026-10-20 起 L2 fixture 拆分为**每算法一个独立源文件/可执行
+文件**（`test/perf/workloads/algo/<algo>_bench.c`，缺陷 #8 修复后的
+拆分复跑，向量与跨配置摘要校验全过）；上表即该口径数据，与拆分前
+单文件口径（combo1 1.2~2.9x / combo2 2.6~20.1x / combo3 1.7~5.0x）
+同量级。
 
 要点：combo1 最轻（enstr≈1.0x、icall 热路径近零，开销基本来自 ibr）；
 combo2 最重（vmfla × ibr 相互放大，md5 达 20x）；combo3 居中。历史
@@ -815,8 +821,7 @@ bcf 参与叠加与全函数标注是当时开销居高的两个因素。
   28/28 + 全量 L1 28/28；L3 combo1（`--runs 0 --annotate-fraction 0.5`）
   bzip2/zlib/lua/sqlite 全部 usability ok，代码生成确认 5 处调用点全部
   `mov w16` 传号、跳板 `ret x17` 跳转；L2 全模式（含向量校验）复跑
-  通过，combo1 开销 1.3~3.1x，与修复前 1.2~2.9x 同量级——nest 寄存器
-  通道变化无性能影响。
+  通过，combo1 开销与修复前同量级——nest 寄存器通道变化无性能影响。
 
 ### 编译耗时结论（回应"编译卡在哪"）
 
