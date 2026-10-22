@@ -12,11 +12,10 @@ mkdir -p "$OUT_DIR"
 args=(-Wno-override-module -Xclang -llvm-verify-each)
 if [[ $(uname -s) == Darwin ]]; then args+=(-isysroot "$(xcrun --show-sdk-path)"); fi
 
-for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
+for mode in baseline enstr vmfla enstr_vmfla; do
   attrs=""
   case "$mode" in
-    enstr|fla|vmfla) attrs="\"vllvm.$mode\"" ;;
-    enstr_fla) attrs='"vllvm.enstr" "vllvm.fla"' ;;
+    enstr|vmfla) attrs="\"vllvm.$mode\"" ;;
     enstr_vmfla) attrs='"vllvm.enstr" "vllvm.vmfla"' ;;
   esac
   sed "s/attributes #0 = { noinline }/attributes #0 = { noinline $attrs }/" \
@@ -39,15 +38,12 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
       /^define / { skip = ($0 ~ /@__vllvm_enstr/) }
       show && !skip && !/^\[vllvm\]/ { print }' "$OUT_DIR/${mode}_O$opt.log" \
         > "$OUT_DIR/$mode.after-lowering.log"
-      # The enstr dispatch is a no-op for fla/vmfla-only input.
-      if [[ $mode == vmfla || $mode == fla ]]; then
-        # fla 已并入 vmfla 链路 = bb2func + merge + vmfla：vmfla 移到链路
-        # 末端的 VLLVMVMFlattenLateDispatchPass 执行；merge dispatcher 和
-        # bb2func helper 是链路的结构性产物（内联可能引入合法 PHI），检查
-        # PHI 合约时排除。
+      # The enstr dispatch is a no-op for vmfla-only input.
+      if [[ $mode == vmfla ]]; then
+        # vmfla 在链路末端 VLLVMVMFlattenLateDispatchPass 执行，检查其
+        # PHI 合约。
         awk '/^; \*\*\* IR Dump After/ { show = /VLLVMVMFlattenLateDispatchPass/ }
-          /^define / { skip = ($0 ~ /@vllvm\.(merge|bb2f)\./) }
-          show && !skip && !/^\[vllvm\]/ { print }' \
+          show && !/^\[vllvm\]/ { print }' \
           "$OUT_DIR/${mode}_O$opt.log" > "$OUT_DIR/$mode.after-lowering.log"
       fi
       grep -q '^define ' "$OUT_DIR/$mode.after-lowering.log"
@@ -65,8 +61,8 @@ for mode in baseline enstr fla vmfla enstr_fla enstr_vmfla; do
           echo "$mode left a plaintext string" >&2; exit 1
         fi ;;
     esac
-    # fla 已并入 vmfla 链路：所有 fla/vmfla 模式都产出同一张 vmfla 常量表。
-    if [[ $mode == fla || $mode == *vmfla ]]; then
+    # vmfla 模式产出 vmfla 常量表。
+    if [[ $mode == *vmfla ]]; then
       grep -q 'vllvm.vmfla.const.table' "$ir"
     fi
     # Compile the original fixture, never feed transformed IR through VLLVM twice.
@@ -93,7 +89,7 @@ echo "PASS enstr funclet PHI and operand bundles"
 for fixture in callbr funclet; do
   target=aarch64-linux-android23
   if [[ $fixture == funclet ]]; then target=aarch64-pc-windows-msvc; fi
-  for mode in enstr fla vmfla; do
+  for mode in enstr vmfla; do
     sed "s/attributes #0 = { noinline }/attributes #0 = { noinline \"vllvm.$mode\" }/" \
       "$ROOT/test/phi/test_phi_$fixture.ll" > "$OUT_DIR/$fixture-$mode.input.ll"
     ir="$OUT_DIR/$fixture-$mode.ll"

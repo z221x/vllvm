@@ -1,7 +1,6 @@
 #include "PassInfo.h"
-#include "BB2FuncPass.h"
 #include "BogusControlFlowPass.h"
-#include "MergePass.h"
+#include "FlowerPass.h"
 #include "VLLVM.h"
 #include "VLLVMAttribute.h"
 #include "VmpPass.h"
@@ -15,7 +14,7 @@ namespace llvm::vllvm {
 namespace {
 constexpr StringLiteral VmpInjectedNoInlineAttr = "vllvm.vmp.injected.noinline";
 constexpr StringLiteral VmpHadAlwaysInlineAttr = "vllvm.vmp.had.alwaysinline";
-// vmfla 链路标记：bb2func+merge 完成后，vmfla 在第二段函数级处理里执行。
+// vmfla 延迟标记：vmfla 在第二段函数级处理里执行。
 constexpr StringLiteral VmFlattenPendingAttr = "vllvm.vmfla.pending";
 // vmfla+ibr 同函数组合标记：ibr 必须在 vmfla 平坦化之后再执行，此处
 // 记录延迟到晚期分发（缺陷 #3 的根因是反序执行）。
@@ -23,8 +22,7 @@ constexpr StringLiteral IbrLateAttr = "vllvm.ibr.late";
 
 bool needsOptimizerProtection(const VLLVMOptions &Options) {
   return Options.VMFlattenFunc || Options.IndirectCall ||
-         Options.IndirectBranch || Options.BogusControlFlow ||
-         Options.BB2Func;
+         Options.IndirectBranch || Options.BogusControlFlow || Options.Flower;
 }
 
 void protectFromLaterOptimization(Function &F) {
@@ -77,8 +75,7 @@ public:
     if (!FunctionOptions.any())
       return PreservedAnalyses::all();
 
-    // vmfla 等级为 0 时整条链路（bb2func+merge+vmfla）全局关闭，
-    // 连第一段的 bb2func/merge 也不执行。
+    // vmfla 等级为 0 时全局关闭，延迟段也不执行。
     VLLVMConfig::get().registerPassLevels("vmfla", 1, 2);
     if (FunctionOptions.VMFlattenFunc &&
         !VLLVMConfig::get().isEnabled("vmfla"))
@@ -107,18 +104,23 @@ public:
     PreservedAnalyses PA = PreservedAnalyses::all();
     auto RunPass = [&](auto Pass) { PA.intersect(Pass.run(F, FAM)); };
 
-    if (FunctionOptions.VMFlattenFunc) {
-      // vmfla 链路当前只保留平坦化本体：不再先切 bb2func helper + merge
-      // 融合，直接挂 pending 延迟执行。bb2func/merge 作为保留方案仍可
-      // 通过独立标注 vllvm:bb2func / vllvm:merge 使用；恢复链路时在此处
-      // 加回 RunPass(BB2FuncPass(/*ChainToMerge=*/true))。
-      F.addFnAttr(VmFlattenPendingAttr);
-      FunctionOptions.VMFlattenFunc = false;
+    // 花指令先于 bcf/ibr 插入：模板自包含、不依赖 CFG 形态，先行插入
+    // 保证 level 计数只落在真实代码位置（bcf 之后再插会随机落入永不可
+    // 达虚假块，计数失真）。
+    if (FunctionOptions.Flower) {
+      RunPass(FlowerPass());
+      if (F.hasFnAttribute("vllvm.flower")) {
+        F.removeFnAttr("vllvm.flower");
+        PA.intersect(PreservedAnalyses::none());
+      }
+      FunctionOptions.Flower = false;
     }
 
-    if (FunctionOptions.BB2Func) {
-      RunPass(BB2FuncPass());
-      FunctionOptions.BB2Func = false;
+    if (FunctionOptions.VMFlattenFunc) {
+      // vmfla 直接挂 pending 延迟执行（早期链路的 bb2func/merge 前置
+      // 已随独立标注一并移除）。
+      F.addFnAttr(VmFlattenPendingAttr);
+      FunctionOptions.VMFlattenFunc = false;
     }
 
     if (FunctionOptions.BogusControlFlow) {
@@ -142,8 +144,8 @@ public:
         RunPass(IndirectBranchPass());
     }
 
-    // fla/lvars 的常量表改为参数传递：函数体搬到带表参数的私有 impl，
-    // 原函数退化为传表包装器；没有表引用或不支持时保持原样。
+    // 常量表改为参数传递：函数体搬到带表参数的私有 impl，原函数退化
+    // 为传表包装器；没有表引用或不支持时保持原样。
     if (needsOptimizerProtection(FunctionOptions) &&
         moveTablesToImplParams(F))
       PA.intersect(PreservedAnalyses::none());
@@ -152,7 +154,7 @@ public:
   }
 };
 
-// 第二段函数级处理：执行被链路延迟的 vmfla（bb2func + merge 之后）。
+// 第二段函数级处理：执行被延迟的 vmfla。
 class VLLVMVMFlattenLateDispatchPass
     : public PassInfoMixin<VLLVMVMFlattenLateDispatchPass> {
 public:
@@ -190,9 +192,6 @@ void addVLLVMPasses(ModulePassManager &MPM, OptimizationLevel Level) {
   FunctionPassManager FPM;
   FPM.addPass(VLLVMFunctionDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
-  // merge 需要 Module 视角：把 vllvm.merge 标记函数（含 vmfla 链路里
-  // bb2func 提取的 helper）按组融进 keyed dispatcher。
-  MPM.addPass(MergePass());
   FunctionPassManager LateFPM;
   LateFPM.addPass(VLLVMVMFlattenLateDispatchPass());
   MPM.addPass(createModuleToFunctionPassAdaptor(std::move(LateFPM)));

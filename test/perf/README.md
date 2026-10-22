@@ -22,7 +22,7 @@
 # 源码放在 test/perf/apps/ 或 tmp/perfbench/apps/：
 #   zlib-1.3.1/ bzip2-1.0.8/ lua-5.4.7/ sqlite-amalgamation-3450100/
 python3 test/perf/run_perfbench.py --apps bzip2,zlib,lua,sqlite \
-  --configs base,fla,bcf,ibr,icall,vmfla,enstr,bb2func,merge,vmp,combo,combo2 \
+  --configs base,bcf,ibr,icall,vmfla,enstr,vmp,combo,combo2 \
   --runs 6 --out tmp/perfbench/full
 
 python3 test/perf/gen_report.py tmp/perfbench/full/results.json \

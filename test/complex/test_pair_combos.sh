@@ -25,9 +25,9 @@ fi
 mkdir -p "$OUT_DIR"
 
 # 逐对组合冒烟：每个 pass 两两叠加到同一批函数上，编译 + 运行 + 退出码
-# 与 base 一致即过。fla 是 vmfla 的别名（链路同一），不单独入池。
+# 与 base 一致即过。支持集 = bcf/vmfla/icall/enstr/ibr/vmp 六个。
 # 覆盖点：switch（ibr）、字符串常量（enstr）、跨函数调用（icall）、
-# 循环/PHI（bcf/vmfla/bb2func/merge）、小函数整体（vmp 虚拟化或回退）。
+# 循环/PHI（bcf/vmfla）、小函数整体（vmp 虚拟化或回退）。
 cat > "$OUT_DIR/pair_fixture.c" <<'EOF'
 #if defined(VLLVM_PAIR)
 #define OBF __attribute__((annotate(VLLVM_PAIR)))
@@ -79,7 +79,7 @@ set +e
 BASE_RC=$?
 set -e
 
-PASSES=(bcf ibr icall vmfla enstr bb2func merge vmp)
+PASSES=(bcf ibr icall vmfla enstr vmp)
 # ibr+vmfla 曾为缺陷 #3（旧调度反序执行：ibr 先改写、vmfla 再平坦化，
 # 静默错结果）；现已改为 vmfla 先行、ibr 延迟到晚期分发作用于平坦化
 # 产物（见 PassInfo.cpp IbrLateAttr），本逐对冒烟保持全量覆盖防回归。

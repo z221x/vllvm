@@ -10,13 +10,12 @@ struct VLLVMOptions {
   bool IndirectCall = false;
   bool IndirectBranch = false;
   bool BogusControlFlow = false;
+  bool Flower = false;
   bool Vmp = false;
-  bool BB2Func = false;
-  bool Merge = false;
 
   bool any() const {
     return EncryptoStr || VMFlattenFunc || IndirectCall ||
-           IndirectBranch || BogusControlFlow || Vmp || BB2Func || Merge;
+           IndirectBranch || BogusControlFlow || Flower || Vmp;
   }
 };
 

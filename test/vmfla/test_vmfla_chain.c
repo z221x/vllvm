@@ -1,8 +1,7 @@
 #include <stdio.h>
 
-/* vmfla 链路目标：vllvm:vmfla 现在展开为 bb2func + merge + vmfla 三段。
- * 函数要有足够多的稠密块（bb2func 提取 >=2 个 helper 才会触发 merge），
- * 同时保留循环/分支给 vmfla 平坦化。 */
+/* vmfla 链路目标：vllvm:vmfla 只执行平坦化本体（bb2func/merge 前段
+ * 已移除）。函数保留循环/分支给 vmfla 平坦化。 */
 __attribute__((annotate("vllvm:vmfla")))
 static unsigned chain_target(unsigned n) {
   unsigned a = n ^ 0x9e3779b9u;

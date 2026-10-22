@@ -23,108 +23,39 @@ if [ "$(uname -s)" = "Darwin" ] && command -v xcrun >/dev/null 2>&1; then
   fi
 fi
 
-NO_DEBUG_ARGS=(-g0)
-
-strip_binary() {
-  local bin=$1
-  if command -v strip >/dev/null 2>&1; then
-    strip "$bin" >/dev/null 2>&1 || strip -x "$bin" >/dev/null 2>&1 || true
-  fi
-}
-
 mkdir -p "$OUT_DIR"
 
-# fla 已并入 vmfla 链路：VMFLA 模式的 lvars 断言需要 vmfla level 2
-# （1=bb2func+merge+平坦化，2=+lvars）。
-VMFLA_CONFIG=(-mllvm -vllvm-config=vmfla=2)
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  -DVLLVM_TEST_LEGACY_COMBO=1 "$SRC" \
-  -o "$OUT_DIR/test_lvars_legacy_combo.ll"
-# fla/lvars 现在都别名到 vmfla：fla,icall,lvars 组合捆绑执行 vmfla，
-# 不再有独立的 fla 常量表和 localvars 偏移表。
-if grep -q "vllvm.fla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
-  echo "fla must merge into the vmfla bundle" >&2
-  exit 1
-fi
-grep -q "vllvm.vmfla.const.table" "$OUT_DIR/test_lvars_legacy_combo.ll"
-if grep -q "vllvm.localvars.table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
-  echo "legacy combo must not emit a standalone localvars table" >&2
-  exit 1
-fi
-# icall 与 vmfla 在同一函数上互斥（既有设计）：vmfla 不再内嵌
-# func_table 间接化，独立 icall 注册池也不会出现。
-if grep -q "func_table" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
-  echo "vmfla bundle must not emit a func_table" >&2
-  exit 1
-fi
-if grep -q "register_funcs" "$OUT_DIR/test_lvars_legacy_combo.ll"; then
-  echo "vmfla bundle must not emit standalone icall pools" >&2
+# 旧名/别名已删除（支持集只有 bcf/vmfla/icall/enstr/ibr/vmp）：
+# vllvm:fla,lvars 之类的旧标注必须 (1) 逐名告警 unknown annotation kind，
+# (2) 不再触发任何混淆产物（无 vmfla 常量表/结构化痕迹），
+# (3) 编译照常成功且运行行为与 base 一致。
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -S -emit-llvm \
+  -DVLLVM_TEST_LEGACY_NAMES=1 "$SRC" \
+  -o "$OUT_DIR/test_lvars_legacy.ll" 2>"$OUT_DIR/test_lvars_legacy.log"
+
+grep -q "unknown annotation kind 'fla' ignored" "$OUT_DIR/test_lvars_legacy.log"
+grep -q "unknown annotation kind 'lvars' ignored" "$OUT_DIR/test_lvars_legacy.log"
+
+if grep -Eq 'vllvm\.(vmfla\.const\.table|localvars\.)|load volatile' \
+  "$OUT_DIR/test_lvars_legacy.ll"; then
+  echo "legacy names must not trigger any obfuscation artifacts" >&2
   exit 1
 fi
 
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 -S -emit-llvm \
-  ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
-  -o "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.vmfla.const.table" "$OUT_DIR/test_lvars.ll"
-grep -q "vllvm.vmfla.const.table.* global " "$OUT_DIR/test_lvars.ll"
-grep -Eq "vllvm\\.vmfla\\.const\\.table.*global \\[[0-9]+ x i32\\]" \
-  "$OUT_DIR/test_lvars.ll"
-if grep -q "vllvm.vmfla.const.table.* constant " "$OUT_DIR/test_lvars.ll"; then
-  echo "vmfla table must be writable data, not constant data" >&2
-  exit 1
-fi
-if grep -Eq "vllvm\\.(localvars\\.table|fla\\.const\\.table|combined\\.const\\.table)|func_index_table" \
-  "$OUT_DIR/test_lvars.ll"; then
-  echo "vmfla mode must not emit separate integer tables" >&2
-  exit 1
-fi
-if grep -Eq "vllvm\\.local\\.(enc_index|index_key|field_index|offset_key\\.ptr)" \
-  "$OUT_DIR/test_lvars.ll"; then
-  echo "unexpected global key or FieldIndex decrypt sequence" >&2
-  exit 1
-fi
-grep -q "load volatile" "$OUT_DIR/test_lvars.ll"
-VOLATILE_LOADS=$(grep -Ec "load volatile i32" "$OUT_DIR/test_lvars.ll")
-if [ "$VOLATILE_LOADS" -lt 1 ]; then
-  echo "expected volatile loads for encrypted offsets" >&2
-  exit 1
-fi
-grep -Eq "xor i32 %[0-9]+, %[0-9]+" "$OUT_DIR/test_lvars.ll"
-if grep -Eq "xor i32 %[0-9]+, [-0-9]+" "$OUT_DIR/test_lvars.ll"; then
-  echo "vmfla mode keys must be loaded from the shared table" >&2
-  exit 1
-fi
-grep -q "call.*@malloc" "$OUT_DIR/test_lvars.ll"
-grep -q "call.*@free" "$OUT_DIR/test_lvars.ll"
-
-# Verify intermediate IR with debug info: the generated wrapper must not share
-# the moved body's DISubprogram or contain an inlinable call without a location.
-for opt in 0; do
-  "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g -O"$opt" -S -emit-llvm \
-    ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
-    -o "$OUT_DIR/test_lvars_debug_O$opt.ll"
-  grep -q '!DISubprogram' "$OUT_DIR/test_lvars_debug_O$opt.ll"
-  if [ "$opt" = 0 ]; then
-    grep -Eq 'define.*vllvm.impl.*!dbg' "$OUT_DIR/test_lvars_debug_O$opt.ll"
-  fi
-done
-
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 "$SRC" \
-  -o "$OUT_DIR/test_lvars_base"
-"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" "${NO_DEBUG_ARGS[@]}" -O0 \
-  ${VMFLA_CONFIG[@]+"${VMFLA_CONFIG[@]}"} -DVLLVM_TEST_VMFLA=1 "$SRC" \
-  -o "$OUT_DIR/test_lvars"
-strip_binary "$OUT_DIR/test_lvars_base"
-strip_binary "$OUT_DIR/test_lvars"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 "$SRC" -o "$OUT_DIR/legacy_base"
+"$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 \
+  -DVLLVM_TEST_LEGACY_NAMES=1 "$SRC" -o "$OUT_DIR/legacy"
 
 set +e
-"$OUT_DIR/test_lvars_base"
+"$OUT_DIR/legacy_base"
 BASE_STATUS=$?
-"$OUT_DIR/test_lvars"
-LVARS_STATUS=$?
+"$OUT_DIR/legacy"
+LEGACY_STATUS=$?
 set -e
 
-if [ "$BASE_STATUS" -ne "$LVARS_STATUS" ]; then
-  echo "exit status mismatch: base=$BASE_STATUS lvars=$LVARS_STATUS" >&2
+if [ "$BASE_STATUS" -ne "$LEGACY_STATUS" ]; then
+  echo "exit status mismatch: base=$BASE_STATUS legacy=$LEGACY_STATUS" >&2
   exit 1
 fi
+
+echo "test_lvars_fla passed (legacy names rejected)"

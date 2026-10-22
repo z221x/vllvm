@@ -6,21 +6,20 @@ import os
 import statistics
 from collections import defaultdict
 
-CONFIG_ORDER = ["base", "fla", "bcf", "ibr", "icall", "vmfla", "enstr",
+CONFIG_ORDER = ["base", "bcf", "ibr", "icall", "vmfla", "enstr",
                 "bb2func", "merge", "vmp", "combo", "combo2"]
 CONFIG_DESC = {
     "base": "基线（无混淆）",
-    "fla": "控制流平坦化",
     "bcf": "虚假控制流",
     "ibr": "间接分支",
     "icall": "间接调用（含参数加密）",
-    "vmfla": "VM 平坦化（bb2func+merge+vmfla 链，含 lvars 结构化）",
+    "vmfla": "VM 平坦化（含 lvars 结构化）",
     "enstr": "字符串加密",
     "bb2func": "CFG 区域提取为 helper",
     "merge": "函数融合进 keyed dispatcher",
     "vmp": "虚拟机保护（实验性）",
-    "combo": "组合（fla+bcf+ibr+icall+vmfla）",
-    "combo2": "组合（fla+bcf+ibr+vmfla，无 icall）",
+    "combo": "组合（bcf+ibr+icall+vmfla）",
+    "combo2": "组合（bcf+ibr+vmfla，无 icall）",
 }
 APP_DESC = {
     "bzip2": "bzip2 1.0.8 压缩/解压",

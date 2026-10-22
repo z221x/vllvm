@@ -13,37 +13,12 @@ using namespace llvm;
 namespace llvm::vllvm {
 namespace {
 constexpr StringRef AttrPrefix = "vllvm.";
-constexpr StringRef ObfuscateAttr = "vllvm.obfuscate";
 constexpr StringRef EnstrGlobalMetadata = "vllvm.enstr";
 
 StringRef normalizeKind(StringRef Kind) {
   Kind = Kind.trim();
   Kind.consume_front("vllvm:");
   Kind.consume_front("vllvm.");
-  // 独立的 FlattenFuncPass 已删除：fla/lvars 标注都归并进 vmfla 链路，
-  // 平坦化在 vmfla level 1 生效。
-  if (Kind == "lvars" || Kind == "local-var-struct" || Kind == "localvars" ||
-      Kind == "flatten")
-    return "vmfla";
-  if (Kind == "indirect-call")
-    return "icall";
-  if (Kind == "indirect-branch")
-    return "ibr";
-  if (Kind == "vm-flatten" || Kind == "vm_flatten" ||
-      Kind == "vm-flatten-func" || Kind == "vm_flatten_func" ||
-      Kind == "vm-flatten-function" || Kind == "vm_flatten_function")
-    return "vmfla";
-  if (Kind == "bogus-control-flow" || Kind == "bogus_control_flow" ||
-      Kind == "bogus" || Kind == "fake-control-flow")
-    return "bcf";
-  if (Kind == "encrypt-string")
-    return "enstr";
-  if (Kind == "virtual-machine-protection" || Kind == "virtualize")
-    return "vmp";
-  if (Kind == "bb2func" || Kind == "bb2f" || Kind == "bb-to-func")
-    return "bb2func";
-  if (Kind == "funcmerge" || Kind == "func-merge")
-    return "merge";
   return Kind;
 }
 
@@ -51,21 +26,23 @@ void setOption(VLLVMOptions &Options, StringRef Kind) {
   Kind = normalizeKind(Kind);
   if (Kind == "enstr")
     Options.EncryptoStr = true;
-  else if (Kind == "vmfla" || Kind == "fla")
-    // fla 平坦化没有独立 pass：fla 标注进入 vmfla 链路。
+  else if (Kind == "vmfla")
     Options.VMFlattenFunc = true;
   else if (Kind == "bcf")
     Options.BogusControlFlow = true;
+  else if (Kind == "flower")
+    Options.Flower = true;
   else if (Kind == "icall")
     Options.IndirectCall = true;
   else if (Kind == "ibr")
     Options.IndirectBranch = true;
   else if (Kind == "vmp")
     Options.Vmp = true;
-  else if (Kind == "bb2func")
-    Options.BB2Func = true;
-  else if (Kind == "merge")
-    Options.Merge = true;
+  else
+    // 未知名告警而不是静默忽略：旧别名（fla/lvars/bogus/bb2func 等）
+    // 已删除，拼错或使用旧名必须对用户可见。
+    errs() << "[vllvm] unknown annotation kind '" << Kind
+           << "' ignored (supported: bcf,flower,vmfla,icall,enstr,ibr,vmp)\n";
 }
 
 bool isOptionSeparator(char C) {
@@ -153,11 +130,10 @@ bool addOptionsAsAttributes(Function &F, const VLLVMOptions &Options) {
   AddAttr("enstr", Options.EncryptoStr);
   AddAttr("vmfla", Options.VMFlattenFunc);
   AddAttr("bcf", Options.BogusControlFlow);
+  AddAttr("flower", Options.Flower);
   AddAttr("icall", Options.IndirectCall);
   AddAttr("ibr", Options.IndirectBranch);
   AddAttr("vmp", Options.Vmp);
-  AddAttr("bb2func", Options.BB2Func);
-  AddAttr("merge", Options.Merge);
   return Changed;
 }
 
@@ -242,46 +218,18 @@ bool hasVLLVMAttribute(Function &F, StringRef Kind) {
 
   SmallString<32> AttrName(AttrPrefix);
   AttrName += Kind;
-  if (F.hasFnAttribute(AttrName))
-    return true;
-
-  Attribute Attr = F.getFnAttribute(ObfuscateAttr);
-  if (!Attr.isValid() || !Attr.isStringAttribute())
-    return false;
-
-  VLLVMOptions Options = parseOptionList(Attr.getValueAsString());
-  if (Kind == "enstr")
-    return Options.EncryptoStr;
-  // fla 无独立 pass，归并到 vmfla 链路执行。
-  if (Kind == "vmfla" || Kind == "fla")
-    return Options.VMFlattenFunc;
-  if (Kind == "bcf")
-    return Options.BogusControlFlow;
-  if (Kind == "icall")
-    return Options.IndirectCall;
-  if (Kind == "ibr")
-    return Options.IndirectBranch;
-  if (Kind == "vmp")
-    return Options.Vmp;
-  if (Kind == "bb2func")
-    return Options.BB2Func;
-  if (Kind == "merge")
-    return Options.Merge;
-  return false;
+  return F.hasFnAttribute(AttrName);
 }
 
 VLLVMOptions getFunctionVLLVMOptions(Function &F) {
   VLLVMOptions Options;
   Options.EncryptoStr |= hasVLLVMAttribute(F, "enstr");
   Options.VMFlattenFunc |= hasVLLVMAttribute(F, "vmfla");
-  // IR 里遗留的 vllvm.fla 属性也归并进 vmfla 链路。
-  Options.VMFlattenFunc |= hasVLLVMAttribute(F, "fla");
   Options.BogusControlFlow |= hasVLLVMAttribute(F, "bcf");
+  Options.Flower |= hasVLLVMAttribute(F, "flower");
   Options.IndirectCall |= hasVLLVMAttribute(F, "icall");
   Options.IndirectBranch |= hasVLLVMAttribute(F, "ibr");
   Options.Vmp |= hasVLLVMAttribute(F, "vmp");
-  Options.BB2Func |= hasVLLVMAttribute(F, "bb2func");
-  Options.Merge |= hasVLLVMAttribute(F, "merge");
   return Options;
 }
 

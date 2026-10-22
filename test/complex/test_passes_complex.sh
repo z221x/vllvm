@@ -50,7 +50,7 @@ run_case() {
   upper_name=$(printf "%s" "$name" | tr "[:lower:]" "[:upper:]")
   local mode_define="-DVLLVM_TEST_${upper_name}=1"
   # icall 的 crypt 断言属于 level 2 行为（1=纯间接调用）；vmfla 的 lvars
-  # 断言属于 level 2 行为（1=bb2func+merge+平坦化，2=+lvars）。
+  # 断言属于 level 2 行为（1=仅平坦化，2=+局部变量结构化）。
   local config_args=()
   case "$name" in
   icall) config_args=(-mllvm -vllvm-config=icall=2) ;;

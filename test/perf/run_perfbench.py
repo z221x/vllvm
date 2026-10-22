@@ -38,17 +38,15 @@ BZIP2_SRC = ["blocksort.c", "bzip2.c", "bzlib.c", "compress.c", "crctable.c",
 
 CONFIGS = {
     "base": [],
-    "fla": ["vllvm.fla"],
     "bcf": ["vllvm.bcf"],
     "ibr": ["vllvm.ibr"],
     "icall": ["vllvm.icall"],
     "vmfla": ["vllvm.vmfla"],
     "enstr": ["vllvm.enstr"],
-    "bb2func": ["vllvm.bb2func"],
-    "merge": ["vllvm.merge"],
+    "flower": ["vllvm.flower"],
     "vmp": ["vllvm.vmp"],
-    # bcf 与 vmfla 叠加：调度上 bcf 作用于 bb2func+merge 之后的 wrapper，
-    # vmfla 在链路末端平坦化含虚假分支的 CFG。
+    # bcf 与 vmfla 叠加：调度上 bcf 先执行，vmfla 在链路末端平坦化
+    # 含虚假分支的 CFG。
     "bcfvmfla": ["vllvm.bcf", "vllvm.vmfla"],
     # 组合策略（2026-10-20 定版）：三组组合，不与 bcf 叠加；应用级
     # 组合配合 --annotate-fraction 做选择性标注（不全函数施加混淆）。
@@ -456,8 +454,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apps", default="zlib,bzip2,lua,sqlite")
     ap.add_argument("--configs",
-                    default="base,fla,bcf,ibr,icall,vmfla,enstr,bb2func,"
-                            "merge,vmp,combo")
+                    default="base,bcf,ibr,icall,vmfla,enstr,vmp,combo")
     ap.add_argument("--runs", type=int, default=WARMUP + TIMED_RUNS,
                     help="计时执行次数；0 = 可用性模式（编译成功 + 单次"
                          "执行输出与基线一致即通过，不计时）")

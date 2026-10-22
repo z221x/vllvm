@@ -476,17 +476,8 @@ BasicBlock *buildBucketDispatch(Function &F, BasicBlock *InsertBefore,
 }
 
 void removeVLLVMAttributes(Function &F) {
-  F.removeFnAttr("vllvm.obfuscate");
-  F.removeFnAttr("vllvm.enstr");
-  F.removeFnAttr("vllvm.vmfla");
-  F.removeFnAttr("vllvm.fla");
-  F.removeFnAttr("vllvm.icall");
-  F.removeFnAttr("vllvm.ibr");
-  F.removeFnAttr("vllvm.lvars");
-  F.removeFnAttr("vllvm.bcf");
-  F.removeFnAttr("vllvm.vmp");
-  F.removeFnAttr("vllvm.bb2func");
-  F.removeFnAttr("vllvm.merge");
+  for (StringRef Kind : {"bcf", "vmfla", "icall", "enstr", "ibr", "vmp"})
+    F.removeFnAttr((Twine("vllvm.") + Kind).str());
 }
 
 // vmfla 链路的延迟标记：由调度层打在原函数上；复制属性到 impl 时必须

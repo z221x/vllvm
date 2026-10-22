@@ -2,13 +2,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL
     "Generate compile_commands.json for clangd" FORCE)
 
 add_llvm_component_library(LLVMVLLVM
-  Pass/BB2FuncPass.cpp
   Pass/BogusControlFlowPass.cpp
   Pass/EncryptoStrPass.cpp
   Pass/EnstrPoolRuntimeEmbed.cpp
   Pass/IndirectBranchPass.cpp
   Pass/IndirectCallPass.cpp
-  Pass/MergePass.cpp
   Pass/PassInfo.cpp
   Pass/VMFlattenFuncPass.cpp
   Pass/VmpPass.cpp

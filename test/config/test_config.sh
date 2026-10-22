@@ -52,7 +52,7 @@ if grep -Eq "vllvm\.(vmfla\.const\.table|bb2f\.|merge\.)" "$OUT_DIR/off.ll"; the
 fi
 grep -q '\[vllvm\] VLLVMConfig:vmfla: level=0 (default=1 max=2)' "$OUT_DIR/off.log"
 
-# vmfla level=1（默认）：bb2func + merge + 平坦化；不做局部变量结构化。
+# vmfla level=1（默认）：仅平坦化；不做局部变量结构化。
 "$VLLVM_CLANG" "${EXTRA_ARGS[@]}" -g0 -O0 -fno-discard-value-names \
   -DVLLVM_TEST_VMFLA=1 "$VMFLA_SRC" -S -emit-llvm \
   -o "$OUT_DIR/l1.ll" 2>"$OUT_DIR/l1.log"
