@@ -30,6 +30,10 @@ CONFIGS = [
     ("combo1", 4),
     ("combo2", 5),
     ("combo3", 6),
+    # VMP 单独测（M3 扩展后标准算法顶层函数可全部虚拟化，270~1900x；
+    # 全套单轮约 2 小时，建议 --configs vmp 单独跑。仍存在准入回退时
+    # 比值近 1.0x，以 __vllvm_vmp_code.<fn> 标记区分）。
+    ("vmp", 7),
 ]
 
 
@@ -40,7 +44,19 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--opt", default="O0",
                     help="逗号分隔的优化级别（如 O1,O0），逐级编译运行")
+    ap.add_argument("--configs", default=None,
+                    help="逗号分隔的配置名（默认全跑，如 base,vmp）")
     args = ap.parse_args()
+
+    configs = CONFIGS
+    if args.configs:
+        wanted = [c.strip() for c in args.configs.split(",") if c.strip()]
+        names = {n for n, _ in CONFIGS}
+        for w in wanted:
+            if w not in names:
+                sys.exit("unknown config '%s' (have: %s)" %
+                         (w, ",".join(names)))
+        configs = [(n, m) for n, m in CONFIGS if n in wanted]
 
     clang = os.environ.get("CLANG") or os.path.join(
         ROOT, "build/llvm-macos/bin/clang")
@@ -57,7 +73,7 @@ def main():
     def run_level(level):
         results = {}
         digests = {}
-        for name, mode in CONFIGS:
+        for name, mode in configs:
             algo_medians = {}
             for algo in ALGOS:
                 src = os.path.join(ALGO_DIR, "%s_bench.c" % algo)
@@ -108,12 +124,12 @@ def main():
 
         base = results["base"]
         print("\n[-%s] %-8s" % (level, "algo"),
-              "".join("%12s" % n for n, _ in CONFIGS))
+              "".join("%12s" % n for n, _ in configs))
         ratios = {}
         for algo in ALGOS:
             ratios[algo] = {}
             cells = []
-            for name, _ in CONFIGS:
+            for name, _ in configs:
                 r = results[name][algo] / base[algo]
                 ratios[algo][name] = round(r, 2)
                 cells.append("%11.2fx" % r)

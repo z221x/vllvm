@@ -40,6 +40,8 @@ public:
 
   bool compile(std::vector<std::uint64_t> &EncodedCode,
                std::vector<std::uint64_t> &ValueTable,
+               std::vector<llvm::vllvm::VMPCodegenResult::AddressSlot>
+                   &OutputAddressSlots,
                std::uint32_t &OutputFrameSize, std::string &Error) {
     if (!layoutFrame(Error) || !selectFunction(Error) ||
         !resolveBranches(Error) || !validate(Error))
@@ -49,6 +51,7 @@ public:
     for (const VmInstruction &Inst : Code)
       EncodedCode.push_back(Inst.encode());
     ValueTable = Constants;
+    OutputAddressSlots = AddressSlots;
     OutputFrameSize = FrameSize;
     return true;
   }
@@ -67,6 +70,9 @@ private:
   SmallVector<BranchFixup, 32> Branches;
   SmallVector<VmInstruction, 128> Code;
   std::vector<std::uint64_t> Constants;
+  std::vector<llvm::vllvm::VMPCodegenResult::AddressSlot> AddressSlots;
+  // 地址槽按全局符号名去重；std::map 避免与常量哨兵撞键（同 Constants）。
+  std::map<std::string, std::uint32_t> AddressSlotIndices;
   const AllocaInst *OutgoingAlloca = nullptr;
   std::uint32_t PhiTemporaryBase = 0;
   std::uint32_t PhiTemporaryCount = 0;
@@ -271,6 +277,21 @@ private:
           .format = InstFormat::CONST_POOL});
   }
 
+  // 全局地址走"补丁槽"：常量池先占位 0，包装函数运行期写入真实地址。
+  void emitGlobalAddress(Reg Dst, const GlobalValue *GV) {
+    const std::string Name = GV->getName().str();
+    auto [It, Inserted] =
+        AddressSlotIndices.try_emplace(Name, Constants.size());
+    if (Inserted) {
+      Constants.push_back(0);
+      AddressSlots.push_back({It->second, Name});
+    }
+    emit({.opcode = Opcode::LDC,
+          .dst = Dst,
+          .payload = It->second,
+          .format = InstFormat::CONST_POOL});
+  }
+
   void emitLoadStack(Reg Dst, std::uint32_t Offset) {
     emit({.opcode = Opcode::LOAD64,
           .dst = Dst,
@@ -319,6 +340,11 @@ private:
       emitConstant(Dst, 0);
       return true;
     }
+    // 全局（变量/函数）地址：不是编译期常量，进补丁槽由包装函数回填。
+    if (const auto *GV = dyn_cast<GlobalValue>(V)) {
+      emitGlobalAddress(Dst, GV);
+      return true;
+    }
 
     std::int64_t StackOffset = 0;
     if (resolveStackAddress(V, StackOffset)) {
@@ -340,8 +366,12 @@ private:
 
     auto It = ValueSlots.find(V);
     if (It == ValueSlots.end()) {
-      Error =
-          (Twine("VMP Direct CodeGen 无法取得 SSA 值：") + V->getName()).str();
+      std::string Desc;
+      raw_string_ostream OS(Desc);
+      V->print(OS);
+      if (Desc.size() > 160)
+        Desc.resize(160);
+      Error = "VMP Direct CodeGen 无法取得 SSA 值：" + Desc;
       return false;
     }
     emitLoadStack(Dst, It->second);
@@ -790,8 +820,8 @@ bool llvm::vllvm::FunctionCompiler::compile(VMPCodegenResult &Output,
                                             std::string &Error) {
   VMPCodegenResult Result;
   FunctionCompilerImpl Compiler(F);
-  if (!Compiler.compile(Result.Code, Result.ValueTable, Result.FrameSize,
-                        Error))
+  if (!Compiler.compile(Result.Code, Result.ValueTable, Result.AddressSlots,
+                        Result.FrameSize, Error))
     return false;
   for (std::uint32_t Pc = 0; Pc != Result.Code.size(); ++Pc) {
     const VmpTrap Trap =

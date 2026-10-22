@@ -17,20 +17,22 @@ fi
   2>"$OUT_DIR/fallback-aarch64.remarks"
 
 grep -q '"vllvm.vmp"' "$OUT_DIR/fallback-aarch64.ll"
-if grep -q 'vllvm.vmp.failed' "$OUT_DIR/fallback-aarch64.ll"; then
-  echo "fallback unexpectedly modified a rejected function" >&2
-  exit 1
-fi
 grep -q '只支持可静态解析的直接调用' "$OUT_DIR/fallback-aarch64.remarks"
-grep -q '暂不支持 GEP' "$OUT_DIR/fallback-aarch64.remarks"
 grep -q '参数数量超过' "$OUT_DIR/fallback-aarch64.remarks"
 grep -q 'HOSTCALL 参数数量超过统一 bridge 的 15 参数上限' \
   "$OUT_DIR/fallback-aarch64.remarks"
-grep -q '非 volatile' "$OUT_DIR/fallback-aarch64.remarks"
-if grep -q '__vllvm_vmp_code' "$OUT_DIR/fallback-aarch64.ll"; then
-  echo "unsupported functions unexpectedly produced VMP code tables" >&2
-  exit 1
-fi
+
+# GEP 与 volatile 标量访存已支持：对应函数必须产出 VMP 代码表。
+grep -q '__vllvm_vmp_code.rejected_gep\.' "$OUT_DIR/fallback-aarch64.ll"
+grep -q '__vllvm_vmp_code.rejected_volatile\.' "$OUT_DIR/fallback-aarch64.ll"
+# 其余不支持形态仍回退，不得产出代码表。
+for rejected in rejected_indirect_call rejected_float rejected_seven \
+                rejected_hostcall_sixteen rejected_aggregate; do
+  if grep -q "__vllvm_vmp_code.${rejected}\\." "$OUT_DIR/fallback-aarch64.ll"; then
+    echo "unsupported function ${rejected} unexpectedly produced VMP code" >&2
+    exit 1
+  fi
+done
 
 "$CLANG" --target=x86_64-unknown-linux-gnu -O0 -Rpass-missed=vmp \
   -S -emit-llvm "$SOURCE" -o "$OUT_DIR/fallback-x86.ll" \

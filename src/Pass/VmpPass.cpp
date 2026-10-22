@@ -15,6 +15,7 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
@@ -61,6 +62,8 @@ struct CompiledFunction {
   Function *Source = nullptr;
   std::vector<std::uint64_t> Code;
   std::vector<std::uint64_t> Constants;
+  // 值表里需要包装函数运行期回填全局地址的槽位（名字对应原 Module）。
+  std::vector<VMPCodegenResult::AddressSlot> AddressSlots;
   struct HostCallTarget {
     Function *Target = nullptr;
     std::string PseudoSymbol;
@@ -208,21 +211,25 @@ struct CompiledFunction {
       return "包含不支持的二元运算";
     }
     if (auto *AI = dyn_cast<AllocaInst>(&I)) {
-      if (!AI->isStaticAlloca() || AI->isArrayAllocation() ||
-          !isScalarVmType(AI->getAllocatedType()) ||
+      // 数组/标量静态 alloca 均可：VM 帧按 DataLayout 字节布局分配
+      //（Direct CodeGen 的 layoutFrame/allocaSize 支持任意定长类型），
+      // 访问仍受下方标量 load/store 检查约束。
+      if (!AI->isStaticAlloca() || !AI->getAllocatedType()->isSized() ||
           AI->getAlign().value() > kFrameAlignment)
-        return "只支持对齐不超过 16 字节的标量静态 alloca";
+        return "只支持静态定长（含标量/数组）、对齐不超过 16 字节的 alloca";
       continue;
     }
     if (auto *LI = dyn_cast<LoadInst>(&I)) {
-      if (LI->isVolatile() || LI->isAtomic() || !isScalarVmType(LI->getType()))
-        return "load 必须是非 volatile、非 atomic 的 M3 标量访问";
+      // volatile 在 VM 中按程序序逐次真实访存执行，单线程语义等价；
+      // atomic 仍拒绝（VM 不提供原子性与跨线程顺序保证）。
+      if (LI->isAtomic() || !isScalarVmType(LI->getType()))
+        return "load 必须是非 atomic 的 M3 标量访问";
       continue;
     }
     if (auto *SI = dyn_cast<StoreInst>(&I)) {
-      if (SI->isVolatile() || SI->isAtomic() ||
+      if (SI->isAtomic() ||
           !isScalarVmType(SI->getValueOperand()->getType()))
-        return "store 必须是非 volatile、非 atomic 的 M3 标量访问";
+        return "store 必须是非 atomic 的 M3 标量访问";
       continue;
     }
     if (auto *Cmp = dyn_cast<ICmpInst>(&I)) {
@@ -239,13 +246,16 @@ struct CompiledFunction {
             &I))
       continue;
     if (auto *CI = dyn_cast<CastInst>(&I)) {
-      if (isa<TruncInst, ZExtInst, SExtInst, BitCastInst>(CI) &&
+      if (isa<TruncInst, ZExtInst, SExtInst, BitCastInst, PtrToIntInst,
+              IntToPtrInst>(CI) &&
           isScalarVmType(CI->getSrcTy()) && isScalarVmType(CI->getDestTy()))
         continue;
-      return "只支持 trunc/zext/sext/等宽 bitcast";
+      return "只支持 trunc/zext/sext/ptrtoint/inttoptr/等宽 bitcast";
     }
+    // 正常流程下 GEP 已被 lowerGEPs 分解；这里只兜底不可分解的残留
+    //（如 PHI incoming 里的常量表达式 GEP 未物化）。
     if (isa<GetElementPtrInst>(&I))
-      return "M3 暂不支持 GEP";
+      return "GEP 分解后仍残留 getelementptr（不可物化的指针常量表达式）";
     if (auto *Call = dyn_cast<CallInst>(&I)) {
       std::string Reason = checkHostCall(*Call);
       if (Reason.empty())
@@ -287,6 +297,174 @@ void lowerSwitches(Function &F) {
   FPM.doInitialization();
   FPM.run(F);
   FPM.doFinalization();
+}
+
+// 把指令操作数里的 ConstantExpr 物化成真实指令：IRBuilder 常量折叠会
+// 把 ptrtoint(@g) 等折回 ConstantExpr，而 Direct CodeGen 只能对指令取
+// 值（纯整数常量表达式物化后同样无害）。PHI 的 incoming 物化到对应
+// 前驱块终结指令之前；物化出的 GEP 由 lowerGEPs 在下一轮分解。
+bool materializeConstantExprs(Function &F) {
+  bool Changed = false;
+  bool Progress = true;
+  while (Progress) {
+    Progress = false;
+    for (BasicBlock &BB : F) {
+      for (auto It = BB.begin(), E = BB.end(); It != E;) {
+        Instruction *User = &*It++;
+        if (auto *Phi = dyn_cast<PHINode>(User)) {
+          for (unsigned In = 0; In < Phi->getNumIncomingValues(); ++In) {
+            auto *CE = dyn_cast<ConstantExpr>(Phi->getIncomingValue(In));
+            if (!CE)
+              continue;
+          Instruction *Expanded = CE->getAsInstruction();
+          Expanded->insertBefore(Phi->getIncomingBlock(In)->getTerminator());
+          Phi->setIncomingValue(In, Expanded);
+          Changed = Progress = true;
+          }
+          continue;
+        }
+        for (unsigned Op = 0; Op < User->getNumOperands(); ++Op) {
+          auto *CE = dyn_cast<ConstantExpr>(User->getOperand(Op));
+          if (!CE)
+            continue;
+          Instruction *Expanded = CE->getAsInstruction();
+          Expanded->insertBefore(User);
+          User->setOperand(Op, Expanded);
+          Changed = Progress = true;
+        }
+      }
+    }
+  }
+  return Changed;
+}
+
+// 把 memcpy/memmove/memset intrinsic 改写为对同名 libc 函数的直接
+// 调用，交给 HOSTCALL 机制执行（参数均为标量指针/长度）；llvm.objectsize
+// 折叠为 -1（未知大小）：-O0 下 fortify 的 __memcpy/__memset_chk 以它
+// 作 dstlen，未知大小按约定跳过长度检查。同时在原 Module 补 libc 声明，
+// 保证 lowerHostCalls 的按名回查可用。
+void lowerMemIntrinsics(Function &F, Module &OriginalModule) {
+  Module *M = F.getParent();
+  // 先收集再改写：遍历中 erase 会留下悬空迭代器。
+  SmallVector<CallInst *, 8> MemCalls;
+  SmallVector<CallInst *, 8> ObjectSizes;
+  for (Instruction &I : instructions(F)) {
+    auto *Call = dyn_cast<CallInst>(&I);
+    if (!Call)
+      continue;
+    Function *Callee = Call->getCalledFunction();
+    if (!Callee)
+      continue;
+    const Intrinsic::ID ID = Callee->getIntrinsicID();
+    if (ID == Intrinsic::memcpy || ID == Intrinsic::memmove ||
+        ID == Intrinsic::memset)
+      MemCalls.push_back(Call);
+    else if (ID == Intrinsic::objectsize)
+      ObjectSizes.push_back(Call);
+  }
+  for (CallInst *Call : ObjectSizes) {
+    Call->replaceAllUsesWith(ConstantInt::get(
+        Type::getInt64Ty(F.getContext()),
+        static_cast<uint64_t>(-1), true));
+    Call->eraseFromParent();
+  }
+  for (CallInst *Call : MemCalls) {
+    const Intrinsic::ID ID = Call->getCalledFunction()->getIntrinsicID();
+    const bool IsSet = ID == Intrinsic::memset;
+    Type *PtrTy = PointerType::getUnqual(F.getContext());
+    Type *I64Ty = Type::getInt64Ty(F.getContext());
+    FunctionType *FnTy = FunctionType::get(
+        PtrTy, {PtrTy, IsSet ? Type::getInt32Ty(F.getContext()) : PtrTy, I64Ty},
+        false);
+    const char *Name = IsSet ? "memset" : (ID == Intrinsic::memcpy ? "memcpy"
+                                                                   : "memmove");
+    OriginalModule.getOrInsertFunction(Name, FnTy);
+    FunctionCallee Libc = M->getOrInsertFunction(Name, FnTy);
+
+    IRBuilder<> B(Call);
+    SmallVector<Value *, 3> Args;
+    for (unsigned A = 0; A < 3; ++A)
+      Args.push_back(Call->getArgOperand(A));
+    if (IsSet)
+      Args[1] = B.CreateZExt(Args[1], Type::getInt32Ty(F.getContext()));
+    B.CreateCall(Libc, Args);
+    Call->eraseFromParent();
+  }
+}
+
+// GEP → 整数地址运算：base = ptrtoint；顺序下标按元素大小缩放相加
+//（常量下标折叠进常量偏移），结构体下标按 DataLayout 字段偏移折叠，
+// 动态下标按有符号语义 sext 到 i64，结果 inttoptr 回指针。全程只用
+// M3 已支持的原语（ADD/MUL/SEXT/BITCAST），不扩展 ISA。
+bool lowerGEPs(Function &F) {
+  const DataLayout &DL = F.getParent()->getDataLayout();
+  SmallVector<GetElementPtrInst *, 32> GEPs;
+  for (Instruction &I : instructions(F))
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+      GEPs.push_back(GEP);
+  if (GEPs.empty())
+    return false;
+
+  Type *I64 = Type::getInt64Ty(F.getContext());
+  for (GetElementPtrInst *GEP : GEPs) {
+    IRBuilder<> B(GEP);
+    APInt ConstOffset(64, 0, true);
+    SmallVector<std::pair<Value *, std::uint64_t>, 4> Dynamic;
+    bool Failed = false;
+    for (gep_type_iterator GTI = gep_type_begin(GEP),
+                           GTE = gep_type_end(GEP);
+         GTI != GTE && !Failed; ++GTI) {
+      Value *Index = GTI.getOperand();
+      if (StructType *ST = GTI.getStructTypeOrNull()) {
+        auto *FieldNo = dyn_cast<ConstantInt>(Index);
+        if (!FieldNo) {
+          Failed = true; // 结构体字段下标必须是常量（合法 IR 保证）
+          break;
+        }
+        ConstOffset += APInt(
+            64, DL.getStructLayout(ST)->getElementOffset(FieldNo->getZExtValue()),
+            true);
+      } else {
+        Type *ElemTy = GTI.getIndexedType();
+        if (!ElemTy->isSized()) {
+          Failed = true;
+          break;
+        }
+        TypeSize Scale = DL.getTypeAllocSize(ElemTy);
+        if (Scale.isScalable()) {
+          Failed = true;
+          break;
+        }
+        const std::uint64_t ScaleV = Scale.getFixedValue();
+        if (auto *C = dyn_cast<ConstantInt>(Index)) {
+          ConstOffset += C->getValue().sext(64) * APInt(64, ScaleV, true);
+        } else {
+          Dynamic.emplace_back(Index, ScaleV);
+        }
+      }
+    }
+    if (Failed)
+      continue; // 保留原 GEP，由 checkEligibility 拒绝并回退
+
+    Value *Addr = B.CreatePtrToInt(GEP->getPointerOperand(), I64,
+                                   GEP->getName() + ".p2i");
+    if (!ConstOffset.isZero())
+      Addr = B.CreateAdd(Addr, ConstantInt::get(I64, ConstOffset),
+                         GEP->getName() + ".off");
+    for (auto &[Index, ScaleV] : Dynamic) {
+      Value *Idx64 =
+          Index->getType() == I64 ? Index : B.CreateSExt(Index, I64);
+      Value *Scaled =
+          ScaleV == 1 ? Idx64
+                      : B.CreateMul(Idx64, ConstantInt::get(I64, ScaleV));
+      Addr = B.CreateAdd(Addr, Scaled, GEP->getName() + ".idx");
+    }
+    Instruction *Ptr = cast<Instruction>(
+        B.CreateIntToPtr(Addr, GEP->getType(), GEP->getName() + ".ptr"));
+    GEP->replaceAllUsesWith(Ptr);
+    GEP->eraseFromParent();
+  }
+  return true;
 }
 
 Value *packVmScalar(IRBuilder<> &Builder, Value *ValueToPack) {
@@ -607,10 +785,8 @@ void removeConflictingAttributes(Function &F) {
   F.removeFnAttr(Attribute::OptimizeNone);
   F.removeFnAttr(Attribute::Memory);
   F.addFnAttr(Attribute::NoInline);
-  for (StringRef Attr : {"vllvm.vmfla", "vllvm.fla", "vllvm.icall",
-                         "vllvm.ibr", "vllvm.lvars", "vllvm.bcf",
-                         "vllvm.vmp"})
-    F.removeFnAttr(Attr);
+  for (StringRef Kind : {"bcf", "vmfla", "icall", "enstr", "ibr", "vmp"})
+    F.removeFnAttr((Twine("vllvm.") + Kind).str());
   F.removeFnAttr(VmpInjectedNoInlineAttr);
   F.removeFnAttr(VmpHadAlwaysInlineAttr);
   F.addFnAttr(VmpProcessedAttr);
@@ -644,8 +820,10 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
   GlobalVariable *ValueTable = nullptr;
   if (!Compiled.Constants.empty()) {
     Constant *ValueData = ConstantDataArray::get(Context, Compiled.Constants);
+    // 含地址槽的值表必须可写：包装函数每次调用前回填全局地址。
     ValueTable = new GlobalVariable(
-        M, ValueData->getType(), true, GlobalValue::PrivateLinkage, ValueData,
+        M, ValueData->getType(), Compiled.AddressSlots.empty(),
+        GlobalValue::PrivateLinkage, ValueData,
         "__vllvm_vmp_values." + F.getName() + "." + utostr(TableId));
     ValueTable->setUnnamedAddr(GlobalValue::UnnamedAddr::Global);
     ValueTable->setAlignment(Align(8));
@@ -703,6 +881,21 @@ bool installWrapper(Module &M, CompiledFunction &Compiled, unsigned TableId,
 
   // VM 栈由解释器按 FrameSize 自行 malloc/free，包装器不再在宿主栈上
   // 分配帧缓冲（递归时不再逐层占用宿主栈）。
+  // 地址槽回填：全局地址含链接期重定位，编译期只能占位 0；这里在
+  // 每次调用解释器前把真实地址写进值表（多次/并发调用写入同值，安全）。
+  for (const VMPCodegenResult::AddressSlot &Slot : Compiled.AddressSlots) {
+    GlobalValue *GV = M.getNamedValue(Slot.GlobalName);
+    if (!GV) {
+      Error = "地址槽对应的全局符号在原 Module 中不存在: " + Slot.GlobalName;
+      return false;
+    }
+    Value *SlotAddress = Builder.CreateInBoundsGEP(
+        ValueTable->getValueType(), ValueTable,
+        {Builder.getInt32(0), Builder.getInt32(Slot.Slot)});
+    Builder.CreateStore(Builder.CreatePtrToInt(GV, Builder.getInt64Ty()),
+                        SlotAddress);
+  }
+
   Value *NullPointer = ConstantPointerNull::get(Builder.getPtrTy());
   Value *RawResult = Builder.CreateCall(
       Execute,
@@ -777,12 +970,28 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
         lowerSelects(*PreparedFunction);
         // 将 switch 指令转换成 if else
         lowerSwitches(*PreparedFunction);
+        // 内存 intrinsic 改写为 libc 直调（走 HOSTCALL）
+        lowerMemIntrinsics(*PreparedFunction, M);
+        // GEP 分解与常量表达式物化交替迭代到不动点：物化会暴露新的
+        // GEP 指令（如 PHI incoming 的常量 GEP），GEP 分解又会折叠出
+        // 新的 ptrtoint 常量表达式（全局基址）。
+        for (int Guard = 0; Guard < 8; ++Guard) {
+          const bool Changed = materializeConstantExprs(*PreparedFunction) |
+                               lowerGEPs(*PreparedFunction);
+          if (!Changed)
+            break;
+        }
         // 判断是否可以进行虚拟化
         Reason = checkEligibility(*PreparedFunction);
         if (Reason.empty() &&
             // 提取目标函数内所有的函数调用
             !lowerHostCalls(*PreparedFunction, M, HostCalls, Reason))
           Reason = Reason.empty() ? "HOSTCALL lowering 失败" : Reason;
+        if (Reason.empty()) {
+          // HOSTCALL 打包会把 ptrtoint(@全局) 折回 ConstantExpr，
+          // 补一轮物化使其成为可取值的指令。
+          materializeConstantExprs(*PreparedFunction);
+        }
       }
     }
     if (Reason.empty()) {
@@ -793,6 +1002,7 @@ PreservedAnalyses VmpPass::run(Module &M, ModuleAnalysisManager &) {
         Result.Source = F;
         Result.Code = std::move(Codegen.Code);
         Result.Constants = std::move(Codegen.ValueTable);
+        Result.AddressSlots = std::move(Codegen.AddressSlots);
         Result.HostCalls = std::move(HostCalls);
         Result.FrameSize = Codegen.FrameSize;
         Compiled.push_back(std::move(Result));

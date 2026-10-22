@@ -27,6 +27,8 @@
 #define OBF __attribute__((annotate("vllvm:vmfla,ibr")))
 #elif OBF_MODE == 6
 #define OBF __attribute__((annotate("vllvm:enstr,icall,vmfla")))
+#elif OBF_MODE == 7
+#define OBF __attribute__((annotate("vllvm:vmp")))
 #else
 #define OBF
 #endif
