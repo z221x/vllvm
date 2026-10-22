@@ -9,7 +9,7 @@
 | --- | --- | --- | --- |
 | L0 约束检查 | 混淆×优化互斥、-O0 正常编译 | `./test/config/test_obf_requires_o0.sh` | 秒级 |
 | L1 回归测试 | 每个 pass 的 IR 形态断言 + 运行等价 | `test/` 下全部 `.sh` | ~10 分钟 |
-| L2 算法基准 | 7 算法 × 4 配置，向量校验 + 开销 | `python3 test/perf/algo_fn_bench.py --runs 3` | ~10 分钟 |
+| L2 算法基准 | 7 算法 × 8 配置，向量校验 + 开销 | `python3 test/perf/algo_fn_bench.py --runs 3` | ~10 分钟 |
 | L3 应用基准 | 4 应用全程序标注（zlib/bzip2/lua/sqlite） | `python3 test/perf/run_perfbench.py --apps zlib,bzip2,lua,sqlite --configs base,vmfla,bcfvmfla --runs 6` | ~40 分钟 |
 | L3+ 应用基准 | CPython（重型） | `python3 test/perf/run_python_bench.py --runs 6` | ~1 小时（首次含源码下载与基线构建） |
 | L4 手动重型 | Firefox（见下） | 人工触发 | 数小时 |
@@ -37,8 +37,7 @@ for t in $(find test -name '*.sh' -not -path '*/perf/*' \
 核心入口：`test/complex/test_passes_complex.sh`（组合）、
 `test/config/`（等级语义与约束）、`test/vmfla/`（链路与 indirectbr）、
 `test/boguscontrolflow/`、`test/enstr/`、`test/indirectcall/`、
-`test/indirectbranch/`、`test/phi/`、`test/localvarstruct/`、
-`test/bb2func/`、`test/merge/`、`test/vmp/`。
+`test/indirectbranch/`、`test/phi/`、`test/localvarstruct/`、`test/vmp/`。
 
 ## 第 2 层：算法基准（函数级）
 
@@ -49,10 +48,13 @@ for t in $(find test -name '*.sh' -not -path '*/perf/*' \
   单一算法与其官方测试向量（FIPS-197 / FIPS-46 / GB/T 32907 /
   RFC6229-ish / RFC1321 / FIPS-180 / CRC32 "123456789"），避免跨算法
   干扰；标注该算法顶层处理函数，`OBF_MODE` 选择配置（0 base /
-  1 vmfla / 2 bcf / 3 bcf+vmfla / 4-6 combo1-3）。
+  1 vmfla / 2 bcf / 3 bcf+vmfla / 4-6 combo1-3 / 7 vmp。vmp 配置单轮
+  全套约 2 小时（解释执行 270~1900x），建议 `--configs vmp` 按需单独
+  跑；准入失败时 pass 回退（比值近 1.0x），以 IR 的
+  `__vllvm_vmp_code.<fn>` 标记或 `-Rpass-missed=vmp` 备注区分）。
 - 运行：`python3 test/perf/algo_fn_bench.py --runs 3 [--opt O0]`，
   样本链接后统一 strip 再计时（-O0 会保留 static 函数名于符号表）。
-- 正确性门槛：向量全过、轮间摘要无漂移、四配置摘要逐一相等，
+- 正确性门槛：向量全过、轮间摘要无漂移、各配置摘要逐一相等，
   任一失败脚本非零退出。
 - 产出：`tmp/perfbench/algo-vmfla/results_O0.json`（中位数与比值）。
 

@@ -761,9 +761,9 @@ switch -> icmp + br 组成的平衡控制流树
 |---|---|
 | 终结指令 | `indirectbr`、`invoke`、`resume`、`cleanupret`、`catchret`、`catchswitch`、`callbr` |
 | 浮点一元/二元 | `fneg`、`fadd`、`fsub`、`fmul`、`fdiv`、`frem` |
-| 内存与原子 | `getelementptr`、`fence`、`cmpxchg`、`atomicrmw` |
+| 内存与原子 | `fence`、`cmpxchg`、`atomicrmw` |
 | 浮点转换 | `fptoui`、`fptosi`、`uitofp`、`sitofp`、`fptrunc`、`fpext` |
-| 指针转换 | `ptrtoint`、`inttoptr`、`addrspacecast` |
+| 指针转换 | `addrspacecast` |
 | 异常 funclet | `cleanuppad`、`catchpad`、`landingpad` |
 | 浮点比较 | `fcmp` |
 | 可变参数 | `va_arg` |
@@ -772,16 +772,19 @@ switch -> icmp + br 组成的平衡控制流树
 | Poison 固化 | `freeze` |
 | LLVM 内部 | `UserOp1`、`UserOp2` |
 
-`ptrtoint/inttoptr` 不能出现在候选函数的输入 IR 中；Pass 在资格检查完成后为了包装
-参数和 HOSTCALL 返回值而内部生成的转换不受此限制。
+`getelementptr` 与 `ptrtoint/inttoptr` 不进入 VM：Pass 在资格检查前把 GEP
+预分解为整数地址运算（常量下标折叠、动态下标按元素大小缩放相加，
+结构体下标按 DataLayout 字段偏移折叠），指针↔整数转换映射为 BITCAST。
+常量表达式形式的指针运算（含 PHI incoming）先物化成指令再分解；
+HOSTCALL 打包折叠出的 `ptrtoint(@全局)` 在 lowering 后补一轮物化。
 
 #### 14.3.3 条件支持指令
 
 | 指令 | 限制 |
 |---|---|
 | `add/sub/mul/udiv/sdiv/urem/srem/and/or/xor/shl/lshr/ashr` | 只能操作 `i1/i8/i16/i32/i64` 标量；不支持浮点、向量和 `i128` |
-| `alloca` | 必须是静态单个标量分配；不能是动态或数组分配；对齐不得超过 16 字节 |
-| `load/store` | 必须非 volatile、非 atomic，访问值必须是受支持标量 |
+| `alloca` | 必须静态定长（含标量/数组，VM 帧按 DataLayout 字节布局分配）；不能是动态分配；对齐不得超过 16 字节 |
+| `load/store` | 允许 volatile（VM 按程序序逐次真实访存，单线程语义等价）；必须非 atomic，访问值必须是受支持标量 |
 | `trunc/zext/sext` | 源和目标都必须是受支持整数类型 |
 | `bitcast` | 源和目标都必须是受支持标量，并满足 LLVM 自身的等宽要求 |
 | `icmp` | 目标能力只覆盖受支持整数/普通指针比较 |
@@ -790,8 +793,11 @@ switch -> icmp + br 组成的平衡控制流树
 | `switch` | 先降为 `icmp + br`，不直接进入 VMP Target |
 | `call` | 仅支持满足下一节 ABI 契约的静态直接调用 |
 
-全局符号地址尚未成为正式支持能力；如果此类访问通过前置白名单，仍会在 VMP
-Target 指令选择或纯流验证阶段事务式回退。
+全局符号地址经**值表补丁槽**支持：全局地址含链接期重定位、不能编进纯
+i64 常量池，编译期在值表占位 0 并记录槽位→符号名，宿主包装函数在每次
+调用解释器前把真实地址写回槽位（LDC 照常读取）。此外，`llvm.memcpy/
+memmove/memset` 预改写为同名 libc 直调（走 HOSTCALL），`llvm.objectsize`
+折叠为 -1（未知大小，配合 fortify `_chk` 函数跳过长度检查）。
 
 #### 14.3.4 不支持的调用形式
 
