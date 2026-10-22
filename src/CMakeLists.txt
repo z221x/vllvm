@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMVLLVM
   Pass/BogusControlFlowPass.cpp
   Pass/EncryptoStrPass.cpp
   Pass/EnstrPoolRuntimeEmbed.cpp
+  Pass/FlowerPass.cpp
   Pass/IndirectBranchPass.cpp
   Pass/IndirectCallPass.cpp
   Pass/PassInfo.cpp
@@ -19,6 +20,7 @@ add_llvm_component_library(LLVMVLLVM
   VmpRuntimeEmbed.cpp
   c_func/vminterpreter/VmpRuntimeBitcode.inc
   c_func/enstrpool/EnstrPoolBitcode.inc
+  c_func/flower/FlowerTemplates.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/VLLVM
